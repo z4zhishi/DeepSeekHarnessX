@@ -1,0 +1,31 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/cards/diff_block.gd" id="1_diff"]
+
+[node name="DiffBlock" type="PanelContainer"]
+script = ExtResource("1_diff")
+
+[node name="VBox" type="VBoxContainer" parent="."]
+layout_mode = 2
+
+[node name="HeaderRow" type="HBoxContainer" parent="VBox"]
+layout_mode = 2
+
+[node name="DiffHeader" type="Label" parent="VBox/HeaderRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 14
+text = "Diff"
+
+[node name="ToggleBtn" type="Button" parent="VBox/HeaderRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Collapse"
+
+[node name="DiffText" type="RichTextLabel" parent="VBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+bbcode_enabled = true
+scroll_active = false

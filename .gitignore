@@ -1,0 +1,43 @@
+﻿# ---- Git 提交规范：仅纳入前后端源码，确保可构建为产物 ----
+# 测试文件/测试数据、文档、构建产物、运行时数据一律不入库。
+
+# 工具链 / 编辑器 / 本地杂项
+.tools/
+.idea/
+.vscode/
+*.iml
+
+# 上游克隆与开发杂项（各自独立，不入库）
+/CK/
+/dev/
+
+# 构建产物与聚合输出（不入库）
+/target/
+backend/dsh.exe
+backend/pkg/embedgui/assets/godot_runner.exe
+backend/pkg/embedgui/assets/dsh.pck
+backend/pkg/embedgui/assets/godot_runner
+frontend-godot/dsh.pck
+frontend-godot/.godot/
+
+# 运行时数据 / 会话数据库（不入库）
+.dsh-data/
+backend/.dsh-data/
+*.db
+*.bbolt
+
+# 测试与测试数据（不入库；工作区保留以便本地 go test）
+**/testdata/
+*_test.go
+
+# 文档 / 构建脚本 / 辅助说明（不入库）
+/docs/
+/AGENT.md
+/build.ps1
+/README.md
+/DSHX.iml
+
+# 本地临时文件（不入库）
+.tmp-*
+
+

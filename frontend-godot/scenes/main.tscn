@@ -1,0 +1,85 @@
+[gd_scene load_steps=9 format=3 uid="uid://c8m8q4rjh7l0v"]
+
+[ext_resource type="Script" path="res://scripts/ui/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/network/dsh_client.gd" id="2_client"]
+[ext_resource type="PackedScene" path="res://scenes/modals/approval_modal.tscn" id="3_modal"]
+[ext_resource type="PackedScene" path="res://scenes/chat/input_dock.tscn" id="4_input"]
+[ext_resource type="PackedScene" path="res://scenes/subagent/subagent_tree.tscn" id="5_tree"]
+[ext_resource type="PackedScene" path="res://scenes/trajectory/trajectory_canvas.tscn" id="6_traj"]
+[ext_resource type="PackedScene" path="res://scenes/chat/chat_view.tscn" id="7_chat"]
+[ext_resource type="Script" path="res://scripts/state/session_store.gd" id="8_store"]
+
+[node name="Main" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_main")
+
+[node name="DshClient" type="Node" parent="."]
+script = ExtResource("2_client")
+
+[node name="SessionStore" type="Node" parent="."]
+script = ExtResource("8_store")
+
+[node name="HBoxContainer" type="HBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/separation = 0
+
+[node name="Sidebar" type="VBoxContainer" parent="HBoxContainer"]
+custom_minimum_size = Vector2(260, 0)
+layout_mode = 2
+
+[node name="AppTitle" type="Label" parent="HBoxContainer/Sidebar"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 18
+text = " DeepSeek Harness"
+
+[node name="NewSessionBtn" type="Button" parent="HBoxContainer/Sidebar"]
+layout_mode = 2
+text = "+ New Session"
+
+[node name="SessionList" type="ItemList" parent="HBoxContainer/Sidebar"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SubagentTree" parent="HBoxContainer/Sidebar" instance=ExtResource("5_tree")]
+custom_minimum_size = Vector2(0, 220)
+layout_mode = 2
+
+[node name="MainArea" type="VBoxContainer" parent="HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="HeaderBar" type="HBoxContainer" parent="HBoxContainer/MainArea"]
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+
+[node name="Title" type="Label" parent="HBoxContainer/MainArea/HeaderBar"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = " Active Conversation Canvas"
+
+[node name="StatusLabel" type="Label" parent="HBoxContainer/MainArea/HeaderBar"]
+layout_mode = 2
+text = "Connecting... "
+
+[node name="ChatScroll" parent="HBoxContainer/MainArea" instance=ExtResource("7_chat")]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="TrajectoryCanvas" parent="HBoxContainer/MainArea" instance=ExtResource("6_traj")]
+custom_minimum_size = Vector2(0, 72)
+layout_mode = 2
+
+[node name="InputDock" parent="HBoxContainer/MainArea" instance=ExtResource("4_input")]
+layout_mode = 2
+
+[node name="ApprovalModal" parent="." instance=ExtResource("3_modal")]

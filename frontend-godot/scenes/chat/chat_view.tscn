@@ -1,0 +1,7 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/chat/chat_view.gd" id="1_chat"]
+
+[node name="ChatView" type="ScrollContainer"]
+script = ExtResource("1_chat")
+horizontal_scroll_mode = 0
