@@ -538,10 +538,15 @@ func (d *DeepSeekAdapter) stream(
 				if cacheRead == 0 && c.Usage.PromptTokensDetails != nil {
 					cacheRead = c.Usage.PromptTokensDetails.CachedTokens
 				}
+				reasoning := 0
+				if c.Usage.CompletionTokensDetails != nil {
+					reasoning = c.Usage.CompletionTokensDetails.ReasoningTokens
+				}
 				pendingUsage = &session.TokenUsage{
 					InputTokens:     c.Usage.PromptTokens - cacheRead,
 					OutputTokens:    c.Usage.CompletionTokens,
 					CacheReadTokens: cacheRead,
+					ReasoningTokens: reasoning,
 				}
 			}
 

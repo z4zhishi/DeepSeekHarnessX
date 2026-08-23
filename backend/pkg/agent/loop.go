@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -614,6 +615,7 @@ func (a *Agent) actorLoop() {
 
 						resStr, isErr, _ := a.Tools.ExecutePipeline(execCtx, tc.Name, tc.Arguments)
 
+						view := buildToolResultView(tc.Name, resStr, isErr)
 						_, _ = a.EmitEvent(session.EventToolResult, session.ToolResultPayload{
 							Turn: turn,
 							Step: step,
@@ -625,6 +627,7 @@ func (a *Agent) actorLoop() {
 								},
 								Source: session.MessageSource{Kind: "tool", CallID: tc.ID},
 							},
+							View: view,
 						}, &session.AppendSurfaceOp)
 					}
 				} else {
@@ -645,4 +648,152 @@ func (a *Agent) actorLoop() {
 			a.maybeCompact()
 		}
 	}
+}
+
+// buildToolResultView derives the rendering intent (real card view) for a tool
+// result. Best-effort: the text diff is parsed into hunks, shell/terminal tools
+// become an ANSI-friendly terminal card, everything else falls back to text.
+func buildToolResultView(name, out string, isErr bool) *session.ToolResultView {
+	if out == "" {
+		return &session.ToolResultView{Kind: "text", Text: ""}
+	}
+	if looksLikeDiff(out) {
+		return &session.ToolResultView{Kind: "diff", Diffs: parseDiff(out)}
+	}
+	if isCommandTool(name) {
+		return &session.ToolResultView{
+			Kind:     "terminal",
+			Terminal: &session.TerminalView{Lines: splitLines(out), ExitCode: boolToExit(isErr)},
+		}
+	}
+	return &session.ToolResultView{Kind: "text", Text: out}
+}
+
+// looksLikeDiff reports whether a tool output is a unified diff (its own file
+// headers and/or `@@` hunk markers).
+func looksLikeDiff(out string) bool {
+	hasDiffHeader := false
+	hasHunk := false
+	for _, line := range splitLines(out) {
+		if strings.HasPrefix(line, "diff --git ") {
+			hasDiffHeader = true
+			continue
+		}
+		if strings.HasPrefix(line, "@@ ") {
+			hasHunk = true
+		}
+	}
+	return hasHunk || (hasDiffHeader && strings.Contains(out, "\n--- "))
+}
+
+// isCommandTool reports whether a tool name maps to a command/terminal card.
+func isCommandTool(name string) bool {
+	switch name {
+	case "run_command", "bash_persistent", "bash_reset", "terminal_open",
+		"terminal_send", "terminal_read", "terminal_list", "terminal_signal",
+		"terminal_close", "job_output", "job_list", "job_kill":
+		return true
+	}
+	return false
+}
+
+// splitLines splits a string on '\n', dropping a trailing empty final line.
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func boolToExit(isErr bool) int {
+	if isErr {
+		return 1
+	}
+	return 0
+}
+
+// parseDiff splits a unified diff stream into per-file hunks (best-effort).
+// It tracks the current file header (`diff --git` / `---`/`+++`), then walks
+// `-`/`+`/context lines splitting old (removed) vs new (added) text, resetting
+// old/new buffers at each `@@` hunk boundary.
+func parseDiff(out string) []session.DiffHunk {
+	var hunks []session.DiffHunk
+	current := session.DiffHunk{}
+	var oldLines, newLines []string
+
+	flush := func() {
+		if current.Path != "" && len(oldLines)+len(newLines) > 0 {
+			current.Old = strings.Join(oldLines, "\n")
+			current.New = strings.Join(newLines, "\n")
+			hunks = append(hunks, current)
+		}
+		current = session.DiffHunk{}
+		oldLines = nil
+		newLines = nil
+	}
+
+	for _, line := range splitLines(out) {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			// New file section — reset buffers and try to pull the b/ path.
+			flush()
+			if idx := strings.Index(line, " b/"); idx > 0 {
+				current.Path = strings.TrimSpace(line[idx+3:])
+			}
+		case strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ "):
+			// Path fallback when no diff --git header was present.
+			if strings.HasPrefix(line, "+++ ") {
+				p := strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
+				p = strings.TrimPrefix(p, "b/")
+				if current.Path == "" {
+					current.Path = p
+				}
+			}
+			if strings.HasPrefix(line, "--- ") {
+				p := strings.TrimSpace(strings.TrimPrefix(line, "--- "))
+				if strings.HasPrefix(p, "a/") {
+					p = p[2:]
+				}
+				if current.Path == "" {
+					current.Path = p
+				}
+			}
+		case strings.HasPrefix(line, "@@ "):
+			// Hunk boundary: commit the accumulated old/new for this hunk.
+			if current.Path != "" && len(oldLines)+len(newLines) > 0 {
+				h := session.DiffHunk{
+					Path: current.Path,
+					Old:  strings.Join(oldLines, "\n"),
+					New:  strings.Join(newLines, "\n"),
+				}
+				hunks = append(hunks, h)
+				oldLines = nil
+				newLines = nil
+			}
+		case strings.HasPrefix(line, "+"):
+			if len(line) > 1 {
+				newLines = append(newLines, line[1:])
+			} else {
+				newLines = append(newLines, "")
+			}
+		case strings.HasPrefix(line, "-"):
+			if len(line) > 1 {
+				oldLines = append(oldLines, line[1:])
+			} else {
+				oldLines = append(oldLines, "")
+			}
+		case strings.HasPrefix(line, "\\"):
+			// "\ No newline at end of file" marker — ignore.
+		default:
+			// Context lines appear in both old and new.
+			oldLines = append(oldLines, line)
+			newLines = append(newLines, line)
+		}
+	}
+	flush()
+	return hunks
 }

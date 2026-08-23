@@ -311,7 +311,30 @@ type ToolResultPayload struct {
 	Step    int             `json:"step"`
 	Message WireMessage     `json:"message"`
 	Error   *ToolError      `json:"error,omitempty"`
+	View    *ToolResultView `json:"view,omitempty"`
 	Meta    json.RawMessage `json:"meta,omitempty"`
+}
+
+// ToolResultView carries the rendering intent a client uses to draw a "real
+// card" for a tool result (true unified diff, ANSI terminal, or plain text).
+type ToolResultView struct {
+	Kind      string        `json:"kind"` // "diff" | "terminal" | "text"
+	Diffs     []DiffHunk    `json:"diffs,omitempty"`
+	Terminal  *TerminalView `json:"terminal,omitempty"`
+	Text      string        `json:"text,omitempty"`
+}
+
+// DiffHunk is one file's slice of a unified diff (best-effort reconstruction).
+type DiffHunk struct {
+	Path string `json:"path"`
+	Old  string `json:"old"`
+	New  string `json:"new"`
+}
+
+// TerminalView renders a command/terminal output card.
+type TerminalView struct {
+	Lines    []string `json:"lines"`
+	ExitCode int      `json:"exitCode"`
 }
 
 // TokenUsage records token consumption
@@ -319,6 +342,9 @@ type TokenUsage struct {
 	InputTokens     int `json:"inputTokens"`
 	OutputTokens    int `json:"outputTokens"`
 	CacheReadTokens int `json:"cacheReadTokens,omitempty"`
+	// ReasoningTokens counts tokens spent in a separate reasoning/thinking
+	// channel (DeepSeek completion_tokens_details.reasoning_tokens).
+	ReasoningTokens int `json:"reasoningTokens,omitempty"`
 }
 
 // ModelMessage represents the normalized message structure for LLM requests.

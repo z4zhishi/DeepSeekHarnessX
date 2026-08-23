@@ -317,6 +317,7 @@ func (r *ToolRegistry) registerBuiltins() {
 
 			if args.RunInBackground {
 				cmd := exec.Command(shellName, shellArgs...)
+				makeProcessGroup(cmd)
 				if workdir != "" {
 					cmd.Dir = workdir
 				}

@@ -63,6 +63,7 @@ func newTerminalSession(owner, termType, name, cwd string) (*TerminalSession, er
 		shellArgs = []string{"--norc", "--noprofile", "-s"}
 	}
 	cmd := exec.Command(shellName, shellArgs...)
+	makeProcessGroup(cmd)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
@@ -277,7 +278,7 @@ func (t *TerminalSession) close() error {
 	t.mu.Unlock()
 	_ = t.stdin.Close()
 	if t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
+		_ = killProcessTree(t.cmd.Process.Pid)
 	}
 	_, _ = t.cmd.Process.Wait()
 	terminalMu.Lock()
@@ -308,7 +309,7 @@ func (t *TerminalSession) signal(name string) error {
 	if runtime.GOOS == "windows" {
 		// Windows has no portable signal delivery to a console process group;
 		// terminate the process tree the same way job_kill does.
-		return t.cmd.Process.Kill()
+		return killProcessTree(t.cmd.Process.Pid)
 	}
 	return t.cmd.Process.Signal(sig)
 }

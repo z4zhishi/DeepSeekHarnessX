@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"sync"
 	"time"
@@ -149,7 +150,10 @@ func (j *Job) readOutput() []byte {
 	return j.buf.Bytes()
 }
 
-// kill stops the process; the runner goroutine settles the record first-wins.
+// kill stops the process tree; the runner goroutine settles the record
+// first-wins. The stdout/stderr pipes are closed so the pipe readers inside
+// cmd.Run() unblock and the goroutine can reap the command (a bare PID kill
+// leaves a shell's grandchildren running and holding the pipes open).
 func (j *Job) kill() error {
 	j.mu.Lock()
 	if j.Status == JobCompleted || j.Status == JobFailed || j.Status == JobKilled {
@@ -161,9 +165,21 @@ func (j *Job) kill() error {
 	proc := j.cmd.Process
 	j.mu.Unlock()
 	if proc != nil {
-		return proc.Kill()
+		_ = killProcessTree(proc.Pid)
 	}
+	closeJobPipes(j.cmd)
 	return nil
+}
+
+// closeJobPipes closes the command's output pipes so the copy goroutines inside
+// cmd.Run() observe EOF and let the runner reap the process. Safe to call even
+// when the pipes are bytes.Buffer (no-op).
+func closeJobPipes(cmd *exec.Cmd) {
+	for _, p := range []io.Writer{cmd.Stdout, cmd.Stderr} {
+		if c, ok := p.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
 }
 
 // RegisterJobTools registers job_output, job_list, and job_kill (upstream
