@@ -110,6 +110,12 @@ func extractText(content []McpContentBlock, rawName string) string {
 	return b.String()
 }
 
+// ExtractText 拼接 content 块为纯文本（含 image/resource 的诊断占位）。
+// 公开出口，供 plugin Host 规范化远端工具/命令结果。
+func ExtractText(content []McpContentBlock) string {
+	return extractText(content, "")
+}
+
 // bridgeOptions 是同步期的桥接参数（由 BridgeOptions 派生）。
 type bridgeOptions struct {
 	serverName          string

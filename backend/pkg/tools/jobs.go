@@ -71,6 +71,48 @@ type jobPublic struct {
 	FinishedAt int64     `json:"finishedAt,omitempty"`
 }
 
+// JobPublic is the exported snapshot shape the gateway RPC (jobs.list) returns
+// for the jobs panel. It is a stable JSON shape (upstream PublicJobSnapshot).
+type JobPublic = jobPublic
+
+// ListJobs returns the public snapshots of every background job owned by
+// sessionID, ordered newest first. It is the gateway-facing entry for the jobs
+// panel (the job_list tool remains the model-facing string form).
+func ListJobs(sessionID string) []JobPublic {
+	jobMu.Lock()
+	defer jobMu.Unlock()
+	var out []JobPublic
+	for _, j := range jobByID {
+		if j.SessionID != sessionID {
+			continue
+		}
+		out = append(out, j.snapshot())
+	}
+	return out
+}
+
+// ReadJobOutput returns the accumulated output of a session-owned job. ok is
+// false when the id is unknown or owned by another session.
+func ReadJobOutput(sessionID, id string) (string, bool) {
+	j, ok := lookupJob(sessionID, id)
+	if !ok {
+		return "", false
+	}
+	return string(j.readOutput()), true
+}
+
+// KillJob stops a session-owned job and reports whether it was found. It
+// settles the record first-wins and returns no error (a terminal job is a
+// no-op kill).
+func KillJob(sessionID, id string) bool {
+	j, ok := lookupJob(sessionID, id)
+	if !ok {
+		return false
+	}
+	_ = j.kill()
+	return true
+}
+
 var (
 	jobMu   sync.Mutex
 	jobSeq  = 0
@@ -79,7 +121,11 @@ var (
 
 // startJob registers and launches one background command owned by sessionID.
 // The command runs detached from the tool-call context: it keeps executing
-// after the call returns (upstream run_in_background semantics).
+// after the call returns (upstream run_in_background semantics). The command
+// is Started synchronously so cmd.Process (and its platform process group /
+// Job Object) is guaranteed present before the caller can act on the job —
+// in particular before job_kill runs, which must be able to tear down the
+// whole tree without racing the spawn.
 func startJob(sessionID, kind, label string, cmd *exec.Cmd) (*Job, error) {
 	jobMu.Lock()
 	jobSeq++
@@ -99,8 +145,22 @@ func startJob(sessionID, kind, label string, cmd *exec.Cmd) (*Job, error) {
 	jobByID[job.ID] = job
 	jobMu.Unlock()
 
+	if err := cmd.Start(); err != nil {
+		// Failed to launch; settle the record immediately so job_output can
+		// read a terminal status instead of hanging.
+		job.mu.Lock()
+		job.FinishedAt = time.Now().UnixMilli()
+		job.Status = JobFailed
+		job.Detail = err.Error()
+		job.mu.Unlock()
+		close(job.done)
+		return job, nil
+	}
+	attachProcessGroup(cmd)
+
 	go func() {
-		err := cmd.Run()
+		err := cmd.Wait()
+		releaseProcessGroup(cmd)
 		job.mu.Lock()
 		job.FinishedAt = time.Now().UnixMilli()
 		if err != nil {
@@ -151,9 +211,10 @@ func (j *Job) readOutput() []byte {
 }
 
 // kill stops the process tree; the runner goroutine settles the record
-// first-wins. The stdout/stderr pipes are closed so the pipe readers inside
-// cmd.Run() unblock and the goroutine can reap the command (a bare PID kill
-// leaves a shell's grandchildren running and holding the pipes open).
+// first-wins. The Job Object (Windows) / process group (Unix) teardown
+// releases the shell's working-directory handle, and the stdout/stderr pipes
+// are closed so the pipe readers inside cmd.Run() observe EOF and the runner
+// can reap the command.
 func (j *Job) kill() error {
 	j.mu.Lock()
 	if j.Status == JobCompleted || j.Status == JobFailed || j.Status == JobKilled {
@@ -162,12 +223,10 @@ func (j *Job) kill() error {
 	}
 	j.Status = JobKilled
 	j.Detail = "killed before exit"
-	proc := j.cmd.Process
+	cmd := j.cmd
 	j.mu.Unlock()
-	if proc != nil {
-		_ = killProcessTree(proc.Pid)
-	}
-	closeJobPipes(j.cmd)
+	_ = killProcessTree(cmd)
+	closeJobPipes(cmd)
 	return nil
 }
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -154,13 +155,16 @@ func (a *Agent) Unsubscribe(ch chan *session.SessionEnvelope) {
 // the envelope; surface-eligible types (user/message, assistant/message,
 // tool/result) require it, mirroring upstream Session.append.
 func (a *Agent) EmitEvent(eventType string, payload any, surfaceOp ...*session.SurfaceOp) (*session.SessionEnvelope, error) {
-	// Snapshot the machine's current numbers BEFORE the transition mutates
-	// them: a step/end payload must carry the step it closes, and turn/end
-	// the turn it ends.
+	// Snapshot, state machine transition, and boundary payload assignment run
+	// under a single hold of stateMu. This closes the TOCTOU window: without
+	// it, a concurrent EmitEvent (session.command, tool Emit) could transition
+	// the machine between the snapshot and validateTransition, so the numbers
+	// a boundary payload carries would no longer match the numbers the machine
+	// assigned for it. validateTransition assumes the lock is already held.
 	a.stateMu.Lock()
 	preTurn, preStep := a.activeTurn, a.activeStep
-	a.stateMu.Unlock()
 	if err := a.validateTransition(eventType); err != nil {
+		a.stateMu.Unlock()
 		return nil, err
 	}
 	// Boundary events carry the state machine's assigned numbers; the caller
@@ -179,6 +183,7 @@ func (a *Agent) EmitEvent(eventType string, payload any, surfaceOp ...*session.S
 			payload = tp
 		}
 	}
+	a.stateMu.Unlock()
 	seq := int(a.seqCounter.Add(1)) - 1 // upstream seqs start at 0
 	env, err := session.NewEnvelope(seq, eventType, payload)
 	if err != nil {
@@ -225,9 +230,11 @@ func (a *Agent) EmitEvent(eventType string, payload any, surfaceOp ...*session.S
 // validateTransition enforces the turn/step lifecycle contract before an
 // event is admitted to the log. Boundary events mutate the machine only
 // after admission succeeds; a rejected event leaves the state untouched.
+//
+// stateMu is expected to be HELD by the caller (EmitEvent holds it across the
+// snapshot/transition/assign section) — this function does not lock itself,
+// so EmitEvent's snapshot and the machine mutation share one critical section.
 func (a *Agent) validateTransition(eventType string) error {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
 	switch eventType {
 	case session.EventTurnStart:
 		if a.activeTurn != 0 {
@@ -594,6 +601,10 @@ func (a *Agent) actorLoop() {
 							CallID:    tc.ID,
 							Name:      tc.Name,
 							Arguments: tc.Arguments,
+							// Running-card rendering intent inferred from the tool
+							// name + args so the client can draw a live
+							// terminal/diff card while the call is in flight.
+							View: buildToolCallView(tc.Name, tc.Arguments),
 						})
 
 						execCtx := tools.ToolExecutionContext{
@@ -667,6 +678,40 @@ func buildToolResultView(name, out string, isErr bool) *session.ToolResultView {
 		}
 	}
 	return &session.ToolResultView{Kind: "text", Text: out}
+}
+
+// buildToolCallView derives the running-card rendering intent for an in-flight
+// tool call, inferred from the tool name + raw arguments. It mirrors the kind
+// decision of buildToolResultView but carries no content yet: the client draws
+// a live skeleton (terminal/diff/text) and replaces it with the settled card
+// when the matching tool/result event arrives.
+func buildToolCallView(name, argsJSON string) *session.ToolResultView {
+	switch {
+	case isCommandTool(name):
+		return &session.ToolResultView{Kind: "terminal", Terminal: &session.TerminalView{Lines: nil, ExitCode: 0}}
+	case looksLikeDiffCall(name, argsJSON):
+		return &session.ToolResultView{Kind: "diff"}
+	default:
+		return &session.ToolResultView{Kind: "text", Text: ""}
+	}
+}
+
+// looksLikeDiffCall reports whether a tool call is expected to render as a
+// unified-diff card (edit-family tools acting on text). Best-effort from the
+// tool name; the result parse remains authoritative.
+func looksLikeDiffCall(name, argsJSON string) bool {
+	switch name {
+	case "write_file", "replace_file_content":
+		var args struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return false
+		}
+		return args.Content != ""
+	}
+	return false
 }
 
 // looksLikeDiff reports whether a tool output is a unified diff (its own file

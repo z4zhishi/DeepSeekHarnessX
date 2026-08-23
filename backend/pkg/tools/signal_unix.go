@@ -19,14 +19,25 @@ func makeProcessGroup(cmd *exec.Cmd) {
 // killProcessTree terminates a process and its whole process group. The job
 // commands are launched with Setpgid=true (see jobs.go), so the root PID is
 // its own group leader and signalling the negative pgid reaches every child.
-// This mirrors the Windows taskkill /T tree-kill, preventing orphaned
-// grandchildren from holding the stdout/stderr pipe handles open.
-func killProcessTree(pid int) error {
+// This mirrors the Windows Job Object tree-kill, preventing orphaned
+// descendants from holding the stdout/stderr pipe handles open.
+func killProcessTree(cmd *exec.Cmd) error {
+	if cmd == nil {
+		return nil
+	}
+	pid := 0
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
 	if pid <= 0 {
 		return nil
 	}
 	return syscall.Kill(-pid, syscall.SIGKILL)
 }
+
+// releaseProcessGroup is a no-op on Unix: the process group is torn down when
+// the group leader dies, so there is no external handle to release.
+func releaseProcessGroup(_ *exec.Cmd) {}
 
 // terminalSignal resolves a requested signal name to a platform signal on
 // Unix-like systems. The enumeration is fixed by the tool schema.

@@ -1,6 +1,8 @@
 # 审批权限弹框：宿主下行 host/permission-request 时弹出。
-# 选项来自后端 options 数组（allow_once/deny/cancel，或任意问答选项），
-# 点击后经 decision_made 信号送出，由 main.gd 通过 approval.respond RPC 回填。
+# 选项来自后端 options 数组（allow_once/deny/cancel，或任意问答选项）。
+# 选项按钮通过 AcceptDialog 的 add_button 进入底部按钮槽（button slot），
+# 而非 add_child 进内容区。点击后经 decision_made 信号送出，由 main.gd
+# 通过 approval.respond RPC 回填。
 
 extends AcceptDialog
 class_name ApprovalModal
@@ -29,13 +31,12 @@ func show_request(call_id: String, prompt: String, options: Array = []) -> void:
 		]
 	for opt in options:
 		if opt is Dictionary:
-			var btn := Button.new()
-			btn.text = str(opt.get("name", opt.get("optionId", "?")))
 			var opt_id: String = str(opt.get("optionId", ""))
+			var label: String = str(opt.get("name", opt_id if opt_id != "" else "?"))
+			# add_button 把按钮放进 AcceptDialog 底部按钮槽（button slot）。
+			var btn := add_button(label)
 			btn.pressed.connect(_on_option.bind(opt_id))
-			add_child(btn)
 			_option_buttons.append(btn)
-	popup_centered()
 
 func _on_option(option_id: String) -> void:
 	_decide(option_id)
@@ -45,6 +46,7 @@ func _on_request_allow() -> void:
 
 func _clear_option_buttons() -> void:
 	for btn in _option_buttons:
+		remove_button(btn)
 		btn.queue_free()
 	_option_buttons.clear()
 

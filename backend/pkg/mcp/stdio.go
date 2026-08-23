@@ -41,18 +41,13 @@ func (c StdioConfig) validate() (StdioConfig, error) {
 	return c, nil
 }
 
-// rpcMsg 一行 JSON-RPC 消息；id==nil 表示通知。
-type rpcMsg struct {
-	ID     *int64          `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  json.RawMessage `json:"error,omitempty"`
-}
+// rpcMsg 一行 JSON-RPC 消息；id==nil 表示通知。它是 RPC 的别名，使现有
+// MCP 内部代码与泛化的 plugin Host 共享同一线格式。
+type rpcMsg = RPC
 
 // stdioConn 是 stdio 传输的 JSON-RPC 连接：专用 reader goroutine
 // 把响应按 id 分发到 pending channel，通知投递到 notify channel。
-// 请求可并发发出（上游 SDK 允许并发 request）。
+// 请求可并发发出（上游依赖允许并发 request）。
 type stdioConn struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
@@ -66,19 +61,24 @@ type stdioConn struct {
 	readErr   error
 }
 
-var _ connection = (*stdioConn)(nil)
+var (
+	_ connection = (*stdioConn)(nil)
+	_ Transport  = (*stdioConn)(nil)
+)
 
 // rpcTimeout 是单次调用的最大等待（工具调用级超时由 bridge 配置另行约束）。
 const rpcTimeout = 120 * time.Second
 
-func startStdio(ctx context.Context, cfg StdioConfig) (*stdioConn, error) {
+// spawnStdio 建立子进程与 stdio 管道，启动 readLoop，不做任何协议握手。
+// 具体协议握手（MCP initialize 或插件 initialize）由调用方在返回的连接上执行。
+func spawnStdio(cfg StdioConfig) (*stdioConn, error) {
 	env := os.Environ()
 	for k, v := range cfg.Env {
 		env = append(env, k+"="+v)
 	}
 	// 注意：不能用 CommandContext 绑定调用方 ctx——重连路径的临时 ctx 会在
 	// reconnectNow 返回时取消，从而杀掉刚启动的子进程。进程生命周期由
-	// Supervisor.Close 统一管理（close 时 kill）。
+	// Supervisor/Host.Close 统一管理（close 时 kill）。
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.Env = env
 	if cfg.Cwd != "" {
@@ -106,8 +106,15 @@ func startStdio(ctx context.Context, cfg StdioConfig) (*stdioConn, error) {
 		closed:  make(chan struct{}),
 	}
 	go conn.readLoop()
+	return conn, nil
+}
 
-	// 握手：initialize → notifications/initialized
+// startStdio 建立 stdio 连接并执行 MCP 握手（initialize → initialized）。
+func startStdio(ctx context.Context, cfg StdioConfig) (*stdioConn, error) {
+	conn, err := spawnStdio(cfg)
+	if err != nil {
+		return nil, err
+	}
 	var out struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
@@ -123,6 +130,18 @@ func startStdio(ctx context.Context, cfg StdioConfig) (*stdioConn, error) {
 		return nil, fmt.Errorf("mcp(%s): 初始化失败: %w", cfg.ServerName, err)
 	}
 	conn.notifyServer("notifications/initialized", map[string]any{})
+	return conn, nil
+}
+
+// StartStdioTransport 建立一条裸 stdio JSON-RPC 传输，不做任何协议握手。
+// 供 plugin Host 使用：Host 在返回的 Transport 上自行执行插件 initialize
+// 握手。此入口复用 stdioConn（同一进程生命周期/重连/分发语义），MCP 路径
+// 不受影响（startStdio 仍走 MCP 握手）。
+func StartStdioTransport(cfg StdioConfig) (Transport, error) {
+	conn, err := spawnStdio(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return conn, nil
 }
 
@@ -251,6 +270,27 @@ func (c *stdioConn) callTool(ctx context.Context, rawName string, args map[strin
 }
 
 func (c *stdioConn) notifications() <-chan *rpcMsg { return c.notify }
+
+// --- Transport 泛化方法：使 stdioConn 同时满足泛化 Transport 接口，
+// 供 plugin Host 与既有 MCP Supervisor 共用同一 stdio 传输。 ---
+
+// Call 是 Transport.Call 的实现：转发到 MCP 侧既有的 call。
+func (c *stdioConn) Call(ctx context.Context, method string, params any, out any) error {
+	return c.call(ctx, method, params, out)
+}
+
+// Notify 是 Transport.Notify 的实现：转发到 notifyServer。
+func (c *stdioConn) Notify(method string, params any) { c.notifyServer(method, params) }
+
+// Close 是 Transport.Close 的实现：转发到内部 close。
+func (c *stdioConn) Close() error { return c.close() }
+
+// Done 是 Transport.Done 的实现：转发到内部 done。
+func (c *stdioConn) Done() <-chan struct{} { return c.done() }
+
+// Notifications 是 Transport.Notifications 的实现：以公共 RPC 类型暴露
+// 通知流（channel 元素类型与内部 rpcMsg 同一）。
+func (c *stdioConn) Notifications() <-chan *RPC { return c.notify }
 
 // done 在子进程退出/流终止时触发。
 func (c *stdioConn) done() <-chan struct{} { return c.closed }

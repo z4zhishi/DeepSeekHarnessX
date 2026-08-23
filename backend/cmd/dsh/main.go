@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"dsh-go/pkg/gateway"
 	"dsh-go/pkg/llm"
 	"dsh-go/pkg/mcp"
+	"dsh-go/pkg/plugin"
 	"dsh-go/pkg/session"
 	"dsh-go/pkg/storage"
 	"dsh-go/pkg/subagent"
@@ -36,16 +38,19 @@ type modeDeps struct {
 	needStore bool
 	store     gateway.SessionStore
 	useBbolt  bool // true -> legacy bbolt backend; default sqlite
+	mock      bool // true -> explicitly use the MockLlmAdapter (test/demo only)
 	toolReg   *tools.ToolRegistry
 	adapter   llm.LlmAdapter
 	subagents *subagent.Manager
+	plugins   *plugin.Registry
 	dataDir   string
 	model     string
+	pluginDir string
 	initErr   error
 }
 
-func newModeDeps(needStore bool, dataDir, model, storeKind string) *modeDeps {
-	return &modeDeps{needStore: needStore, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt"}
+func newModeDeps(needStore, mock bool, dataDir, model, storeKind, pluginDir string) *modeDeps {
+	return &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir}
 }
 
 // build lazily assembles tooling and (when needStore) storage. Mode code calls
@@ -75,19 +80,36 @@ func (m *modeDeps) build() {
 
 		m.toolReg = tools.NewToolRegistry()
 
+		// Upstream credential semantics: no key is not a load-time failure and
+		// does not silently fall back to a mock. Only an explicit --mock opts
+		// into the demo adapter; otherwise we build a keyless DeepSeekAdapter
+		// whose Stream() reports MISSING_CREDENTIAL at call time.
 		var adapter llm.LlmAdapter
-		if apiKey := os.Getenv("DEEPSEEK_API_KEY"); apiKey != "" {
+		if m.mock {
+			adapter = &llm.MockLlmAdapter{}
+		} else {
 			adapter = llm.NewDeepSeekAdapter(llm.DeepSeekConfig{
-				APIKey: apiKey,
+				APIKey: os.Getenv("DEEPSEEK_API_KEY"),
 				Model:  m.model,
 			})
-		} else {
-			adapter = &llm.MockLlmAdapter{}
 		}
 		m.adapter = adapter
 
 		m.subagents = subagent.NewManager(m.toolReg, m.adapter)
 		m.subagents.RegisterSubagentTools(m.toolReg)
+
+		// 插件边界：把"扁平单例"收敛为"能力 + 注册表 + 事件总线"。
+		// 内置能力经 Registry.Register 编译期注册；外部子进程插件经
+		// Registry.ScanDir 扫描插件目录（*.json manifest）后由 Reconcile 拉起。
+		// 两者共享同一 ToolRegistry/CommandRegistry/EventBus。
+		m.plugins = plugin.NewRegistry(m.toolReg, m.toolReg.Commands, plugin.NewEventBus(), log.Default())
+		if m.pluginDir != "" {
+			if err := m.plugins.ScanDir(context.Background(), m.pluginDir); err != nil {
+				m.initErr = fmt.Errorf("扫描插件目录失败: %w", err)
+				return
+			}
+		}
+		m.plugins.Reconcile(context.Background())
 	})
 }
 
@@ -111,6 +133,9 @@ func (m *modeDeps) Subagents() *subagent.Manager {
 
 // Close releases the store if it was opened. Safe to call unconditionally.
 func (m *modeDeps) Close() {
+	if m.plugins != nil {
+		m.plugins.Close()
+	}
 	if closer, ok := m.store.(interface{ Close() error }); ok {
 		_ = closer.Close()
 		m.store = nil
@@ -126,7 +151,9 @@ func main() {
 		dataDir    = flag.String("data-dir", ".dsh-data", "Storage data directory")
 		systemText = flag.String("system", "You are DeepSeek Harness (DSH) Assistant.", "System prompt")
 		showVer    = flag.Bool("version", false, "Print version and exit")
+		mockLlm    = flag.Bool("mock", false, "Use the mock LLM adapter (test/demo only; default behavior reports MISSING_CREDENTIAL when DEEPSEEK_API_KEY is unset)")
 		mcpConfig  = flag.String("mcp-config", "", "MCP servers JSON config file (mcp mode)")
+		pluginDir  = flag.String("plugin-dir", "", "External plugin directory (JSON-RPC subprocess plugins; *.json manifests)")
 	)
 	flag.Parse()
 
@@ -151,7 +178,7 @@ func main() {
 	// ACP is automation-only over stdio: it never opens storage. Every other
 	// mode persists, so it is the only mode that constructs deps without a store.
 	needStore := mode != "acp" && mode != "mcp"
-	deps := newModeDeps(needStore, *dataDir, *model, *storeKind)
+	deps := newModeDeps(needStore, *mockLlm, *dataDir, *model, *storeKind, *pluginDir)
 	defer deps.Close()
 
 	switch mode {

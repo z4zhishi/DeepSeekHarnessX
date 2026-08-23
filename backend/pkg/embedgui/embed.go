@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -92,8 +93,10 @@ func LaunchAllInOneGUIWithServer(port int, srv *gateway.Server) error {
 	fmt.Printf(" [DSH] Go 1.25 Backend API Gateway: http://%s\n", addr)
 	fmt.Println("=================================================================")
 
-	// Wait briefly for server ready
-	time.Sleep(100 * time.Millisecond)
+	// Wait until the gateway is actually listening on the port (deterministic
+	// readiness instead of a fixed sleep). Falls through if the port is already
+	// bound or the probe errors, so a ready server is never delayed.
+	waitForPort(addr)
 
 	// 2. Extract self-contained Godot runner and PCK
 	runnerPath, pckPath, err := EnsureExtracted()
@@ -128,6 +131,27 @@ func fileMatchesSize(path string, expectedSize int64) bool {
 		return false
 	}
 	return info.Size() == expectedSize
+}
+
+// waitForPort polls a TCP dial to addr until it succeeds, then returns. It is
+// bounded (default ~1s) and treats a probe error as "not ready yet"; if the
+// deadline is reached without the port opening, it returns anyway so the GUI
+// launch is never blocked indefinitely by a listener that is slow or already
+// gone. Polling is 10ms with a short first-delay so the common ready path adds
+// almost no latency.
+func waitForPort(addr string) {
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func fileExists(path string) bool {

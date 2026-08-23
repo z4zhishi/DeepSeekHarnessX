@@ -4,6 +4,7 @@ class_name DshClient
 signal session_event_received(event_data: Dictionary)
 signal host_event_received(method: String, payload: Variant)
 signal connection_state_changed(is_connected: bool)
+signal jobs_refreshed(jobs: Array)
 
 var base_url: String = "http://127.0.0.1:3080"
 var ws_mux: WebSocketPeer = WebSocketPeer.new()
@@ -123,3 +124,34 @@ func send_command(session_id: String, line: String, callback: Callable) -> void:
 
 func create_session(cwd: String, preset: String, callback: Callable) -> void:
 	_rpc("session.create", {"cwd": cwd, "preset": preset}, callback)
+
+## ---- jobs RPC（对应 gateway jobs.list / jobs.output / jobs.kill）----
+## 供 jobs 面板 / 右侧详情栏（波3）消费；返回 (ok, data) 回调。
+
+# jobs.list  -> { "jobs": [JobPublic{id,kind,label,status,detail,startedAt,finishedAt}] }
+func list_jobs(session_id: String, callback: Callable) -> void:
+	_rpc("jobs.list", {"sessionId": session_id}, func(ok, data):
+		var jobs: Array = []
+		if ok and data is Dictionary and data.get("jobs") is Array:
+			jobs = data["jobs"] as Array
+		jobs_refreshed.emit(jobs)
+		callback.call(ok, data)
+	)
+
+# jobs.output -> { "output": string }
+func read_job_output(session_id: String, job_id: String, callback: Callable) -> void:
+	_rpc("jobs.output", {"sessionId": session_id, "jobId": job_id}, callback)
+
+# jobs.kill   -> { "killed": jobId }
+func kill_job(session_id: String, job_id: String, callback: Callable) -> void:
+	_rpc("jobs.kill", {"sessionId": session_id, "jobId": job_id}, callback)
+
+## ---- workspace / settings（占位接口，波3 接线）----
+
+# workspace.list -> [ {id, name, path} ]
+func list_workspaces(callback: Callable) -> void:
+	_rpc("workspace.list", {}, callback)
+
+# settings 面板骨架：后端暂无独立 settings RPC，先经 host.describe 取运行时信息。
+func fetch_settings(callback: Callable) -> void:
+	describe(callback)

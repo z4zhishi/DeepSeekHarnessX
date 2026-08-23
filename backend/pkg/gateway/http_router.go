@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,13 @@ type Server struct {
 	Hub        *DownlinkHub
 	Tools      *tools.ToolRegistry
 	LlmAdapter llm.LlmAdapter
+	// Version is reported by host.describe; injected by the host from the
+	// build-time main.version so the Godot header/jobs panels show the real
+	// build instead of a hardcoded constant.
+	Version string
+	// Workspaces is the workspace root(s) served by workspace.list. nil falls
+	// back to the process working directory.
+	Workspaces []string
 	agents     map[string]*agent.Agent
 	// subagents is the process-level subagent manager whose lifecycle events
 	// are relayed to the host downlink (Godot subagent tree).
@@ -44,11 +52,17 @@ type Server struct {
 
 // NewServer creates a new API server.
 func NewServer(store SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter) *Server {
+	return NewServerWithVersion(store, toolReg, adapter, "dev")
+}
+
+// NewServerWithVersion creates a new API server with an explicit host version.
+func NewServerWithVersion(store SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, version string) *Server {
 	return &Server{
 		Store:            store,
 		Hub:              NewDownlinkHub(),
 		Tools:            toolReg,
 		LlmAdapter:       adapter,
+		Version:          version,
 		agents:           make(map[string]*agent.Agent),
 		pendingApprovals: make(map[string]chan tools.ApprovalDecision),
 	}
@@ -127,7 +141,7 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 		return map[string]any{
 			"ready":       true,
 			"engine":      "dsh-go-godot",
-			"version":     "1.0.0",
+			"version":     s.hostVersion(),
 			"runtime":     "go1.25",
 			"activeHub":   true,
 			"environment": "desktop",
@@ -266,13 +280,40 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 		return map[string]any{"kind": res.Kind, "text": res.Text, "sourceEventSeq": res.SourceSeq}, nil
 
 	case "workspace.list":
-		return []map[string]any{
-			{
-				"id":   "ws-default",
-				"name": "Default Workspace",
-				"path": ".",
-			},
+		return s.workspaceList(), nil
+
+	case "jobs.list":
+		sessionID, _ := payload["sessionId"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("sessionId is required")
+		}
+		return map[string]any{
+			"jobs": tools.ListJobs(sessionID),
 		}, nil
+
+	case "jobs.output":
+		sessionID, _ := payload["sessionId"].(string)
+		jobID, _ := payload["jobId"].(string)
+		if sessionID == "" || jobID == "" {
+			return nil, fmt.Errorf("sessionId and jobId are required")
+		}
+		out, ok := tools.ReadJobOutput(sessionID, jobID)
+		if !ok {
+			return nil, fmt.Errorf("unknown job %q for this session", jobID)
+		}
+		return map[string]any{"output": out}, nil
+
+	case "jobs.kill":
+		sessionID, _ := payload["sessionId"].(string)
+		jobID, _ := payload["jobId"].(string)
+		if sessionID == "" || jobID == "" {
+			return nil, fmt.Errorf("sessionId and jobId are required")
+		}
+		ok := tools.KillJob(sessionID, jobID)
+		if !ok {
+			return nil, fmt.Errorf("unknown job %q for this session", jobID)
+		}
+		return map[string]any{"killed": jobID}, nil
 
 	case "approval.respond":
 		// GUI 对 host/permission-request 的一次性决策（allow_once/deny/cancel）。
@@ -328,6 +369,39 @@ func (s *Server) AttachSubagentManager(m *subagent.Manager) {
 			})
 		},
 	})
+}
+
+// hostVersion returns the injected build version, falling back to a dev tag
+// when the host never set one.
+func (s *Server) hostVersion() string {
+	if s.Version != "" {
+		return s.Version
+	}
+	return "dev"
+}
+
+// workspaceList returns the real workspace root(s) for the jobs/file panels.
+// It surfaces the injected Workspaces roots; when none were configured it
+// reports the process working directory so clients always get an absolute,
+// usable path instead of a hardcoded stub.
+func (s *Server) workspaceList() []map[string]any {
+	paths := s.Workspaces
+	if len(paths) == 0 {
+		if cwd, err := os.Getwd(); err == nil {
+			paths = []string{cwd}
+		} else {
+			paths = []string{"."}
+		}
+	}
+	list := make([]map[string]any, 0, len(paths))
+	for i, p := range paths {
+		list = append(list, map[string]any{
+			"id":   fmt.Sprintf("ws-%d", i),
+			"name": fmt.Sprintf("Workspace %d", i),
+			"path": p,
+		})
+	}
+	return list
 }
 
 // askApproval issues one host-level permission request and waits for the GUI's

@@ -292,11 +292,15 @@ type AssistantMessagePayload struct {
 
 // ToolCallPayload defines a tool call initiated by the model
 type ToolCallPayload struct {
-	Turn      int    `json:"turn"`
-	Step      int    `json:"step"`
-	CallID    string `json:"callId"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"` // raw JSON string
+	Turn      int             `json:"turn"`
+	Step      int             `json:"step"`
+	CallID    string          `json:"callId"`
+	Name      string          `json:"name"`
+	Arguments string          `json:"arguments"` // raw JSON string
+	// View carries the running-card rendering intent (terminal/diff/text)
+	// inferred from the tool name and arguments before execution, so a client
+	// can draw a live card while the call is still in flight.
+	View *ToolResultView `json:"view,omitempty"`
 }
 
 // ToolError carries an internal tool failure identity (upstream `tool/result` error).
