@@ -34,7 +34,6 @@ backend/.dsh-data/
 /docs/
 /AGENT.md
 /build.ps1
-/README.md
 /DSHX.iml
 
 # 本地临时文件（不入库）
