@@ -1,0 +1,33 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/cards/todo_card.gd" id="1_todo"]
+
+[node name="TodoCard" type="PanelContainer"]
+size_flags_horizontal = 3
+script = ExtResource("1_todo")
+
+[node name="Col" type="VBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="HeaderRow" type="HBoxContainer" parent="Col"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Icon" type="TextureRect" parent="Col/HeaderRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(16, 16)
+layout_mode = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Header" type="Label" parent="Col/HeaderRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Tasks"
+
+[node name="List" type="VBoxContainer" parent="Col"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 4

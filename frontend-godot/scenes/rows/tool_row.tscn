@@ -1,0 +1,72 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/rows/tool_row.gd" id="1_tool"]
+
+[node name="ToolRow" type="MarginContainer"]
+size_flags_horizontal = 3
+script = ExtResource("1_tool")
+
+[node name="Col" type="VBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="Head" type="HBoxContainer" parent="Col"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Icon" type="TextureRect" parent="Col/Head"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(16, 16)
+layout_mode = 2
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Name" type="Label" parent="Col/Head"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+mouse_filter = 2
+text = "tool"
+
+[node name="Status" type="Label" parent="Col/Head"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+text = "running"
+
+[node name="Expand" type="VBoxContainer" parent="Col"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="InLabel" type="Label" parent="Col/Expand"]
+layout_mode = 2
+text = "IN"
+
+[node name="InBody" type="RichTextLabel" parent="Col/Expand"]
+unique_name_in_owner = true
+layout_mode = 2
+bbcode_enabled = true
+fit_content = true
+scroll_active = false
+autowrap_mode = 3
+
+[node name="OutLabel" type="Label" parent="Col/Expand"]
+layout_mode = 2
+text = "OUT"
+
+[node name="OutHost" type="VBoxContainer" parent="Col/Expand"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="InspectBtn" type="Button" parent="Col/Expand"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 0
+flat = true
+text = "Inspect"
+focus_mode = 0

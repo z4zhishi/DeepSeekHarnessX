@@ -220,7 +220,7 @@ func (s *SDKServer) getOrCreateSession(sessionID string) (*agent.Agent, error) {
 	if s.store != nil {
 		_ = s.store.PutSession(&header)
 	}
-	ag := agent.NewAgent(header, storage.NewRingBuffer(512), nil, s.store, s.tools, s.adapter, "You are DeepSeek Harness (DSH) Assistant.", s.model)
+	ag := agent.NewAgent(header, storage.NewRingBuffer(512), nil, s.store, s.tools, s.adapter, "You are DSHX Assistant.", s.model)
 	ag.Start()
 	s.sessions[sessionID] = ag
 	// Pipe the agent's live event stream to the client as session.event

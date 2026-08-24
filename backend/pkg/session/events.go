@@ -292,11 +292,11 @@ type AssistantMessagePayload struct {
 
 // ToolCallPayload defines a tool call initiated by the model
 type ToolCallPayload struct {
-	Turn      int             `json:"turn"`
-	Step      int             `json:"step"`
-	CallID    string          `json:"callId"`
-	Name      string          `json:"name"`
-	Arguments string          `json:"arguments"` // raw JSON string
+	Turn      int    `json:"turn"`
+	Step      int    `json:"step"`
+	CallID    string `json:"callId"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // raw JSON string
 	// View carries the running-card rendering intent (terminal/diff/text)
 	// inferred from the tool name and arguments before execution, so a client
 	// can draw a live card while the call is still in flight.
@@ -322,10 +322,10 @@ type ToolResultPayload struct {
 // ToolResultView carries the rendering intent a client uses to draw a "real
 // card" for a tool result (true unified diff, ANSI terminal, or plain text).
 type ToolResultView struct {
-	Kind      string        `json:"kind"` // "diff" | "terminal" | "text"
-	Diffs     []DiffHunk    `json:"diffs,omitempty"`
-	Terminal  *TerminalView `json:"terminal,omitempty"`
-	Text      string        `json:"text,omitempty"`
+	Kind     string        `json:"kind"` // "diff" | "terminal" | "text"
+	Diffs    []DiffHunk    `json:"diffs,omitempty"`
+	Terminal *TerminalView `json:"terminal,omitempty"`
+	Text     string        `json:"text,omitempty"`
 }
 
 // DiffHunk is one file's slice of a unified diff (best-effort reconstruction).

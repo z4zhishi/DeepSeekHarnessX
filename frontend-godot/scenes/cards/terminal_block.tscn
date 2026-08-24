@@ -3,20 +3,42 @@
 [ext_resource type="Script" path="res://scripts/cards/terminal_block.gd" id="1_term"]
 
 [node name="TerminalBlock" type="PanelContainer"]
+size_flags_horizontal = 3
 script = ExtResource("1_term")
 
-[node name="VBox" type="VBoxContainer" parent="."]
+[node name="Col" type="VBoxContainer" parent="."]
 layout_mode = 2
+theme_override_constants/separation = 6
 
-[node name="TerminalHeader" type="Label" parent="VBox"]
+[node name="HeaderRow" type="HBoxContainer" parent="Col"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Icon" type="TextureRect" parent="Col/HeaderRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(16, 16)
+layout_mode = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="TerminalHeader" type="Label" parent="Col/HeaderRow"]
 unique_name_in_owner = true
 layout_mode = 2
-theme_override_font_sizes/font_size = 14
+size_flags_horizontal = 3
 text = "Terminal"
 
-[node name="TerminalOutput" type="RichTextLabel" parent="VBox"]
+[node name="ExpandBtn" type="Button" parent="Col/HeaderRow"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+flat = true
+text = "Expand"
+focus_mode = 0
+
+[node name="TerminalOutput" type="RichTextLabel" parent="Col"]
 unique_name_in_owner = true
 layout_mode = 2
-size_flags_vertical = 3
 bbcode_enabled = true
+fit_content = true
 scroll_active = false
+autowrap_mode = 0

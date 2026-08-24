@@ -38,10 +38,18 @@ func EnsureExtracted() (runnerPath string, pckPath string, err error) {
 	runnerPath = filepath.Join(runtimeDir, runnerName)
 	pckPath = filepath.Join(runtimeDir, "dsh.pck")
 
-	// 1. Extract dsh.pck
-	pckData, err := EmbeddedAssets.ReadFile("assets/dsh.pck")
-	if err == nil {
-		if !fileMatchesSize(pckPath, int64(len(pckData))) {
+	// Check if dsh.pck is located alongside the executable first
+	if execPath, err := os.Executable(); err == nil {
+		localPck := filepath.Join(filepath.Dir(execPath), "dsh.pck")
+		if fileExists(localPck) {
+			pckPath = localPck
+		}
+	}
+
+	// 1. Extract dsh.pck if not using local
+	if pckPath != filepath.Join(filepath.Dir(os.Args[0]), "dsh.pck") {
+		pckData, err := EmbeddedAssets.ReadFile("assets/dsh.pck")
+		if err == nil && len(pckData) > 0 {
 			_ = os.WriteFile(pckPath, pckData, 0644)
 		}
 	}
@@ -89,8 +97,8 @@ func LaunchAllInOneGUIWithServer(port int, srv *gateway.Server) error {
 	}()
 
 	fmt.Println("=================================================================")
-	fmt.Printf(" [DSH] DeepSeek Harness All-in-One Desktop GUI Starting...\n")
-	fmt.Printf(" [DSH] Go 1.25 Backend API Gateway: http://%s\n", addr)
+	fmt.Printf(" [DSHX] DeepSeekHarnessX All-in-One Desktop GUI Starting...\n")
+	fmt.Printf(" [DSHX] Go 1.25 Backend API Gateway: http://%s\n", addr)
 	fmt.Println("=================================================================")
 
 	// Wait until the gateway is actually listening on the port (deterministic
@@ -116,12 +124,12 @@ func LaunchAllInOneGUIWithServer(port int, srv *gateway.Server) error {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("[DSH] Failed to launch GUI window: %v\n", err)
-		fmt.Printf("[DSH] Backend server remains active on http://%s\n", addr)
+		fmt.Printf("[DSHX] Failed to launch GUI window: %v\n", err)
+		fmt.Printf("[DSHX] Backend server remains active on http://%s\n", addr)
 		select {} // Keep server running
 	}
 
-	fmt.Printf("[DSH] Godot 4 GUI window launched successfully (PID: %d).\n", cmd.Process.Pid)
+	fmt.Printf("[DSHX] Godot 4 GUI window launched successfully (PID: %d).\n", cmd.Process.Pid)
 	return cmd.Wait()
 }
 

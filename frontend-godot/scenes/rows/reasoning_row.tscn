@@ -1,0 +1,33 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/rows/reasoning_row.gd" id="1_reason"]
+
+[node name="ReasoningRow" type="MarginContainer"]
+size_flags_horizontal = 3
+script = ExtResource("1_reason")
+
+[node name="Col" type="VBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="Toggle" type="Button" parent="Col"]
+unique_name_in_owner = true
+layout_mode = 2
+flat = true
+text = "Think"
+alignment = 0
+focus_mode = 0
+
+[node name="Preview" type="Label" parent="Col"]
+unique_name_in_owner = true
+layout_mode = 2
+text_overrun_behavior = 3
+
+[node name="Body" type="RichTextLabel" parent="Col"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+bbcode_enabled = true
+fit_content = true
+scroll_active = false
+autowrap_mode = 3

@@ -1,0 +1,216 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/sidebar.gd" id="1_script"]
+
+[node name="Sidebar" type="PanelContainer"]
+custom_minimum_size = Vector2(280, 0)
+clip_contents = true
+script = ExtResource("1_script")
+
+[node name="Margin" type="MarginContainer" parent="."]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/margin_left = 12
+theme_override_constants/margin_top = 12
+theme_override_constants/margin_right = 12
+theme_override_constants/margin_bottom = 12
+
+[node name="VBox" type="VBoxContainer" parent="Margin"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="BrandRow" type="HBoxContainer" parent="Margin/VBox"]
+custom_minimum_size = Vector2(0, 36)
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="BrandMark" type="TextureRect" parent="Margin/VBox/BrandRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(24, 24)
+layout_mode = 2
+size_flags_vertical = 4
+expand_mode = 1
+stretch_mode = 5
+
+[node name="BrandTitle" type="Label" parent="Margin/VBox/BrandRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "DSHX"
+text_overrun_behavior = 3
+
+[node name="CollapseBtn" type="Button" parent="Margin/VBox/BrandRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+
+[node name="CollapseIcon" type="TextureRect" parent="Margin/VBox/BrandRow/CollapseBtn"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 6.0
+offset_top = 6.0
+offset_right = -6.0
+offset_bottom = -6.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="NewSessionBtn" type="Button" parent="Margin/VBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 36)
+layout_mode = 2
+
+[node name="NewRow" type="HBoxContainer" parent="Margin/VBox/NewSessionBtn"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_right = -10.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+theme_override_constants/separation = 8
+alignment = 1
+
+[node name="NewSessionIcon" type="TextureRect" parent="Margin/VBox/NewSessionBtn/NewRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(14, 14)
+layout_mode = 2
+size_flags_vertical = 4
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="NewSessionLabel" type="Label" parent="Margin/VBox/NewSessionBtn/NewRow"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+text = "New Session"
+
+[node name="WorkspaceBtn" type="Button" parent="Margin/VBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 32)
+layout_mode = 2
+alignment = 0
+text_overrun_behavior = 3
+text = "Workspace"
+
+[node name="WsRow" type="HBoxContainer" parent="Margin/VBox/WorkspaceBtn"]
+visible = false
+layout_mode = 1
+mouse_filter = 2
+
+[node name="WorkspaceIcon" type="TextureRect" parent="Margin/VBox/WorkspaceBtn"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(16, 16)
+layout_mode = 1
+anchors_preset = 4
+anchor_top = 0.5
+anchor_bottom = 0.5
+offset_left = 8.0
+offset_top = -8.0
+offset_right = 24.0
+offset_bottom = 8.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="SessionLabel" type="Label" parent="Margin/VBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "RECENT SESSIONS"
+
+[node name="SessionSearchRow" type="HBoxContainer" parent="Margin/VBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 28)
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="SearchIcon" type="TextureRect" parent="Margin/VBox/SessionSearchRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(14, 14)
+layout_mode = 2
+size_flags_vertical = 4
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="SessionSearch" type="LineEdit" parent="Margin/VBox/SessionSearchRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "Search sessions…"
+
+[node name="SessionList" type="ItemList" parent="Margin/VBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="Footer" type="HBoxContainer" parent="Margin/VBox"]
+custom_minimum_size = Vector2(0, 32)
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="StatusDot" type="ColorRect" parent="Margin/VBox/Footer"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(8, 8)
+layout_mode = 2
+size_flags_vertical = 4
+
+[node name="StatusLabel" type="Label" parent="Margin/VBox/Footer"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Ready"
+text_overrun_behavior = 3
+
+[node name="ThemeBtn" type="Button" parent="Margin/VBox/Footer"]
+unique_name_in_owner = true
+layout_mode = 2
+flat = true
+text = "Dark"
+
+[node name="PluginsBtn" type="Button" parent="Margin/VBox/Footer"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+
+[node name="PluginsIcon" type="TextureRect" parent="Margin/VBox/Footer/PluginsBtn"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 6.0
+offset_top = 6.0
+offset_right = -6.0
+offset_bottom = -6.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="SettingsBtn" type="Button" parent="Margin/VBox/Footer"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+
+[node name="SettingsIcon" type="TextureRect" parent="Margin/VBox/Footer/SettingsBtn"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 6.0
+offset_top = 6.0
+offset_right = -6.0
+offset_bottom = -6.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5

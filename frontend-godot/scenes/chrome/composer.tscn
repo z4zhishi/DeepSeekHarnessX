@@ -1,0 +1,113 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/composer.gd" id="1_script"]
+
+[node name="Composer" type="PanelContainer"]
+custom_minimum_size = Vector2(480, 72)
+script = ExtResource("1_script")
+
+[node name="VBox" type="VBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="GenStatus" type="Label" parent="VBox"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+mouse_filter = 2
+text = "Deep diving..."
+
+[node name="QueueRail" type="HBoxContainer" parent="VBox"]
+unique_name_in_owner = true
+visible = false
+clip_contents = true
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 6
+
+[node name="AttachRail" type="HBoxContainer" parent="VBox"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="Prompt" type="TextEdit" parent="VBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 44)
+layout_mode = 2
+size_flags_horizontal = 3
+wrap_mode = 1
+scroll_fit_content_height = true
+placeholder_text = "Message the agent"
+
+[node name="Row" type="HBoxContainer" parent="VBox"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="CmdBtn" type="Button" parent="VBox/Row"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+text = "/"
+
+[node name="AccessBtn" type="Button" parent="VBox/Row"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 28)
+layout_mode = 2
+flat = true
+clip_text = true
+text_overrun_behavior = 3
+text = "Workspace Write"
+
+[node name="Spacer" type="Control" parent="VBox/Row"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="ModelPicker" type="OptionButton" parent="VBox/Row"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(160, 28)
+layout_mode = 2
+fit_to_longest_item = false
+clip_text = true
+disabled = true
+
+[node name="AttachBtn" type="Button" parent="VBox/Row"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+
+[node name="AttachIcon" type="TextureRect" parent="VBox/Row/AttachBtn"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 6.0
+offset_top = 6.0
+offset_right = -6.0
+offset_bottom = -6.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="SendBtn" type="Button" parent="VBox/Row"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(34, 34)
+layout_mode = 2
+flat = true
+
+[node name="SendIcon" type="TextureRect" parent="VBox/Row/SendBtn"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 8.0
+offset_top = 8.0
+offset_right = -8.0
+offset_bottom = -8.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5

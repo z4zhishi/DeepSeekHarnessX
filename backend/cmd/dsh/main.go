@@ -122,7 +122,7 @@ func (m *modeDeps) build() {
 				},
 			})
 		}
-		m.adapter = adapter
+		m.adapter = llm.NewRouter(adapter)
 
 		m.subagents = subagent.NewManager(m.toolReg, m.adapter)
 		m.subagents.RegisterSubagentTools(m.toolReg)
@@ -131,7 +131,7 @@ func (m *modeDeps) build() {
 		// teammate children as full DSH agents (shared store/registry/adapter)
 		// whenever spawn_teammate is invoked. Wire lazily through build() so
 		// both server and headless hosts get a live provider.
-		tools.SetTeamSpawner(teamSpawner(m.store, m.toolReg, m.adapter))
+		tools.SetTeamSpawner(teamSpawner(m.store, m.toolReg, m.adapter, m.model))
 
 		// 插件边界：把"扁平单例"收敛为"能力 + 注册表 + 事件总线"。
 		// 内置能力经 Registry.Register 编译期注册；外部子进程插件经
@@ -183,10 +183,10 @@ func main() {
 	var (
 		port       = flag.Int("port", 3080, "HTTP/WS API server port")
 		profile    = flag.String("profile", "", "Profile to launch: gui | tui | web | headless | server | acp")
-		model      = flag.String("model", "deepseek-chat", "Default model name")
+		model      = flag.String("model", "deepseek-v4-flash", "Default model name")
 		storeKind  = flag.String("store", "sqlite", "Storage engine: sqlite (default) | bbolt")
 		dataDir    = flag.String("data-dir", ".dsh-data", "Storage data directory")
-		systemText = flag.String("system", "You are DeepSeek Harness (DSH) Assistant.", "System prompt")
+		systemText = flag.String("system", "You are DSHX Assistant.", "System prompt")
 		showVer    = flag.Bool("version", false, "Print version and exit")
 		mockLlm    = flag.Bool("mock", false, "Use the mock LLM adapter (test/demo only; default behavior reports MISSING_CREDENTIAL when DEEPSEEK_API_KEY is unset)")
 		mcpConfig  = flag.String("mcp-config", "", "MCP servers JSON config file (mcp mode)")
@@ -197,7 +197,7 @@ func main() {
 	// Fast paths: --help (handled by flag package) and --version return before
 	// any storage/tools/adapter work is done.
 	if *showVer {
-		fmt.Printf("DSH %s\n", version)
+		fmt.Printf("DSHX %s\n", version)
 		os.Exit(0)
 	}
 
@@ -215,6 +215,9 @@ func main() {
 	// ACP is automation-only over stdio: it never opens storage. Every other
 	// mode persists, so it is the only mode that constructs deps without a store.
 	needStore := mode != "acp" && mode != "mcp"
+	if *pluginDir == "" {
+		*pluginDir = filepath.Join(*dataDir, "plugins")
+	}
 	deps := newModeDeps(needStore, *mockLlm, *dataDir, *model, *storeKind, *pluginDir)
 	defer deps.Close()
 
@@ -249,7 +252,7 @@ func main() {
 		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
 		addr := fmt.Sprintf("127.0.0.1:%d", *port)
-		fmt.Printf("DSH Go API Gateway listening on http://%s\n", addr)
+		fmt.Printf("DSHX Go API Gateway listening on http://%s\n", addr)
 		if err := http.ListenAndServe(addr, srv.Routes()); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
@@ -279,7 +282,7 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		fmt.Printf("DSH MCP: %d server(s) mounted\n", len(sups))
+		fmt.Printf("DSHX MCP: %d server(s) mounted\n", len(sups))
 		// 阻塞直至 Ctrl+C；退出前优雅关闭全部连接并注销工具
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt)
@@ -342,7 +345,7 @@ func fatal(err error) {
 // store may be nil (headless spawn of an in-memory child is unsupported, so
 // the host must own a store for Team to be live); callers only invoke this
 // after deps.Full() has opened the store.
-func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter) tools.TeamSpawner {
+func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model string) tools.TeamSpawner {
 	return func(name, description, prompt, context string) (tools.TeamChild, error) {
 		childID := fmt.Sprintf("team-%d/%s", time.Now().UnixNano(), name)
 		header := session.SessionHeader{
@@ -354,7 +357,7 @@ func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapte
 		}
 		ringBuf := storage.NewRingBuffer(256)
 		child := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter,
-			fmt.Sprintf("You are teammate '%s'. %s", name, description), "deepseek-chat")
+			fmt.Sprintf("You are teammate '%s'. %s", name, description), model)
 		child.AutoTitle = true
 		child.Start()
 		return &teamChildAgent{ag: child}, nil
@@ -388,7 +391,21 @@ var generalSettingsSchema = []byte(`{
 	"type": "object",
 	"properties": {
 		"language": { "type": "string", "default": "auto" },
-		"composerEnter": { "type": "boolean", "default": true }
+		"composerEnter": { "type": "boolean", "default": true },
+		"model": { "type": "string", "default": "deepseek-v4-flash" }
+	}
+}`)
+
+// providerSchema is the JSON Schema for the "provider" namespace: a set of
+// switchable provider profiles (each with protocol/baseUrl/model/apiKeyRef) and
+// the id of the active one. Profiles are stored as an object map keyed by id so
+// settings.mutate path ops can add/update a single profile without clobbering
+// the rest.
+var providerSchema = []byte(`{
+	"type": "object",
+	"properties": {
+		"active": { "type": "string", "default": "" },
+		"profiles": { "type": "object" }
 	}
 }`)
 
@@ -428,6 +445,10 @@ func wireServerExt(srv *gateway.Server, deps *modeDeps) {
 	// Active model: seeds llm.models' selected id and the token meter's context
 	// window so session.context reports contextPressure against the right model.
 	srv.Model = deps.model
+
+	srv.PluginDir = deps.pluginDir
+	srv.Plugins = deps.plugins
+	srv.HydrateRuntime()
 }
 
 // loadHooks loads a CC-style hooks.json from $DSH_HOME/hooks.json, else
@@ -492,10 +513,16 @@ func wireSettings(srv *gateway.Server) {
 		log.Printf("settings: register general failed: %v", err)
 		return
 	}
+	if err := settingsMgr.Register("provider", providerSchema, settings.Options{Writable: true}); err != nil {
+		log.Printf("settings: register provider failed: %v", err)
+		return
+	}
 	store := settings.NewFileStore(settingsPath)
 	if err := store.Load(settingsMgr); err != nil {
 		log.Printf("settings: load failed: %v", err)
 	}
+	// Persist every committed write to disk so settings survive a restart.
+	settingsMgr.SetPersist(func() error { return store.Save(settingsMgr) })
 	srv.Settings = settingsMgr
 
 	// Credential backend: process env > $DSH_HOME/.credentials.yaml > cwd/.env

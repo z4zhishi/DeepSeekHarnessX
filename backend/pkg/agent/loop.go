@@ -84,6 +84,10 @@ type Agent struct {
 	teamTeardown func()
 	ctx          context.Context
 	cancelFunc   context.CancelFunc
+	// turnCancel aborts only the in-flight turn (llmRetry/Stream) without
+	// tearing down the actor. AbortTurn invokes it; a nil value means idle.
+	turnMu     sync.Mutex
+	turnCancel context.CancelFunc
 
 	seqCounter atomic.Int64
 	turnNumber atomic.Int32
@@ -426,6 +430,65 @@ func (a *Agent) Stop() {
 // IsRunning reports whether the actor is mid-turn (TeamChild.Status uses it).
 func (a *Agent) IsRunning() bool { return a.isRunning.Load() }
 
+// Alive reports whether the actor loop is still serving (context not cancelled).
+// Distinct from IsRunning, which is only true during a turn. session.stop
+// cancels the context immediately; a stopped agent may remain in the gateway
+// map and must be replaced on resume.
+func (a *Agent) Alive() bool {
+	return a != nil && a.ctx != nil && a.ctx.Err() == nil
+}
+
+// AbortTurn cancels the per-turn context used by llmRetry/Stream without
+// cancelling the actor. The loop emits step/end + turn/end reason=aborted
+// and then waits for the next PostUserMessage. A no-op when idle.
+func (a *Agent) AbortTurn() {
+	a.turnMu.Lock()
+	cancel := a.turnCancel
+	a.turnMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// deriveTurnCtx starts a child of a.ctx for one turn. The previous turn's
+// cancel (if any) is invoked first so a stale abort cannot leak.
+func (a *Agent) deriveTurnCtx() context.Context {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	if a.turnCancel != nil {
+		a.turnCancel()
+	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.turnCancel = cancel
+	return ctx
+}
+
+// clearTurnCtx drops the current turn cancel so a later AbortTurn is a no-op.
+func (a *Agent) clearTurnCtx() {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	if a.turnCancel != nil {
+		a.turnCancel()
+		a.turnCancel = nil
+	}
+}
+
+// finishTurnReason closes an open step (if any) and the active turn with kind.
+func (a *Agent) finishTurnReason(kind, message string) {
+	a.stateMu.Lock()
+	stepOpen := a.activeStep != 0
+	turnOpen := a.activeTurn != 0
+	a.stateMu.Unlock()
+	if stepOpen {
+		_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{})
+	}
+	if turnOpen {
+		_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
+			Reason: session.TurnEndReason{Kind: kind, Message: message},
+		})
+	}
+}
+
 // dispatchHook runs the CC-style hooks runtime at one interception point. It is
 // a no-op when the runtime is not wired (HookBus or Hooks nil). Each matching
 // command hook first emits hook/invoked, then (after running) hook/result, so
@@ -440,6 +503,7 @@ func (a *Agent) dispatchHook(point, subject string, turn int) {
 }
 
 func (a *Agent) actorLoop() {
+turns:
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -448,8 +512,9 @@ func (a *Agent) actorLoop() {
 		case userMsg := <-a.nextTurnChan:
 			a.isRunning.Store(true)
 			a.stepNumber.Store(0)
+			turnCtx := a.deriveTurnCtx()
 
-			// 1. turn/start 閳?the transition machine assigns the turn number
+			// 1. turn/start — the transition machine assigns the turn number
 			_, _ = a.EmitEvent(session.EventTurnStart, session.TurnStartPayload{})
 			a.stateMu.Lock()
 			turn := a.activeTurn
@@ -463,6 +528,7 @@ func (a *Agent) actorLoop() {
 
 			// Step loop
 			turnFinished := false
+			turnClosed := false
 			for !turnFinished {
 				// next-step priority interruption: a queued user block aborts
 				// the current step (closing it) and immediately starts a new
@@ -481,15 +547,15 @@ func (a *Agent) actorLoop() {
 				}
 				select {
 				case <-a.ctx.Done():
-					// Close the open step before ending the turn so the
-					// lifecycle machine accepts the transition.
-					_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{})
-					_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
-						Turn:   turn,
-						Reason: session.TurnEndReason{Kind: "aborted", Message: "User aborted"},
-					})
+					a.finishTurnReason("aborted", "User aborted")
 					a.isRunning.Store(false)
+					a.clearTurnCtx()
 					return
+				case <-turnCtx.Done():
+					a.finishTurnReason("aborted", "User aborted")
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					continue turns
 				default:
 				}
 
@@ -567,12 +633,15 @@ func (a *Agent) actorLoop() {
 				// retryable transient failures (RATE_LIMIT/SERVER/TIMEOUT/
 				// TRANSPORT). The default normal policy retries up to 5 times
 				// with exponential backoff + jitter (upstream llm-retry).
-				chunkChan, errChan := a.llmRetry(a.ctx, turn, step, modelReq, defaultRetryMax)
+				chunkChan, errChan := a.llmRetry(turnCtx, turn, step, modelReq, defaultRetryMax)
 				assembler := llm.NewBlockAssembler()
 
 				var pendingNextStep *session.ContentBlock
 				streamDone := false
 				interruptedByNextStep := false
+				llmFailed := false
+				actorStopped := false
+				turnAborted := false
 				for !streamDone {
 					// Priority check: the next-step inbox wins over stream
 					// chunks at every iteration, so an interrupt can never be
@@ -590,16 +659,38 @@ func (a *Agent) actorLoop() {
 					}
 					select {
 					case <-a.ctx.Done():
+						actorStopped = true
+						streamDone = true
+					case <-turnCtx.Done():
+						if a.ctx.Err() != nil {
+							actorStopped = true
+						} else {
+							turnAborted = true
+						}
 						streamDone = true
 					case err, ok := <-errChan:
-						if ok && err != nil {
+						if !ok {
+							errChan = nil
+							break
+						}
+						if err != nil {
+							if a.ctx.Err() != nil {
+								actorStopped = true
+								streamDone = true
+								break
+							}
+							if turnCtx.Err() != nil {
+								turnAborted = true
+								streamDone = true
+								break
+							}
 							_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step})
 							_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
 								Turn:   turn,
 								Reason: session.TurnEndReason{Kind: "error", Message: err.Error()},
 							})
-							a.isRunning.Store(false)
-							return
+							llmFailed = true
+							streamDone = true
 						}
 					case chunk, ok := <-chunkChan:
 						if !ok {
@@ -613,6 +704,25 @@ func (a *Agent) actorLoop() {
 							"chunk": chunk,
 						})
 					}
+				}
+
+				if actorStopped {
+					a.finishTurnReason("aborted", "User aborted")
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					return
+				}
+				if turnAborted {
+					a.finishTurnReason("aborted", "User aborted")
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					continue turns
+				}
+				if llmFailed {
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					turnClosed = true
+					break
 				}
 
 				// Assembled assistant message
@@ -732,22 +842,25 @@ func (a *Agent) actorLoop() {
 				_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step})
 			}
 
-			// turn/end
-			_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
-				Turn:   turn,
-				Reason: session.TurnEndReason{Kind: "completed"},
-			})
-			a.isRunning.Store(false)
-			// One-shot automatic session title on the first completed turn.
-			// Best-effort and never load-bearing: GenerateTitle already degrades
-			// any LLM failure to the deterministic fallback (or "" when there is
-			// no eligible user text), so a failed title never surfaces as an
-			// error here. nil adapter / empty log both emit a no-op title event.
-			if a.AutoTitle && a.titleDone.CompareAndSwap(false, true) {
-				a.generateSessionTitle()
+			if !turnClosed {
+				// turn/end
+				_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
+					Turn:   turn,
+					Reason: session.TurnEndReason{Kind: "completed"},
+				})
+				a.isRunning.Store(false)
+				// One-shot automatic session title on the first completed turn.
+				// Best-effort and never load-bearing: GenerateTitle already degrades
+				// any LLM failure to the deterministic fallback (or "" when there is
+				// no eligible user text), so a failed title never surfaces as an
+				// error here. nil adapter / empty log both emit a no-op title event.
+				if a.AutoTitle && a.titleDone.CompareAndSwap(false, true) {
+					a.generateSessionTitle()
+				}
+				// Idle-session compaction pressure check (log-only brackets).
+				a.maybeCompact()
 			}
-			// Idle-session compaction pressure check (log-only brackets).
-			a.maybeCompact()
+			a.clearTurnCtx()
 		}
 	}
 }

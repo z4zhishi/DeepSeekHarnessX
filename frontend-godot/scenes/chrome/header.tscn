@@ -1,0 +1,113 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/header.gd" id="1_script"]
+
+[node name="Header" type="PanelContainer"]
+custom_minimum_size = Vector2(0, 48)
+script = ExtResource("1_script")
+
+[node name="Margin" type="MarginContainer" parent="."]
+layout_mode = 2
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_bottom = 8
+
+[node name="HBox" type="HBoxContainer" parent="Margin"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="TitleBlock" type="VBoxContainer" parent="Margin/HBox"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 0
+
+[node name="Title" type="Label" parent="Margin/HBox/TitleBlock"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Active conversation"
+text_overrun_behavior = 3
+
+[node name="Lineage" type="Label" parent="Margin/HBox/TitleBlock"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+text_overrun_behavior = 3
+
+[node name="TabBar" type="HBoxContainer" parent="Margin/HBox"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="ChatTabBtn" type="Button" parent="Margin/HBox/TabBar"]
+unique_name_in_owner = true
+layout_mode = 2
+toggle_mode = true
+button_pressed = true
+text = "Chat"
+
+[node name="TrajectoryTabBtn" type="Button" parent="Margin/HBox/TabBar"]
+unique_name_in_owner = true
+layout_mode = 2
+toggle_mode = true
+text = "Trajectory"
+
+[node name="ModelPicker" type="OptionButton" parent="Margin/HBox"]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+disabled = true
+
+[node name="CtxPressure" type="HBoxContainer" parent="Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="CtxBar" type="ProgressBar" parent="Margin/HBox/CtxPressure"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(60, 8)
+layout_mode = 2
+size_flags_vertical = 4
+max_value = 1.0
+show_percentage = false
+
+[node name="CtxLabel" type="Label" parent="Margin/HBox/CtxPressure"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "ctx 0%"
+
+[node name="PlanBadge" type="PanelContainer" parent="Margin/HBox"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+
+[node name="PlanRow" type="HBoxContainer" parent="Margin/HBox/PlanBadge"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="PlanBadgeIcon" type="TextureRect" parent="Margin/HBox/PlanBadge/PlanRow"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(14, 14)
+layout_mode = 2
+size_flags_vertical = 4
+expand_mode = 1
+stretch_mode = 5
+
+[node name="PlanBadgeLabel" type="Label" parent="Margin/HBox/PlanBadge/PlanRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Plan"
+
+[node name="JobsBtn" type="Button" parent="Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Jobs"
+
+[node name="JobsIcon" type="TextureRect" parent="Margin/HBox/JobsBtn"]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(14, 14)
+layout_mode = 2
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5

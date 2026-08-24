@@ -1,8 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://c3subagenttree"]
-
-[ext_resource type="Script" path="res://scripts/subagent/subagent_tree.gd" id="1_tree"]
-
-[node name="SubagentTree" type="Tree"]
-columns = 2
-column_titles_visible = true
-script = ExtResource("1_tree")

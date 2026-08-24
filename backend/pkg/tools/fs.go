@@ -1,3 +1,27 @@
+// Package tools: filesystem manipulation tools.
+//
+// Stale-version edit protection (replace_file_content):
+//
+// A file may be edited by more than one agent/teammate concurrently. Without a
+// version guard, two agents that both read a file, then both write their own
+// edit, will clobber each other — the second writer silently overwrites the
+// first writer's change because each operates on the snapshot it read. This is
+// classic last-writer-wins data loss.
+//
+// Upstream (CK/packages/fs/tool-str-replace-editor + fs-local) solves this by
+// anchoring every edit to the file version the caller observed. The edit carries
+// an expected version; the writer re-stats the file and, if the on-disk version
+// no longer matches, returns FS_STALE_VERSION instead of overwriting. This makes
+// a concurrent edit observable: the second writer is told the file changed since
+// it was read, and must re-read before retrying, so no edit is silently lost.
+//
+// We mirror that semantics here with a minimal, portable version anchor. Upstream
+// uses `dev:ino:size:mtimeNs:ctimeNs` (CK fs-local/src/fsio.ts versionOf). Go's
+// os.Stat does not expose inode/device/ctime portably (Windows in particular),
+// so we anchor on the portable subset — file size + mtime (nanosecond) — which
+// retains the freshness property that matters for the concurrent-edit race while
+// staying platform-independent. Expected_version is OPTIONAL: callers that omit
+// it keep the previous unconditional-edit behavior (backward compatible).
 package tools
 
 import (
@@ -9,6 +33,17 @@ import (
 	"regexp"
 	"strings"
 )
+
+// fileVersion computes the version anchor for stale-edit detection: file size
+// plus modification time (nanosecond). Mirrors upstream's size:mtimeNs pairing;
+// see the package comment for why dev/ino/ctime are omitted.
+func fileVersion(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano()), nil
+}
 
 // RegisterFSTools registers full-scale file manipulation and code search tools.
 func (r *ToolRegistry) RegisterFSTools() {
@@ -114,6 +149,13 @@ func (r *ToolRegistry) RegisterFSTools() {
 	})
 
 	// 3. replace_file_content
+	//
+	// Stale-version edit protection: the optional expected_version parameter lets
+	// the caller pin the edit to the file version it read. When provided and the
+	// on-disk version no longer matches (another agent edited the file in between),
+	// the tool returns an FS_STALE_VERSION error instead of overwriting — the
+	// caller must re-read and retry. When omitted, behavior is unchanged
+	// (unconditional edit). See the package comment for the rationale.
 	r.Register(ToolDefinition{
 		Name:         "replace_file_content",
 		Description:  "Replace target content with replacement content in a file.",
@@ -123,7 +165,8 @@ func (r *ToolRegistry) RegisterFSTools() {
 			"properties": {
 				"path": { "type": "string", "description": "Target file path" },
 				"target_content": { "type": "string", "description": "Exact text to replace" },
-				"replacement_content": { "type": "string", "description": "New replacement text" }
+				"replacement_content": { "type": "string", "description": "New replacement text" },
+				"expected_version": { "type": "string", "description": "Optional file version the edit is based on. If the file changed since it was read (version mismatch), the edit is refused with FS_STALE_VERSION instead of overwriting." }
 			},
 			"required": ["path", "target_content", "replacement_content"]
 		}`),
@@ -132,12 +175,27 @@ func (r *ToolRegistry) RegisterFSTools() {
 				Path               string `json:"path"`
 				TargetContent      string `json:"target_content"`
 				ReplacementContent string `json:"replacement_content"`
+				ExpectedVersion    string `json:"expected_version"`
 			}
 			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 				return nil, err
 			}
 
 			targetPath := resolvePath(ctx.Cwd, args.Path)
+			// Stale guard: verify the file still matches the version the caller
+			// observed before reading/matching. Refuse with FS_STALE_VERSION rather
+			// than silently overwrite a concurrent edit.
+			if args.ExpectedVersion != "" {
+				cur, err := fileVersion(targetPath)
+				if err != nil {
+					return nil, err
+				}
+				if cur != args.ExpectedVersion {
+					return nil, fmt.Errorf(
+						"cannot replace content in %s: file changed since it was read (FS_STALE_VERSION)", args.Path)
+				}
+			}
+
 			data, err := os.ReadFile(targetPath)
 			if err != nil {
 				return nil, err

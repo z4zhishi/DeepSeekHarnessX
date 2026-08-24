@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -21,6 +22,16 @@ import (
 	"dsh-go/pkg/tools"
 	"dsh-go/pkg/workspace"
 )
+
+// PluginCtl is the plugin control surface gateway RPCs consume.
+// *plugin.Registry satisfies it once ListInfo/InstallFromPath/Uninstall/
+// SetEnabled land.
+type PluginCtl interface {
+	ListInfo() []plugin.PluginInfo
+	InstallFromPath(ctx context.Context, src, destDir string) (plugin.PluginInfo, error)
+	Uninstall(name string) error
+	SetEnabled(name string, enabled bool) error
+}
 
 // SessionStore is the storage surface the gateway consumes. Both the
 // bbolt-backed and the schema-17 SQLite stores satisfy it, so the gateway
@@ -65,11 +76,16 @@ type Server struct {
 	// Credentials is the credential-reference backend (settings.credentials).
 	// nil reports every reference unconfigured/read-only.
 	Credentials *credential.Manager
-	// Model is the configured default model id (e.g. "deepseek-chat"). It is
-	// reported by llm.models and seeds the token meter's context window for
-	// session.context. Empty falls back to the catalog's default model.
-	Model  string
-	agents map[string]*agent.Agent
+	// Model is the configured default model id (e.g. "deepseek-v4-flash").
+	// It is reported by llm.models and seeds the token meter's context window
+	// for session.context. Empty falls back to the active provider profile, then
+	// the catalog's first model. Unknown ids are kept (not clamped to catalog).
+	Model string
+	// PluginDir is the on-disk plugin install root passed to InstallFromPath.
+	PluginDir string
+	// Plugins is the plugin control surface (typically *plugin.Registry).
+	Plugins PluginCtl
+	agents  map[string]*agent.Agent
 	// subagents is the process-level subagent manager whose lifecycle events
 	// are relayed to the host downlink (Godot subagent tree).
 	subagents *subagent.Manager
@@ -86,7 +102,7 @@ func NewServer(store SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmA
 
 // NewServerWithVersion creates a new API server with an explicit host version.
 func NewServerWithVersion(store SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, version string) *Server {
-	return &Server{
+	s := &Server{
 		Store:            store,
 		Hub:              NewDownlinkHub(),
 		Tools:            toolReg,
@@ -95,6 +111,17 @@ func NewServerWithVersion(store SessionStore, toolReg *tools.ToolRegistry, adapt
 		agents:           make(map[string]*agent.Agent),
 		pendingApprovals: make(map[string]chan tools.ApprovalDecision),
 	}
+	s.Hub.Replay = func(sessionID string, fromSeq int) []session.SessionEnvelope {
+		if s.Store == nil || sessionID == "" {
+			return nil
+		}
+		events, err := s.Store.GetEvents(sessionID, fromSeq)
+		if err != nil {
+			return nil
+		}
+		return events
+	}
+	return s
 }
 
 // Routes sets up all HTTP routes matching DSH gateway specs.
@@ -107,6 +134,11 @@ func (s *Server) Routes() http.Handler {
 
 	// Unary RPC dispatcher（在 Host/Origin 信任栅栏之后）
 	mux.HandleFunc("/api/", s.handleRPC)
+
+	// Inbound native protocols (DSHX as OpenAI/Anthropic-compatible server).
+	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
 
 	// CSRF/Host 信任栅栏：网关只服务 loopback 客户端
 	return s.trustGuard(mux)
@@ -164,12 +196,18 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, error) {
+func (s *Server) dispatch(ctx context.Context, method string, payload map[string]any) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	switch method {
 	case "host.describe":
 		return map[string]any{
 			"ready":       true,
 			"engine":      "dsh-go-godot",
+			"name":        "DSHX",
+			"backend":     "dsh-go-godot",
+			"protocol":    "http+ws",
 			"version":     s.hostVersion(),
 			"runtime":     "go1.25",
 			"activeHub":   true,
@@ -202,38 +240,28 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 			_ = s.Store.PutSession(&header)
 		}
 
-		// Instantiate agent actor
-		ringBuf := storage.NewRingBuffer(512)
-		ag := agent.NewAgent(header, ringBuf, nil, s.Store, s.Tools, s.LlmAdapter, "You are DSH Assistant.", "deepseek-chat")
-		// CC-style hooks runtime: the shared registry's event bus + loaded
-		// hooks drive the agent's four dispatch intercept points (best-effort;
-		// nil leaves them inert).
-		ag.HookBus = s.HookBus
-		ag.Hooks = s.Hooks
-		// 会话标题：首条人工消息后的首个完成回合生成一次 log-only
-		// `session/title` 快照（first-prompt 模式；失败静默降级为确定性回退）。
-		ag.AutoTitle = true
-		// 审批瀑布：需权限的工具调用经 host 下行通知 GUI，GUI 通过
-		// approval.respond RPC 回填决策（与 ACP permission-request 桥同构）。
-		ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
-			return s.askApproval(id, prompt, options)
-		}
-		ag.Start()
-
-		// Pipe agent events to downlink hub
-		sub := ag.Subscribe()
-		go func() {
-			for env := range sub {
-				s.Hub.BroadcastSessionEvent(id, env)
-			}
-		}()
-
-		s.mu.Lock()
-		s.agents[id] = ag
-		s.mu.Unlock()
-
+		s.spawnAgent(header)
 		s.Hub.BroadcastHostEvent("host/session-added", header)
+		return header, nil
 
+	case "session.resume":
+		// Re-attach a stored session's actor. A live actor is reused; after
+		// session.stop the dead map entry is replaced (NewAgent seeds seq).
+		sessionID, _ := payload["sessionId"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.resume requires a sessionId")
+		}
+		header, ok := s.lookupHeader(sessionID)
+		if !ok {
+			return nil, fmt.Errorf("session not found: %s", sessionID)
+		}
+		s.mu.RLock()
+		ag, exists := s.agents[sessionID]
+		s.mu.RUnlock()
+		if exists && ag.Alive() {
+			return header, nil
+		}
+		s.spawnAgent(header)
 		return header, nil
 
 	case "session.history":
@@ -293,15 +321,10 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 	case "session.prompt":
 		sessionID, _ := payload["sessionId"].(string)
 		text, _ := payload["text"].(string)
-
-		s.mu.RLock()
-		ag, ok := s.agents[sessionID]
-		s.mu.RUnlock()
-
-		if !ok {
-			return nil, fmt.Errorf("session not found or active: %s", sessionID)
+		ag, err := s.ensureLiveAgent(sessionID)
+		if err != nil {
+			return nil, err
 		}
-
 		ag.PostUserMessage(session.UserMessagePayload{
 			ID:   fmt.Sprintf("msg-%d", time.Now().UnixNano()),
 			Role: "user",
@@ -310,8 +333,78 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 			},
 			Source: session.MessageSource{Kind: "user"},
 		})
-
 		return map[string]any{"admitted": true}, nil
+
+	case "session.steer":
+		// Mid-turn next-step interrupt. A dead actor has no turn to interrupt,
+		// so we respawn and treat the text as a fresh user message.
+		sessionID, _ := payload["sessionId"].(string)
+		text, _ := payload["text"].(string)
+		s.mu.RLock()
+		ag, exists := s.agents[sessionID]
+		s.mu.RUnlock()
+		if !exists || !ag.Alive() {
+			ag, err := s.ensureLiveAgent(sessionID)
+			if err != nil {
+				return nil, err
+			}
+			ag.PostUserMessage(session.UserMessagePayload{
+				ID:   fmt.Sprintf("msg-%d", time.Now().UnixNano()),
+				Role: "user",
+				Content: []session.ContentBlock{
+					{Type: "text", Text: text},
+				},
+				Source: session.MessageSource{Kind: "user"},
+			})
+			return map[string]any{"steered": true, "respawned": true}, nil
+		}
+		ag.PostNextStep(session.ContentBlock{Type: "text", Text: text})
+		return map[string]any{"steered": true}, nil
+
+	case "session.abort":
+		// Soft abort: cancel the in-flight turn without destroying the actor.
+		// GUI Stop should use this; session.stop remains a hard teardown.
+		sessionID, _ := payload["sessionId"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.abort requires a sessionId")
+		}
+		s.mu.RLock()
+		ag, ok := s.agents[sessionID]
+		s.mu.RUnlock()
+		if !ok {
+			if _, found := s.lookupHeader(sessionID); !found {
+				return nil, fmt.Errorf("session not found: %s", sessionID)
+			}
+			return map[string]any{"aborted": true}, nil
+		}
+		ag.AbortTurn()
+		return map[string]any{"aborted": true}, nil
+
+	case "session.stop":
+		// Hard Stop: cancel the actor context and destroy the live loop.
+		// Teardown/shutdown only. GUI conversation Stop must use session.abort
+		// so the next prompt can reuse the same actor.
+		sessionID, _ := payload["sessionId"].(string)
+		s.mu.RLock()
+		ag, ok := s.agents[sessionID]
+		s.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("session not found or active: %s", sessionID)
+		}
+		ag.Stop()
+		return map[string]any{"stopped": true}, nil
+
+	case "command.list":
+		cmds := []map[string]any{}
+		if s.Tools != nil && s.Tools.Commands != nil {
+			for _, def := range s.Tools.Commands.List() {
+				cmds = append(cmds, map[string]any{
+					"name":        def.Name,
+					"description": def.Description,
+				})
+			}
+		}
+		return map[string]any{"commands": cmds}, nil
 
 	case "session.command":
 		// Slash-command execution through the shared registry: the lifecycle
@@ -521,21 +614,196 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 		return map[string]any{"refs": refs}, nil
 
 	case "llm.models":
-		// { } -> {models:[{id, name, contextWindow, modalities}], active}
-		// Model catalog for the frontend model picker (aligned with upstream
-		// DEFAULT_MODELS). active reports the currently selected model id so the
-		// picker can render the live selection.
+		// { } -> {models:[{id, name, contextWindow, modalities}], selected, fetchError?}
+		// Live provider listing first, then any DefaultModels id not already present.
 		models := llm.DefaultModels
-		list := make([]map[string]any, 0, len(models))
-		for _, m := range models {
-			list = append(list, map[string]any{
-				"id":            m.ID,
-				"name":          m.Name,
-				"contextWindow": m.ContextWindow,
-				"modalities":    m.Modalities,
-			})
+		var fetchError string
+		active, profiles := s.providerState()
+		if p, ok := profiles[active]; ok && active != "" {
+			protocol := p.Protocol
+			if protocol == "" || protocol == "deepseek" {
+				protocol = llm.ProtocolOpenAICompletions
+			}
+			key := ""
+			if s.Credentials != nil && p.APIKeyRef != "" {
+				if k, kerr := s.Credentials.ResolveValue(p.APIKeyRef); kerr == nil {
+					key = k
+				}
+			}
+			fctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			live, err := llm.FetchModelsFor(fctx, protocol, p.BaseURL, key, nil)
+			cancel()
+			if err != nil {
+				fetchError = err.Error()
+			} else {
+				models = mergeModelCatalog(live, llm.DefaultModels)
+			}
 		}
-		return map[string]any{"models": list, "selected": s.configuredModel()}, nil
+		out := map[string]any{"models": modelInfoMaps(models), "selected": s.configuredModel()}
+		if fetchError != "" {
+			out["fetchError"] = fetchError
+		}
+		return out, nil
+
+	case "model.set":
+		// {model} -> {selected}：持久化默认模型并重配 adapter，使选择立即生效。
+		model, _ := payload["model"].(string)
+		if model == "" {
+			return nil, fmt.Errorf("model.set requires a model id")
+		}
+		if s.Settings != nil {
+			if _, err := s.Settings.Mutate("general", []settings.Op{
+				{Op: "set", Path: []string{"model"}, Value: model},
+			}); err != nil {
+				return nil, err
+			}
+		}
+		s.Model = model
+		switch a := s.LlmAdapter.(type) {
+		case *llm.Router:
+			a.SetModel(model)
+		case *llm.DeepSeekAdapter:
+			a.SetModel(model)
+		}
+		s.mu.Lock()
+		for _, ag := range s.agents {
+			if ag != nil {
+				ag.ModelName = model
+			}
+		}
+		s.mu.Unlock()
+		return map[string]any{"selected": s.configuredModel()}, nil
+
+	case "provider.describe":
+		// { } -> {active, profiles:[...], usable}
+		s.SeedDefaultProvider()
+		return s.providerDescribeResp(), nil
+
+	case "provider.set":
+		// {id, name?, protocol?, baseUrl?, model?, apiKeyRef?, apiKey?, setActive?}
+		id, _ := payload["id"].(string)
+		if id == "" {
+			return nil, fmt.Errorf("provider.set requires an id")
+		}
+		// Read existing profile (or create a default-shaped one).
+		_, profiles := s.providerState()
+		cur := map[string]any{"id": id, "name": id, "protocol": llm.ProtocolOpenAICompletions, "baseUrl": llm.DefaultDeepSeekBaseURL, "model": llm.DefaultDeepSeekModel, "apiKeyRef": "DEEPSEEK_API_KEY"}
+		if ex, ok := profiles[id]; ok {
+			cur = ex.Raw
+		}
+		// Apply overrides from the payload.
+		if v, ok := payload["name"].(string); ok && v != "" {
+			cur["name"] = v
+		}
+		if v, ok := payload["protocol"].(string); ok && v != "" {
+			cur["protocol"] = v
+		}
+		if v, ok := payload["baseUrl"].(string); ok && v != "" {
+			cur["baseUrl"] = v
+		}
+		if v, ok := payload["model"].(string); ok && v != "" {
+			cur["model"] = v
+		}
+		keyRef, _ := cur["apiKeyRef"].(string)
+		if keyRef == "" {
+			keyRef = "DEEPSEEK_API_KEY"
+			cur["apiKeyRef"] = keyRef
+		}
+		// Persist the profile under provider.profiles.<id>.
+		if s.Settings != nil {
+			if _, err := s.Settings.Mutate("provider", []settings.Op{
+				{Op: "set", Path: []string{"profiles", id}, Value: cur},
+			}); err != nil {
+				return nil, err
+			}
+		}
+		// Persist the API key into the credential store if provided.
+		if v, ok := payload["apiKey"].(string); ok && v != "" {
+			if s.Credentials != nil {
+				if err := s.Credentials.Set(keyRef, v); err != nil {
+					return nil, err
+				}
+			}
+		}
+		setActive, _ := payload["setActive"].(bool)
+		if setActive {
+			if _, err := s.setActiveProvider(id); err != nil {
+				return nil, err
+			}
+		}
+		return s.providerDescribeResp(), nil
+
+	case "provider.apply":
+		// Reconfigure the adapter from the active profile (fast switch).
+		active, _ := s.providerState()
+		if active == "" {
+			return nil, fmt.Errorf("no active provider configured")
+		}
+		if _, err := s.applyProviderConfig(active); err != nil {
+			return nil, err
+		}
+		return s.providerDescribeResp(), nil
+
+	case "provider.delete":
+		// {id} -> provider.describe：从 provider 命名空间移除一个 profile。
+		id, _ := payload["id"].(string)
+		if id == "" {
+			return nil, fmt.Errorf("provider.delete requires an id")
+		}
+		if s.Settings != nil {
+			if _, err := s.Settings.Mutate("provider", []settings.Op{
+				{Op: "unset", Path: []string{"profiles", id}},
+			}); err != nil {
+				return nil, err
+			}
+		}
+		active, _ := s.providerState()
+		if active == id {
+			// 删除了当前 active：清空 active。
+			if s.Settings != nil {
+				if _, err := s.Settings.Mutate("provider", []settings.Op{
+					{Op: "unset", Path: []string{"active"}},
+				}); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return s.providerDescribeResp(), nil
+
+	case "provider.models":
+		// {profileId?} -> {models, selected}：从目标 profile 的 protocol/baseUrl 拉取模型。
+		profileID, _ := payload["profileId"].(string)
+		active, profiles := s.providerState()
+		if profileID == "" {
+			profileID = active
+		}
+		if profileID == "" {
+			return map[string]any{"models": llm.DefaultModels, "selected": s.configuredModel()}, nil
+		}
+		p, ok := profiles[profileID]
+		if !ok {
+			return map[string]any{"models": llm.DefaultModels, "selected": s.configuredModel()}, nil
+		}
+		protocol := p.Protocol
+		if protocol == "" || protocol == "deepseek" {
+			protocol = llm.ProtocolOpenAICompletions
+		}
+		key := ""
+		if s.Credentials != nil && p.APIKeyRef != "" {
+			if k, kerr := s.Credentials.ResolveValue(p.APIKeyRef); kerr == nil {
+				key = k
+			}
+		}
+		fctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		models, err := llm.FetchModelsFor(fctx, protocol, p.BaseURL, key, nil)
+		if err != nil {
+			return map[string]any{"models": llm.DefaultModels, "selected": s.configuredModel(), "fetchError": err.Error()}, nil
+		}
+		if len(models) == 0 {
+			models = llm.DefaultModels
+		}
+		return map[string]any{"models": models, "selected": s.configuredModel()}, nil
 
 	case "jobs.list":
 		sessionID, _ := payload["sessionId"].(string)
@@ -569,6 +837,56 @@ func (s *Server) dispatch(ctx any, method string, payload map[string]any) (any, 
 			return nil, fmt.Errorf("unknown job %q for this session", jobID)
 		}
 		return map[string]any{"killed": jobID}, nil
+
+	case "plugin.list":
+		list := []map[string]any{}
+		if s.Plugins != nil {
+			for _, p := range s.Plugins.ListInfo() {
+				list = append(list, pluginInfoValue(p))
+			}
+		}
+		return map[string]any{"plugins": list}, nil
+
+	case "plugin.install":
+		if s.Plugins == nil {
+			return nil, fmt.Errorf("plugin service unavailable")
+		}
+		path, _ := payload["path"].(string)
+		if path == "" {
+			return nil, fmt.Errorf("plugin.install requires a path")
+		}
+		info, err := s.Plugins.InstallFromPath(ctx, path, s.PluginDir)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"plugin": pluginInfoValue(info)}, nil
+
+	case "plugin.uninstall":
+		if s.Plugins == nil {
+			return nil, fmt.Errorf("plugin service unavailable")
+		}
+		name, _ := payload["name"].(string)
+		if name == "" {
+			return nil, fmt.Errorf("plugin.uninstall requires a name")
+		}
+		if err := s.Plugins.Uninstall(name); err != nil {
+			return nil, err
+		}
+		return map[string]any{"uninstalled": name}, nil
+
+	case "plugin.enable":
+		if s.Plugins == nil {
+			return nil, fmt.Errorf("plugin service unavailable")
+		}
+		name, _ := payload["name"].(string)
+		if name == "" {
+			return nil, fmt.Errorf("plugin.enable requires a name")
+		}
+		enabled, _ := payload["enabled"].(bool)
+		if err := s.Plugins.SetEnabled(name, enabled); err != nil {
+			return nil, err
+		}
+		return map[string]any{"name": name, "enabled": enabled}, nil
 
 	case "approval.respond":
 		// GUI 对 host/permission-request 的一次性决策（allow_once/deny/cancel）。
@@ -635,19 +953,363 @@ func (s *Server) hostVersion() string {
 	return "dev"
 }
 
-// configuredModel returns the active model id for meter/selection purposes. The
-// host's Model (default "deepseek-chat") is authoritative; a malformed value
-// falls back to the catalog's first (default chat) model.
-func (s *Server) configuredModel() string {
-	if s.Model == "" {
-		return llm.DefaultModels[0].ID
+// providerProfile is the resolved view of one provider configuration.
+type providerProfile struct {
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Protocol      string         `json:"protocol"`
+	BaseURL       string         `json:"baseUrl"`
+	Model         string         `json:"model"`
+	APIKeyRef     string         `json:"apiKeyRef"`
+	KeyConfigured bool           `json:"keyConfigured"`
+	KeySource     string         `json:"keySource"`
+	KeyWritable   bool           `json:"keyWritable"`
+	Raw           map[string]any `json:"-"`
+}
+
+// providerState reads the "provider" settings namespace into an active id and a
+// map of resolved profiles. It tolerates an unregistered/absent namespace.
+func (s *Server) providerState() (string, map[string]providerProfile) {
+	active := ""
+	profiles := map[string]providerProfile{}
+	if s.Settings == nil {
+		return active, profiles
 	}
-	for _, m := range llm.DefaultModels {
-		if m.ID == s.Model {
-			return m.ID
+	v, err := s.Settings.Get("provider")
+	if err != nil {
+		return active, profiles
+	}
+	raw, _ := v.(map[string]any)
+	if raw == nil {
+		return active, profiles
+	}
+	if a, ok := raw["active"].(string); ok {
+		active = a
+	}
+	pm, _ := raw["profiles"].(map[string]any)
+	if pm == nil {
+		return active, profiles
+	}
+	for id, pv := range pm {
+		pmap, _ := pv.(map[string]any)
+		if pmap == nil {
+			continue
+		}
+		p := providerProfile{
+			ID:        id,
+			Name:      strAny(pmap["name"], id),
+			Protocol:  strAny(pmap["protocol"], llm.ProtocolOpenAICompletions),
+			BaseURL:   strAny(pmap["baseUrl"], llm.DefaultDeepSeekBaseURL),
+			Model:     strAny(pmap["model"], llm.DefaultDeepSeekModel),
+			APIKeyRef: strAny(pmap["apiKeyRef"], "DEEPSEEK_API_KEY"),
+			Raw:       pmap,
+		}
+		if s.Credentials != nil {
+			if info, err := s.Credentials.Describe(p.APIKeyRef); err == nil {
+				p.KeyConfigured = info.Configured
+				p.KeySource = info.Source
+				p.KeyWritable = info.Writable
+			}
+		}
+		profiles[id] = p
+	}
+	return active, profiles
+}
+
+// providerDescribeResp renders the provider.describe payload.
+func (s *Server) providerDescribeResp() map[string]any {
+	active, profiles := s.providerState()
+	usable := false
+	for _, p := range profiles {
+		if p.ID == active && p.KeyConfigured {
+			usable = true
 		}
 	}
+	list := make([]map[string]any, 0, len(profiles))
+	for _, p := range profiles {
+		list = append(list, map[string]any{
+			"id":            p.ID,
+			"name":          p.Name,
+			"protocol":      p.Protocol,
+			"baseUrl":       p.BaseURL,
+			"model":         p.Model,
+			"apiKeyRef":     p.APIKeyRef,
+			"keyConfigured": p.KeyConfigured,
+			"keySource":     p.KeySource,
+			"keyWritable":   p.KeyWritable,
+		})
+	}
+	return map[string]any{"active": active, "profiles": list, "usable": usable}
+}
+
+// setActiveProvider persists the active id and reconfigures the adapter.
+func (s *Server) setActiveProvider(id string) (map[string]any, error) {
+	if s.Settings != nil {
+		if _, err := s.Settings.Mutate("provider", []settings.Op{
+			{Op: "set", Path: []string{"active"}, Value: id},
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := s.applyProviderConfig(id); err != nil {
+		return nil, err
+	}
+	return s.providerDescribeResp(), nil
+}
+
+// applyProviderConfig reconfigures the live adapter from the named profile so
+// it takes effect without a restart. The profile is turned into a protocol
+// adapter and swapped into the process Router (or replaces LlmAdapter and
+// live agents when the adapter is not a Router).
+func (s *Server) applyProviderConfig(id string) (map[string]any, error) {
+	_, profiles := s.providerState()
+	p, ok := profiles[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown provider profile %q", id)
+	}
+	protocol := p.Protocol
+	if protocol == "" || protocol == "deepseek" {
+		protocol = llm.ProtocolOpenAICompletions
+	}
+	adapter, err := llm.NewProtocolAdapter(llm.ProviderProfile{
+		Protocol:       protocol,
+		BaseURL:        p.BaseURL,
+		Model:          p.Model,
+		APIKeyResolver: s.keyResolverFor(p.APIKeyRef),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if p.Model != "" {
+		s.Model = p.Model
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.LlmAdapter.(*llm.Router); ok {
+		r.Swap(adapter)
+	} else {
+		s.LlmAdapter = adapter
+		for _, ag := range s.agents {
+			if ag != nil {
+				ag.LlmAdapter = adapter
+			}
+		}
+	}
+	if p.Model != "" {
+		for _, ag := range s.agents {
+			if ag != nil {
+				ag.ModelName = p.Model
+			}
+		}
+	}
+	return s.providerDescribeResp(), nil
+}
+
+// HydrateRuntime applies the persisted provider profile and selected model so
+// the live adapter matches disk (not only the CLI --model flag). Call after
+// Settings and Credentials are attached. SeedDefaultProvider is invoked first.
+func (s *Server) HydrateRuntime() {
+	s.SeedDefaultProvider()
+	active, _ := s.providerState()
+	if active != "" {
+		if _, err := s.applyProviderConfig(active); err != nil {
+			// Adapter stays on the process default; picker still lists catalog.
+			_ = err
+		}
+	}
+	if s.Settings == nil {
+		return
+	}
+	v, err := s.Settings.Get("general")
+	if err != nil {
+		return
+	}
+	raw, _ := v.(map[string]any)
+	if raw == nil {
+		return
+	}
+	model, _ := raw["model"].(string)
+	if model == "" {
+		return
+	}
+	s.Model = model
+	switch a := s.LlmAdapter.(type) {
+	case *llm.Router:
+		a.SetModel(model)
+	case *llm.DeepSeekAdapter:
+		a.SetModel(model)
+	}
+}
+
+// SeedDefaultProvider writes a `deepseek` openai-completions profile when the
+// provider namespace has no profiles yet.
+func (s *Server) SeedDefaultProvider() {
+	if s.Settings == nil {
+		return
+	}
+	_, profiles := s.providerState()
+	if len(profiles) > 0 {
+		return
+	}
+	cur := map[string]any{
+		"id":        "deepseek",
+		"name":      "deepseek",
+		"protocol":  llm.ProtocolOpenAICompletions,
+		"baseUrl":   llm.DefaultDeepSeekBaseURL,
+		"model":     llm.DefaultDeepSeekModel,
+		"apiKeyRef": "DEEPSEEK_API_KEY",
+	}
+	ops := []settings.Op{
+		{Op: "set", Path: []string{"profiles", "deepseek"}, Value: cur},
+	}
+	active, _ := s.providerState()
+	if active == "" {
+		ops = append(ops, settings.Op{Op: "set", Path: []string{"active"}, Value: "deepseek"})
+	}
+	_, _ = s.Settings.Mutate("provider", ops)
+}
+
+// keyResolverFor binds a credential reference (default DEEPSEEK_API_KEY).
+func (s *Server) keyResolverFor(ref string) func() (string, error) {
+	if ref == "" {
+		ref = "DEEPSEEK_API_KEY"
+	}
+	return func() (string, error) {
+		if s.Credentials == nil {
+			return "", nil
+		}
+		return s.Credentials.ResolveValue(ref)
+	}
+}
+
+// pluginInfoValue maps plugin.PluginInfo onto a camelCase RPC object.
+func pluginInfoValue(p plugin.PluginInfo) map[string]any {
+	caps := p.Capabilities
+	if caps == nil {
+		caps = []string{}
+	}
+	return map[string]any{
+		"name":         p.Name,
+		"abiVersion":   p.ABIVersion,
+		"status":       p.Status,
+		"command":      p.Command,
+		"source":       p.Source,
+		"capabilities": caps,
+		"error":        p.Error,
+	}
+}
+
+// ensureLiveAgent returns a live actor for sessionID, spawning (or replacing a
+// dead map entry) the same way session.resume does. A stored session is never
+// 404'd just because the actor is missing.
+func (s *Server) ensureLiveAgent(sessionID string) (*agent.Agent, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("sessionId is required")
+	}
+	s.mu.RLock()
+	ag, exists := s.agents[sessionID]
+	s.mu.RUnlock()
+	if exists && ag.Alive() {
+		return ag, nil
+	}
+	header, ok := s.lookupHeader(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+	s.spawnAgent(header)
+	s.mu.RLock()
+	ag = s.agents[sessionID]
+	s.mu.RUnlock()
+	if ag == nil || !ag.Alive() {
+		return nil, fmt.Errorf("session not found or active: %s", sessionID)
+	}
+	return ag, nil
+}
+
+// keyResolver returns a resolver bound to the current provider profile's
+// apiKeyRef (falling back to DEEPSEEK_API_KEY), for fetching models.
+func (s *Server) keyResolver() func() (string, error) {
+	return func() (string, error) {
+		ref := "DEEPSEEK_API_KEY"
+		active, profiles := s.providerState()
+		if active != "" {
+			if p, ok := profiles[active]; ok && p.APIKeyRef != "" {
+				ref = p.APIKeyRef
+			}
+		}
+		if s.Credentials == nil {
+			return "", nil
+		}
+		return s.Credentials.ResolveValue(ref)
+	}
+}
+
+// rpcCtx returns a bounded context for outbound provider calls during an RPC.
+func (s *Server) rpcCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// The timeout is the bound; we intentionally let the caller run to completion.
+	_ = cancel
+	return ctx
+}
+
+func strAny(v any, def string) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return def
+}
+
+// configuredModel returns the active model id for meter/selection purposes.
+// s.Model is authoritative and is never clamped to the static catalog, so a
+// live provider id stays selected. Empty falls back to the active profile's
+// model, then DefaultModels[0].
+func (s *Server) configuredModel() string {
+	if s.Model != "" {
+		return s.Model
+	}
+	active, profiles := s.providerState()
+	if active != "" {
+		if p, ok := profiles[active]; ok && p.Model != "" {
+			return p.Model
+		}
+	}
+	if len(llm.DefaultModels) == 0 {
+		return llm.DefaultDeepSeekModel
+	}
 	return llm.DefaultModels[0].ID
+}
+
+// modelInfoMaps is the llm.models wire shape: [{id, name, contextWindow, modalities}].
+func modelInfoMaps(models []llm.ModelInfo) []map[string]any {
+	list := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		list = append(list, map[string]any{
+			"id":            m.ID,
+			"name":          m.Name,
+			"contextWindow": m.ContextWindow,
+			"modalities":    m.Modalities,
+		})
+	}
+	return list
+}
+
+// mergeModelCatalog returns live models first, then any fallback id not already present.
+func mergeModelCatalog(live, fallback []llm.ModelInfo) []llm.ModelInfo {
+	out := make([]llm.ModelInfo, 0, len(live)+len(fallback))
+	seen := make(map[string]struct{}, len(live)+len(fallback))
+	for _, src := range [][]llm.ModelInfo{live, fallback} {
+		for _, m := range src {
+			if m.ID == "" {
+				continue
+			}
+			if _, ok := seen[m.ID]; ok {
+				continue
+			}
+			seen[m.ID] = struct{}{}
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // workspaceList returns the real workspace surface. When a WorkspaceMgr is set,
@@ -724,6 +1386,59 @@ func settingsHasDocument(m *settings.Manager) bool {
 		}
 	}
 	return m.DocumentExists()
+}
+
+// spawnAgent starts (or replaces) the in-process actor for header. NewAgent
+// already seeds seq from the store so resume appends contiguously. A previous
+// !Alive() entry left by session.stop is replaced.
+func (s *Server) spawnAgent(header session.SessionHeader) {
+	id := header.ID
+	ringBuf := storage.NewRingBuffer(512)
+	ag := agent.NewAgent(header, ringBuf, nil, s.Store, s.Tools, s.LlmAdapter, "You are DSHX Assistant.", s.configuredModel())
+	ag.HookBus = s.HookBus
+	ag.Hooks = s.Hooks
+	ag.AutoTitle = true
+	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
+		return s.askApproval(id, prompt, options)
+	}
+	ag.Start()
+
+	sub := ag.Subscribe()
+	go func() {
+		for env := range sub {
+			s.Hub.BroadcastSessionEvent(id, env)
+		}
+	}()
+
+	s.mu.Lock()
+	old := s.agents[id]
+	s.agents[id] = ag
+	s.mu.Unlock()
+	if old != nil && old != ag {
+		old.Stop()
+	}
+}
+
+// lookupHeader finds a session header by id from the store, else a live/dead
+// in-memory actor still held in the map.
+func (s *Server) lookupHeader(id string) (session.SessionHeader, bool) {
+	if s.Store != nil {
+		list, err := s.Store.ListSessions()
+		if err == nil {
+			for _, h := range list {
+				if h.ID == id {
+					return h, true
+				}
+			}
+		}
+	}
+	s.mu.RLock()
+	ag, ok := s.agents[id]
+	s.mu.RUnlock()
+	if ok && ag != nil {
+		return ag.Header, true
+	}
+	return session.SessionHeader{}, false
 }
 
 // askApproval issues one host-level permission request and waits for the GUI's

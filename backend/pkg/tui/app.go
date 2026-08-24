@@ -1,10 +1,10 @@
 package tui
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,38 +16,22 @@ import (
 	"dsh-go/pkg/tools"
 )
 
-// Terminal colors using standard ANSI escape codes for zero-dependency instant startup
-const (
-	ColorReset   = "\033[0m"
-	ColorBold    = "\033[1m"
-	ColorDim     = "\033[2m"
-	ColorRed     = "\033[31m"
-	ColorGreen   = "\033[32m"
-	ColorYellow  = "\033[33m"
-	ColorBlue    = "\033[34m"
-	ColorMagenta = "\033[35m"
-	ColorCyan    = "\033[36m"
-	ColorGray    = "\033[90m"
-)
-
-// approvalCh carries permission requests from agent goroutines to the TUI main
-// loop (single-reader stdin design). inputCh is the single stdin pump consumed
-// by both message entry and approval prompts.
-var approvalCh = make(chan approvalRequest, 4)
-var inputCh = make(chan string, 64)
-
-// approvalRequest is one in-flight permission request handed from the agent
-// goroutine to the interactive TUI main loop. The main loop reads the user's
-// decision from stdin and resolves the channel (y=allow once / n=deny /
-// c=cancel).
-type approvalRequest struct {
-	prompt   string
-	decision chan tools.ApprovalDecision
+func enterAltScreen() {
+	enableVT()
+	fmt.Fprint(os.Stdout, "\033[?1049h\033[2J\033[H")
 }
 
-// RunTUI launches the ultra-fast native terminal interactive mode.
+func leaveAltScreen() {
+	fmt.Fprint(os.Stdout, "\033[?1049l")
+}
+
+// RunTUI launches the native terminal interactive mode.
 func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string) {
-	printBanner()
+	enterAltScreen()
+	defer leaveAltScreen()
+
+	ui := newUI(os.Stdout)
+	defer ui.close()
 
 	sessionID := fmt.Sprintf("tui-%d", time.Now().UnixNano())
 	header := session.SessionHeader{
@@ -57,11 +41,14 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 	}
 
 	ringBuf := storage.NewRingBuffer(512)
-	ag := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter, "You are DSH Terminal Assistant.", modelName)
+	ag := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter, "You are DSHX Assistant.", modelName)
+	approvalCh := make(chan approvalRequest, 4)
 	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
-		// Run the approval prompt through the main loop so the single stdin
-		// reader owns all input; the loop replies on req.decision.
-		req := approvalRequest{prompt: prompt, decision: make(chan tools.ApprovalDecision, 1)}
+		req := approvalRequest{
+			prompt:   prompt,
+			options:  options,
+			decision: make(chan tools.ApprovalDecision, 1),
+		}
 		approvalCh <- req
 		return <-req.decision, nil
 	}
@@ -69,92 +56,61 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 	ag.Start()
 	defer ag.Stop()
 
-	// Goroutine to render streaming event frames in real time
 	go func() {
 		for env := range eventsChan {
-			switch env.Type {
-			case session.EventTurnStart:
-				fmt.Printf("\n%s[Turn Start]%s\n", ColorCyan, ColorReset)
-
-			case session.EventAssistantChunk:
-				// 流式文本增量直刷（assistant/chunk → llm.StreamChunk）
-				var chunkPayload struct {
-					Chunk llm.StreamChunk `json:"chunk"`
-				}
-				_ = json.Unmarshal(env.Data, &chunkPayload)
-				switch chunkPayload.Chunk.Type {
-				case llm.ChunkTextDelta:
-					fmt.Print(ColorGreen + chunkPayload.Chunk.Text + ColorReset)
-				case llm.ChunkReasoningDelta:
-					fmt.Print(ColorGray + chunkPayload.Chunk.Text + ColorReset)
-				}
-
-			case session.EventToolCall:
-				var tc session.ToolCallPayload
-				_ = json.Unmarshal(env.Data, &tc)
-				fmt.Printf("\n%s[Tool Call] %s %s%s\n", ColorYellow, tc.Name, tc.Arguments, ColorReset)
-
-			case session.EventToolResult:
-				var tr session.ToolResultPayload
-				_ = json.Unmarshal(env.Data, &tr)
-				var text string
-				for _, b := range tr.Message.Content {
-					if b.Type == "text" {
-						text += b.Text
-					}
-				}
-				if text == "" {
-					text = "(no text output)"
-				}
-				status := "OK"
-				if tr.Error != nil {
-					status = "ERROR"
-				}
-				fmt.Printf("%s[Tool %s] %s%s\n", ColorBlue, status, text, ColorReset)
-
-			case session.EventTurnEnd:
-				fmt.Printf("%s\n[Turn Completed]%s\n\n%s> %s", ColorDim, ColorReset, ColorBold, ColorReset)
+			text, promptAfter := formatEnvelope(env)
+			if text != "" {
+				ui.write(text)
+			}
+			if promptAfter {
+				ui.prompt()
 			}
 		}
 	}()
 
-	// Input pump: one reader goroutine owns stdin; the main loop consumes
-	// both user lines and approval requests from the single channel.
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			inputCh <- scanner.Text()
-		}
-	}()
+	inputCh := startStdinPump()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
 
-	fmt.Printf("%s> %s", ColorBold, ColorReset)
+	ui.write(banner())
+	ui.prompt()
+
 	for {
 		select {
-		case line := <-inputCh:
+		case <-interrupt:
+			ui.write("\nExiting DSHX TUI.\n")
+			return
+		case req := <-approvalCh:
+			ui.write(formatApproval(req))
+			if !readApproval(inputCh, ui, req) {
+				return
+			}
+		case line, ok := <-inputCh:
+			if !ok {
+				return
+			}
+			ui.consumed()
 			line = strings.TrimSpace(line)
 			if line == "" {
-				fmt.Printf("%s> %s", ColorBold, ColorReset)
+				ui.prompt()
 				continue
 			}
 			if line == "/exit" || line == "/quit" {
-				fmt.Println("Exiting DSH TUI.")
+				ui.write("Exiting DSHX TUI.\n")
 				return
 			}
 			if line == "/help" {
-				printHelp()
-				fmt.Printf("%s> %s", ColorBold, ColorReset)
+				ui.write(helpText(toolReg))
+				ui.prompt()
 				continue
 			}
 			if line == "/clear" {
-				fmt.Print("\033[2J\033[H")
-				printBanner()
-				fmt.Printf("%s> %s", ColorBold, ColorReset)
+				ui.clear()
+				ui.write(banner())
+				ui.prompt()
 				continue
 			}
-			// Resolve known slash commands through the shared registry: the
-			// command/run -> command/done lifecycle lands in the session log
-			// (upstream dsh-commands), so the TUI, gateway RPC and Godot share
-			// one command table. Unknown /lines fall through to the model.
 			if strings.HasPrefix(line, "/") && toolReg != nil && toolReg.Commands != nil {
 				if res := toolReg.Commands.Execute(tools.CommandInvocation{
 					SessionID: sessionID,
@@ -171,18 +127,20 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 					},
 					Policy: toolReg.Policy,
 				}, line); res != nil {
-					if res.Text != "" && res.Text != "exit" {
-						fmt.Printf("%s%s%s\n", ColorCyan, res.Text, ColorReset)
-					}
 					if res.Text == "exit" {
-						fmt.Println("Exiting DSH TUI.")
+						ui.write("Exiting DSHX TUI.\n")
 						return
 					}
-					fmt.Printf("%s> %s", ColorBold, ColorReset)
+					if res.Text != "" {
+						ui.write(ColorCyan + res.Text + ColorReset)
+						if !strings.HasSuffix(res.Text, "\n") {
+							ui.write("\n")
+						}
+					}
+					ui.prompt()
 					continue
 				}
 			}
-			// Post prompt to agent turn loop
 			ag.PostUserMessage(session.UserMessagePayload{
 				ID:   fmt.Sprintf("tui-msg-%d", time.Now().UnixNano()),
 				Role: "user",
@@ -191,53 +149,42 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 				},
 				Source: session.MessageSource{Kind: "user"},
 			})
-		case req := <-approvalCh:
-			interactiveApproval(req)
 		}
 	}
 }
 
-// interactiveApproval prints one permission prompt and reads y/n/c from the
-// TUI input channel, blocking until a valid decision is entered.
-func interactiveApproval(req approvalRequest) {
-	fmt.Printf("\n%s[Permission Required]%s %s\n", ColorYellow, ColorReset, req.prompt)
-	fmt.Printf("  %sy%s = allow once   %sn%s = deny   %sc%s = cancel%s\n> ",
-		ColorGreen, ColorReset, ColorRed, ColorReset, ColorMagenta, ColorReset, ColorReset)
+func readApproval(inputCh <-chan string, ui *UI, req approvalRequest) bool {
 	for {
-		line := <-inputCh
-		line = strings.TrimSpace(strings.ToLower(line))
-		switch line {
-		case "y", "yes", "allow", "once":
-			req.decision <- tools.ApprovalAllowOnce
-			fmt.Printf("%s> %s", ColorBold, ColorReset)
-			return
-		case "n", "no", "deny", "reject":
-			req.decision <- tools.ApprovalDeny
-			fmt.Printf("%s> %s", ColorBold, ColorReset)
-			return
-		case "c", "cancel":
+		line, ok := <-inputCh
+		if !ok {
 			req.decision <- tools.ApprovalCancel
-			fmt.Printf("%s> %s", ColorBold, ColorReset)
-			return
-		default:
-			fmt.Print("  无效选择，请输入 y / n / c: ")
+			return false
 		}
+		ui.consumed()
+		if d, ok := parseApproval(line, req.options); ok {
+			req.decision <- d
+			return true
+		}
+		ui.write("  无效选择，请输入 y / n / c 或选项编号/id\n" + ColorBold + "? " + ColorReset)
 	}
 }
 
-func printBanner() {
-	fmt.Printf("%s%s=== DeepSeek-Harness (DSH) Native Terminal TUI ===%s\n", ColorBold, ColorCyan, ColorReset)
-	fmt.Printf("%sPowered by Go 1.25 + Event Sourcing + Actor Engine%s\n", ColorDim, ColorReset)
-	fmt.Printf("Type your instructions or %s/help%s for commands, %s to quit.\n\n", ColorYellow, ColorReset, ColorRed+"/exit"+ColorReset)
-}
-
-func printHelp() {
-	fmt.Println("\nAvailable Commands:")
-	fmt.Println("  /help     - Show this help message")
-	fmt.Println("  /clear    - Clear screen")
-	fmt.Println("  /exit     - Exit TUI mode")
-	fmt.Println("\nTool Permission Prompts:")
-	fmt.Println("  y - Allow once")
-	fmt.Println("  n - Deny (reject once)")
-	fmt.Println("  c - Cancel")
+func helpText(toolReg *tools.ToolRegistry) string {
+	var b strings.Builder
+	b.WriteString("\nCommands:\n")
+	b.WriteString("  /help     Show this help\n")
+	b.WriteString("  /clear    Clear the screen\n")
+	b.WriteString("  /exit     Leave TUI (/quit)\n")
+	if toolReg != nil && toolReg.Commands != nil {
+		defs := toolReg.Commands.List()
+		sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
+		for _, d := range defs {
+			if d.Name == "help" || d.Name == "exit" {
+				continue
+			}
+			fmt.Fprintf(&b, "  /%-8s %s\n", d.Name, d.Description)
+		}
+	}
+	b.WriteString("\nApprovals: y = allow once, n = deny, c = cancel; or optionId / 1..n\n")
+	return b.String()
 }

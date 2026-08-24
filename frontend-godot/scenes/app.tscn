@@ -1,0 +1,134 @@
+[gd_scene load_steps=16 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/app.gd" id="1_app"]
+[ext_resource type="Script" path="res://scripts/net/dsh_client.gd" id="2_client"]
+[ext_resource type="Script" path="res://scripts/state/store.gd" id="3_store"]
+[ext_resource type="PackedScene" path="res://scenes/chrome/sidebar.tscn" id="4_sidebar"]
+[ext_resource type="PackedScene" path="res://scenes/chrome/header.tscn" id="5_header"]
+[ext_resource type="PackedScene" path="res://scenes/chrome/composer.tscn" id="6_composer"]
+[ext_resource type="PackedScene" path="res://scenes/chrome/details.tscn" id="7_details"]
+[ext_resource type="PackedScene" path="res://scenes/chrome/hero.tscn" id="8_hero"]
+[ext_resource type="Script" path="res://scripts/ui/virtual_list.gd" id="9_chat"]
+[ext_resource type="Script" path="res://scripts/views/trajectory.gd" id="10_traj"]
+[ext_resource type="Script" path="res://scripts/overlays/approval.gd" id="11_appr"]
+[ext_resource type="Script" path="res://scripts/overlays/settings.gd" id="12_set"]
+[ext_resource type="Script" path="res://scripts/overlays/onboarding.gd" id="13_onb"]
+[ext_resource type="Script" path="res://scripts/overlays/jobs.gd" id="14_jobs"]
+[ext_resource type="Script" path="res://scripts/overlays/plugins.gd" id="15_plug"]
+
+[node name="App" type="PanelContainer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_app")
+
+[node name="DshClient" type="Node" parent="."]
+unique_name_in_owner = true
+script = ExtResource("2_client")
+
+[node name="SessionStore" type="Node" parent="."]
+unique_name_in_owner = true
+script = ExtResource("3_store")
+
+[node name="Frame" type="HBoxContainer" parent="."]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="Sidebar" parent="Frame" instance=ExtResource("4_sidebar")]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(280, 0)
+layout_mode = 2
+
+[node name="Center" type="PanelContainer" parent="Frame"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CenterVBox" type="VBoxContainer" parent="Frame/Center"]
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="Header" parent="Frame/Center/CenterVBox" instance=ExtResource("5_header")]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="ChatTab" type="VBoxContainer" parent="Frame/Center/CenterVBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/separation = 0
+
+[node name="ChatList" type="ScrollContainer" parent="Frame/Center/CenterVBox/ChatTab"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+horizontal_scroll_mode = 0
+script = ExtResource("9_chat")
+
+[node name="Hero" parent="Frame/Center/CenterVBox/ChatTab" instance=ExtResource("8_hero")]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="TrajectoryTab" type="Control" parent="Frame/Center/CenterVBox"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+script = ExtResource("10_traj")
+
+[node name="ComposerSeat" type="MarginContainer" parent="Frame/Center/CenterVBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 0
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_bottom = 12
+
+[node name="ComposerCenter" type="CenterContainer" parent="Frame/Center/CenterVBox/ComposerSeat"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Composer" parent="Frame/Center/CenterVBox/ComposerSeat/ComposerCenter" instance=ExtResource("6_composer")]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="Details" parent="Frame" instance=ExtResource("7_details")]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(360, 0)
+layout_mode = 2
+
+[node name="ApprovalOverlay" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 50
+script = ExtResource("11_appr")
+
+[node name="SettingsOverlay" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 30
+script = ExtResource("12_set")
+
+[node name="OnboardingOverlay" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 20
+script = ExtResource("13_onb")
+
+[node name="JobsOverlay" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 40
+script = ExtResource("14_jobs")
+
+[node name="PluginsOverlay" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 31
+script = ExtResource("15_plug")

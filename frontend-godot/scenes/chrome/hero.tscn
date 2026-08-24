@@ -1,0 +1,45 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/hero.gd" id="1_script"]
+
+[node name="Hero" type="CenterContainer"]
+size_flags_horizontal = 3
+size_flags_vertical = 3
+script = ExtResource("1_script")
+
+[node name="VBox" type="VBoxContainer" parent="."]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="Headline" type="HBoxContainer" parent="VBox"]
+layout_mode = 2
+alignment = 1
+theme_override_constants/separation = 10
+
+[node name="Mark" type="TextureRect" parent="VBox/Headline"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(34, 34)
+layout_mode = 2
+size_flags_vertical = 4
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Title" type="Label" parent="VBox/Headline"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "DSHX"
+horizontal_alignment = 1
+
+[node name="Subtitle" type="Label" parent="VBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "高性能 Agent 工作台"
+horizontal_alignment = 1
+
+[node name="Grid" type="GridContainer" parent="VBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 4
+theme_override_constants/h_separation = 12
+theme_override_constants/v_separation = 12
+columns = 2

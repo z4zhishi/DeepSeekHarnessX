@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,6 +28,9 @@ type DownlinkHub struct {
 	muxClients  map[*websocket.Conn]string // conn -> subscribed sessionId
 	hostClients map[*websocket.Conn]bool
 	mu          sync.RWMutex
+	// Replay returns stored envelopes for mux catch-up. Invoked without
+	// holding h.mu so a store query cannot deadlock the hub.
+	Replay func(sessionID string, fromSeq int) []session.SessionEnvelope
 }
 
 // NewDownlinkHub creates a new downlink hub.
@@ -46,6 +50,28 @@ func (h *DownlinkHub) HandleMux(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	sessionID := r.URL.Query().Get("sessionId")
+	fromSeq := 0
+	if v := r.URL.Query().Get("fromSeq"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			fromSeq = n
+		}
+	}
+
+	// Replay historical envelopes before registering for live events so a
+	// reconnecting GUI sees the log. Query the store without holding h.mu.
+	var history []session.SessionEnvelope
+	if replay := h.Replay; replay != nil && sessionID != "" {
+		history = replay(sessionID, fromSeq)
+	}
+	for i := range history {
+		data, err := encodeSessionEvent(&history[i])
+		if err != nil {
+			continue
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			return
+		}
+	}
 
 	h.mu.Lock()
 	h.muxClients[conn] = sessionID
@@ -97,13 +123,17 @@ func (h *DownlinkHub) HandleHost(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 }
 
-// BroadcastSessionEvent sends a session event to clients subscribed to that session.
-func (h *DownlinkHub) BroadcastSessionEvent(sessionID string, env *session.SessionEnvelope) {
-	data, err := json.Marshal(map[string]any{
+func encodeSessionEvent(env *session.SessionEnvelope) ([]byte, error) {
+	return json.Marshal(map[string]any{
 		"type":    "server-request",
 		"method":  "session/event",
 		"payload": env,
 	})
+}
+
+// BroadcastSessionEvent sends a session event to clients subscribed to that session.
+func (h *DownlinkHub) BroadcastSessionEvent(sessionID string, env *session.SessionEnvelope) {
+	data, err := encodeSessionEvent(env)
 	if err != nil {
 		return
 	}
