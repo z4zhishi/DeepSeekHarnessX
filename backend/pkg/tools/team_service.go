@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -236,6 +237,13 @@ func (ts *TeamService) teamTaskUpdate(ctx ToolExecutionContext, id string, expec
 			}
 			next.Description = d
 		}
+		if raw, ok := fields["write_scopes"]; ok {
+			var scopes []string
+			for _, v := range raw.([]any) {
+				scopes = append(scopes, v.(string))
+			}
+			next.WriteScopes = scopes
+		}
 	case "set_dependencies":
 		var deps []string
 		if raw, ok := fields["blocked_by"]; ok {
@@ -311,7 +319,27 @@ func (ts *TeamService) teamTaskUpdate(ctx ToolExecutionContext, id string, expec
 	return teamTaskViewOf(state, next), nil
 }
 
-func callerID(ctx ToolExecutionContext) string { return ctx.CallerID }
+// callerID resolves the executing agent's identity. The shared pipeline never
+// populates CallerID (loop.go omits it), so a single-lead deployment collapses
+// to the lead session id; a host that populates CallerID for teammates gets
+// per-member identity.
+func callerID(ctx ToolExecutionContext) string {
+	if ctx.CallerID != "" {
+		return ctx.CallerID
+	}
+	return ctx.SessionID
+}
+
+// toAnySlice converts a string slice to the []any the task-update field
+// decoder expects (the fold path reads blocked_by / write_scopes via
+// raw.([]any)).
+func toAnySlice(in []string) []any {
+	out := make([]any, len(in))
+	for i, v := range in {
+		out[i] = v
+	}
+	return out
+}
 
 // resolveTeamTarget maps a member name (or "lead") to its session id.
 func resolveTeamTarget(state *teamFoldState, leadID, raw string) (string, error) {
@@ -617,4 +645,280 @@ func (ts *TeamService) interruptAgent(ctx ToolExecutionContext, target string) (
 	}
 	child.Interrupt()
 	return map[string]any{"target": name, "previousStatus": "running"}, nil
+}
+
+// RegisterTeamSession declares one lead session's Team runtime on demand and
+// returns a teardown that stops live children and unregisters it. The agent
+// loop (or any host owning a lead session) calls this once per lead session;
+// without it the fold-based tools still work, but spawn_teammate has no child
+// registry and wait_agent/interrupt/send have no live peer handles. Safe to
+// call repeatedly for the same session id.
+func RegisterTeamSession(sessionID string) func() {
+	globalTeam.registerLead(sessionID)
+	return func() { globalTeam.unregisterLead(sessionID) }
+}
+
+// RegisterTeamTools installs the model-facing Agent Teams tool set (upstream
+// @deepseek-ai/tool-agent-team): spawn_teammate, send_message, followup_task,
+// list_agents, wait_agent, interrupt_agent, team_task_create, team_task_list,
+// team_task_get, and team_task_update. Team tools are opt-in; wiring (Phase 2)
+// decides whether to call this from the shared pipeline.
+func (r *ToolRegistry) RegisterTeamTools() {
+	r.Register(ToolDefinition{
+		Name:        "spawn_teammate",
+		Description: "Create one named, durable teammate. Only the Team Lead may call this tool.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"name": { "type": "string", "description": "Unique lower-kebab-case teammate name." },
+				"description": { "type": "string", "description": "Short description of the delegated responsibility." },
+				"prompt": { "type": "string", "description": "Complete initial task for the teammate." },
+				"context": { "type": "string", "enum": ["fresh", "fork"], "description": "fresh starts without Lead history; fork inherits completed Lead turns. Defaults to fresh." }
+			},
+			"required": ["name", "description", "prompt"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				Prompt      string `json:"prompt"`
+				Context     string `json:"context"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			if args.Context == "" {
+				args.Context = "fresh"
+			}
+			member, err := globalTeam.spawnTeammate(ctx, args.Name, args.Description, args.Prompt, args.Context)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"member": member}, nil
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "send_message",
+		Description: "Send durable information to another Team member without starting an idle member.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"target": { "type": "string", "description": "Team member name, or lead." },
+				"message": { "type": "string", "description": "Self-contained message for the target." }
+			},
+			"required": ["target", "message"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Target  string `json:"target"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			return globalTeam.teamMessageSend(ctx, args.Target, args.Message, "quiet")
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "followup_task",
+		Description: "Send a durable follow-up task to another Team member and start a turn when needed.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"target": { "type": "string", "description": "Team member name, or lead." },
+				"message": { "type": "string", "description": "Self-contained message for the target." }
+			},
+			"required": ["target", "message"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Target  string `json:"target"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			return globalTeam.teamMessageSend(ctx, args.Target, args.Message, "wakeup")
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:           "list_agents",
+		Description:    "List the Lead and every durable teammate with current runtime status.",
+		ParametersJSON: json.RawMessage(`{"type": "object", "properties": {}, "required": []}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			return globalTeam.teamListMembers(ctx)
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "wait_agent",
+		Description: "Wait for the next teammate status, mailbox, or shared-task change after this call starts. This never wakes inactive members and returns noProgress immediately when no other member is running or provisioning. Re-list after wakeup or timeout instead of polling.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"timeout_ms": { "type": "integer", "description": "Wait duration in milliseconds, from 10000 through 3600000. Defaults to 30000." }
+			},
+			"required": []
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				TimeoutMs int `json:"timeout_ms"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			if args.TimeoutMs == 0 {
+				args.TimeoutMs = 30000
+			}
+			return globalTeam.teamWait(ctx, args.TimeoutMs)
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "interrupt_agent",
+		Description: "Interrupt one teammate's current turn while preserving its pending inbox. Team Lead only.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"target": { "type": "string", "description": "Teammate name." }
+			},
+			"required": ["target"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Target string `json:"target"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			return globalTeam.interruptAgent(ctx, args.Target)
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "team_task_create",
+		Description: "Create one unowned pending task on the shared Team task board.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"subject": { "type": "string", "description": "Concise task title." },
+				"description": { "type": "string", "description": "Complete task details and acceptance criteria." },
+				"blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task ids that must complete first." },
+				"write_scopes": { "type": "array", "items": { "type": "string" }, "description": "Advisory workspace-relative file or directory prefixes this task expects to modify." }
+			},
+			"required": ["subject", "description"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Subject     string   `json:"subject"`
+				Description string   `json:"description"`
+				BlockedBy   []string `json:"blocked_by"`
+				WriteScopes []string `json:"write_scopes"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			return globalTeam.teamTaskCreate(ctx, args.Subject, args.Description, args.BlockedBy, args.WriteScopes)
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "team_task_list",
+		Description: "List shared tasks, including readiness, owner, revision, blockers, and write-scope warnings.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Optional exact status filter." }
+			},
+			"required": []
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			tasks, err := globalTeam.teamTaskList(ctx, args.Status)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"tasks": tasks}, nil
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "team_task_get",
+		Description: "Read the complete latest value of one shared task before changing or executing it.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"task_id": { "type": "string", "description": "Shared task id." }
+			},
+			"required": ["task_id"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				TaskID string `json:"task_id"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			return globalTeam.teamTaskGet(ctx, args.TaskID)
+		},
+	})
+
+	r.Register(ToolDefinition{
+		Name:        "team_task_update",
+		Description: "Compare-and-set a shared task action using the latest revision from team_task_get or team_task_list.",
+		ParametersJSON: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"task_id": { "type": "string", "description": "Shared task id." },
+				"expected_revision": { "type": "integer", "description": "Current task revision used as the CAS precondition." },
+				"action": { "type": "string", "enum": ["claim", "release", "edit", "set_dependencies", "complete", "reopen", "reassign", "delete"], "description": "Task transition to apply." },
+				"subject": { "type": "string", "description": "Replacement title for edit." },
+				"description": { "type": "string", "description": "Replacement details for edit." },
+				"blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Complete blocker list for set_dependencies." },
+				"write_scopes": { "type": "array", "items": { "type": "string" }, "description": "Replacement advisory write scopes for edit." },
+				"owner": { "type": "string", "description": "Member name for reassign; omit to unassign." }
+			},
+			"required": ["task_id", "expected_revision", "action"]
+		}`),
+		Execute: func(ctx ToolExecutionContext, argsJSON string) (any, error) {
+			var args struct {
+				TaskID           string   `json:"task_id"`
+				ExpectedRevision int      `json:"expected_revision"`
+				Action           string   `json:"action"`
+				Subject          *string  `json:"subject"`
+				Description      *string  `json:"description"`
+				BlockedBy        []string `json:"blocked_by"`
+				WriteScopes      []string `json:"write_scopes"`
+				Owner            *string  `json:"owner"`
+			}
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				return nil, err
+			}
+			fields := map[string]any{}
+			if args.Subject != nil {
+				fields["subject"] = *args.Subject
+			}
+			if args.Description != nil {
+				fields["description"] = *args.Description
+			}
+			if args.BlockedBy != nil {
+				fields["blocked_by"] = toAnySlice(args.BlockedBy)
+			}
+			if args.WriteScopes != nil {
+				fields["write_scopes"] = toAnySlice(args.WriteScopes)
+			}
+			if args.Owner != nil {
+				fields["owner"] = *args.Owner
+			}
+			return globalTeam.teamTaskUpdate(ctx, args.TaskID, args.ExpectedRevision, args.Action, fields)
+		},
+	})
 }

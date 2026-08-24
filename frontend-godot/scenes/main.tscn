@@ -104,6 +104,12 @@ text = "Settings"
 layout_mode = 2
 text = "Connecting... "
 
+[node name="ModelPicker" type="OptionButton" parent="Frame/Center/HeaderBar"]
+layout_mode = 2
+custom_minimum_size = Vector2(140, 0)
+disabled = true
+tooltip_text = "Model (read-only: from request/header config; llm.models not yet produced by backend)"
+
 [node name="ChatTab" type="VBoxContainer" parent="Frame/Center"]
 layout_mode = 2
 size_flags_vertical = 3

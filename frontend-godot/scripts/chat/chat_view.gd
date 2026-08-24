@@ -10,13 +10,21 @@ class_name ChatView
 ## 卡片节点一直保留在 _items 中（只挂/卸，不销毁），满足"复用节点"要求。
 ##
 ## 对外 API 与 main.gd 现有调用兼容：
-##   add_message(role,text) / add_card(card) / append_streaming(delta)
+##   add_message(role,text[,message_id]) / add_card(card) / append_streaming(delta)
 ##   end_streaming() / clear_messages()
+##
+## message-feedback（B1）：add_message("assistant", text, messageId) 会为消息卡
+## 附加 like/dislike + note 控制条；按钮经 feedback_rating / feedback_note 信号
+## 交由 main.gd 接后端 feedback.put RPC。messageId 存于卡片 set_meta。
+
+signal feedback_rating(message_id: String, rating: String)
+signal feedback_note(message_id: String, note: String)
 
 const OVERSCAN := 80
 const CHAR_H := 18
 const PAD := 16
 const MIN_H := 40
+const FOOTER_H := 30
 
 var _content: Control
 var _items: Array = []            # Array[Control]
@@ -40,8 +48,11 @@ func _ready() -> void:
 
 ## ---------------- 对外 API ----------------
 
-func add_message(role: String, text: String) -> void:
-	_append_item(_new_text_card(role, text))
+func add_message(role: String, text: String, message_id: String = "") -> void:
+	var card := _new_text_card(role, text)
+	if message_id != "":
+		card.set_meta("message_id", message_id)
+	_append_item(card)
 
 func add_card(card: Control) -> void:
 	_append_item(card)
@@ -53,7 +64,7 @@ func append_streaming(delta: String) -> void:
 		_last_stream_idx = _items.size() - 1
 		_stream_text = ""
 	_stream_text += delta
-	var lbl: RichTextLabel = (_items[_last_stream_idx] as PanelContainer).get_node("Body")
+	var lbl: RichTextLabel = _find_body(_items[_last_stream_idx])
 	lbl.text = _bb_assistant(_stream_text)
 	_heights[_last_stream_idx] = _estimate_height(_items[_last_stream_idx])
 	_request_sync()
@@ -61,6 +72,17 @@ func append_streaming(delta: String) -> void:
 func end_streaming() -> void:
 	_last_stream_idx = -1
 	_stream_text = ""
+
+## B1：流式 assistant 消息补记 message id（feedback 按钮按 id 定位）。
+func set_last_assistant_message_id(message_id: String) -> void:
+	if _last_stream_idx < 0 or _last_stream_idx >= _items.size():
+		return
+	_items[_last_stream_idx].set_meta("message_id", message_id)
+	# 若卡片尚未带反馈 footer（流式建卡时无 id），这里补挂
+	if _items[_last_stream_idx].get_node_or_null("VBox/FeedbackRow") == null:
+		_add_feedback_footer(_items[_last_stream_idx], message_id)
+	_heights[_last_stream_idx] = _estimate_height(_items[_last_stream_idx])
+	_request_sync()
 
 func clear_messages() -> void:
 	_unmount_all()
@@ -88,10 +110,88 @@ func _new_text_card(role: String, text: String) -> Control:
 	label.name = "Body"
 	panel.add_child(label)
 	_populate_text(panel, role, text)
+	if role == "assistant" and panel.has_meta("message_id"):
+		_add_feedback_footer(panel, str(panel.get_meta("message_id")))
 	return panel
 
+## 为 assistant 消息附加 like/dislike + note 控制条（message-feedback UI）。
+## 按钮只发信号，RPC 由 main.gd 经 client.feedback_put 接线。
+func _add_feedback_footer(panel: Control, message_id: String) -> void:
+	var body: Control = panel.get_node_or_null("Body")
+	if body == null:
+		return
+	var row := HBoxContainer.new()
+	row.name = "FeedbackRow"
+	row.custom_minimum_size = Vector2(0, FOOTER_H)
+	row.add_theme_constant_override("separation", 6)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(spacer)
+
+	var like := Button.new()
+	like.text = "👍 Like"
+	like.flat = true
+	like.add_theme_font_size_override("font_size", 12)
+	like.pressed.connect(func(): feedback_rating.emit(message_id, "like"))
+	row.add_child(like)
+
+	var dislike := Button.new()
+	dislike.text = "👎 Dislike"
+	dislike.flat = true
+	dislike.add_theme_font_size_override("font_size", 12)
+	dislike.pressed.connect(func(): feedback_rating.emit(message_id, "dislike"))
+	row.add_child(dislike)
+
+	var note_btn := Button.new()
+	note_btn.text = "Add note"
+	note_btn.flat = true
+	note_btn.add_theme_font_size_override("font_size", 12)
+	note_btn.pressed.connect(func(): _open_note_popup(panel, message_id))
+	row.add_child(note_btn)
+
+	# 将 Body 收进外层 VBox，Footer 追加其后
+	var vbox := VBoxContainer.new()
+	panel.remove_child(body)
+	body.name = "Body"
+	vbox.add_child(body)
+	vbox.add_child(row)
+	panel.add_child(vbox)
+
+## note 弹层：输入反馈说明，确认后发 feedback_note 信号（经 feedback.put 的 note 字段）。
+func _open_note_popup(panel: Control, message_id: String) -> void:
+	var dialog := AcceptDialog.new()
+	dialog.title = "Feedback note"
+	dialog.ok_button_text = "Save"
+	dialog.dialog_text = "Optional explanation:"
+	var line := LineEdit.new()
+	line.placeholder_text = "Why this rating? (optional)"
+	line.custom_minimum_size = Vector2(320, 0)
+	dialog.add_child(line)
+	# AcceptDialog 内容区：包一个 MarginContainer 让输入框可见
+	var vbox := VBoxContainer.new()
+	vbox.add_child(line)
+	# 替换默认 Message label 为提示 + 输入
+	var msg := dialog.get_node_or_null("Message") as Label
+	if msg != null:
+		msg.text = "Attach a note to this message:"
+	dialog.add_child(vbox)
+	dialog.confirmed.connect(func():
+		var note := line.text.strip_edges()
+		if note != "":
+			feedback_note.emit(message_id, note)
+	)
+	get_tree().current_scene.add_child(dialog)
+	dialog.popup_centered(Vector2(380, 160))
+
 func _populate_text(panel: Control, role: String, text: String) -> void:
-	var label: RichTextLabel = panel.get_node("Body")
+	var label: RichTextLabel = panel.get_node_or_null("Body")
+	if label == null:
+		label = RichTextLabel.new()
+		label.bbcode_enabled = true
+		label.fit_content = true
+		label.scroll_active = false
+		label.name = "Body"
+		panel.add_child(label)
 	var escaped := text.replace("[", "[lb]").replace("]", "[/lb]")
 	match role:
 		"user":
@@ -106,13 +206,22 @@ func _populate_text(panel: Control, role: String, text: String) -> void:
 func _bb_assistant(t: String) -> String:
 	return "[b][color=#81c784]DSH:[/color][/b]\n" + t
 
-func _estimate_height(card: Control) -> int:
+## 取卡片正文 RichTextLabel：旧版 Body 直接挂 panel，新版经 VBox 包裹。
+func _find_body(card: Control) -> RichTextLabel:
 	if card is PanelContainer and card.get_node_or_null("Body") is RichTextLabel:
-		var lbl: RichTextLabel = card.get_node_or_null("Body")
-		var lines := 1
-		if lbl.text != "":
-			lines = maxi(lbl.text.count("\n") + 1, 1)
-		return maxi(MIN_H, int(lines * CHAR_H + PAD))
+		return card.get_node_or_null("Body") as RichTextLabel
+	if card is PanelContainer and card.get_node_or_null("VBox/Body") is RichTextLabel:
+		return card.get_node_or_null("VBox/Body") as RichTextLabel
+	return null
+
+func _estimate_height(card: Control) -> int:
+	if card is PanelContainer:
+		var lbl := _find_body(card)
+		if lbl != null:
+			var lines := 1
+			if lbl.text != "":
+				lines = maxi(lbl.text.count("\n") + 1, 1)
+			return maxi(MIN_H, int(lines * CHAR_H + PAD) + FOOTER_H)
 	return 0
 
 func _request_sync() -> void:

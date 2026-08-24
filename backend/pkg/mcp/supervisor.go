@@ -326,10 +326,15 @@ func (s *Supervisor) run() {
 			return
 		}
 		if conn == nil {
+			// 快照 connSet 到局部变量再 select：字段仅能在 mu 下读写，避免
+			// signalConnSet 锁内重建字段与 run 无锁读字段的竞态。
+			s.mu.Lock()
+			connSet := s.connSet
+			s.mu.Unlock()
 			select {
 			case <-s.stop:
 				return
-			case <-s.connSet:
+			case <-connSet:
 				continue
 			}
 		}

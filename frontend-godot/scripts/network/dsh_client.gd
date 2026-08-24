@@ -155,3 +155,49 @@ func list_workspaces(callback: Callable) -> void:
 # settings 面板骨架：后端暂无独立 settings RPC，先经 host.describe 取运行时信息。
 func fetch_settings(callback: Callable) -> void:
 	describe(callback)
+
+## ---- settings RPC（对应 A2 契约 settings.describe / settings.mutate）----
+
+# settings.describe -> {namespaces:[{ns,base,user,revision,schema,writable}], writable, hasDocument}
+func settings_describe(callback: Callable) -> void:
+	_rpc("settings.describe", {}, callback)
+
+# settings.mutate 入参 {ns, ops:[{op:"set"|"unset", path, value?}]} -> {revision}
+func settings_mutate(ns: String, ops: Array, callback: Callable) -> void:
+	_rpc("settings.mutate", {"ns": ns, "ops": ops}, callback)
+
+## ---- model 选择：后端 llm.models 若已产则用之；否则降级由 request/header 的 config.model 只读展示 ----
+
+# llm.models -> {models:[{id,name,contextWindow,modalities}], active}
+func list_models(callback: Callable) -> void:
+	_rpc("llm.models", {}, callback)
+
+## ---- session.context RPC（对应 A2 契约：上下文占用度量）----
+
+# session.context -> {tokenUsage, contextPressure, contextLimit, projectedTokens,
+#                     messageCount, breakdown, tokenUsageInput, tokenUsageOutput}
+func session_context(session_id: String, callback: Callable) -> void:
+	_rpc("session.context", {"sessionId": session_id}, callback)
+
+## ---- feedback RPC（对应后端 feedback.list / feedback.put / feedback.delete）----
+
+# feedback.list -> {items:[{messageId,rating,note?,version,createdAt,updatedAt}]}
+func feedback_list(session_id: String, callback: Callable) -> void:
+	_rpc("feedback.list", {"sessionId": session_id}, callback)
+
+# feedback.put 入参 {sessionId, messageId, rating, note?, version?} -> {item}
+# rating 用 "like" | "dislike"；version 为空表示新建。冲突时返回权威当前 item。
+func feedback_put(session_id: String, message_id: String, rating: String, note: String = "", version: String = "", callback: Callable = Callable()) -> void:
+	var payload := {"sessionId": session_id, "messageId": message_id, "rating": rating}
+	if note != "":
+		payload["note"] = note
+	if version != "":
+		payload["version"] = version
+	_rpc("feedback.put", payload, callback)
+
+# feedback.delete -> {ok}（version 缺省时视为已不存在）
+func feedback_delete(session_id: String, message_id: String, version: String = "", callback: Callable = Callable()) -> void:
+	var payload := {"sessionId": session_id, "messageId": message_id}
+	if version != "":
+		payload["version"] = version
+	_rpc("feedback.delete", payload, callback)

@@ -346,6 +346,9 @@ type TokenUsage struct {
 	InputTokens     int `json:"inputTokens"`
 	OutputTokens    int `json:"outputTokens"`
 	CacheReadTokens int `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens counts tokens written into the provider cache during a
+	// call (upstream llm/types.ts usage.cacheWriteTokens).
+	CacheWriteTokens int `json:"cacheWriteTokens,omitempty"`
 	// ReasoningTokens counts tokens spent in a separate reasoning/thinking
 	// channel (DeepSeek completion_tokens_details.reasoning_tokens).
 	ReasoningTokens int `json:"reasoningTokens,omitempty"`

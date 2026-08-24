@@ -3,28 +3,34 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"dsh-go/pkg/acp"
 	"dsh-go/pkg/agent"
+	"dsh-go/pkg/credential"
 	"dsh-go/pkg/embedgui"
+	"dsh-go/pkg/feedback"
 	"dsh-go/pkg/gateway"
 	"dsh-go/pkg/llm"
 	"dsh-go/pkg/mcp"
 	"dsh-go/pkg/plugin"
 	"dsh-go/pkg/session"
+	"dsh-go/pkg/settings"
 	"dsh-go/pkg/storage"
 	"dsh-go/pkg/subagent"
 	"dsh-go/pkg/tools"
 	"dsh-go/pkg/tui"
+	"dsh-go/pkg/workspace"
 )
 
 // version is injected at build time via `-ldflags "-X main.version=..."`.
@@ -45,12 +51,28 @@ type modeDeps struct {
 	plugins   *plugin.Registry
 	dataDir   string
 	model     string
+	// pluginDir is scanned for external subprocess plugins.
 	pluginDir string
-	initErr   error
+	// workspaceRoots are the workspace roots seeded into the workspace manager
+	// at startup (usually the configured data dir / cwd); empty uses the cwd.
+	workspaceRoots []string
+	// hookBus is the shared plugin event bus captured at build time so the
+	// hooks runtime can dispatch through the same bus plugins use. Set in
+	// build(); may be nil for tooling-only modes.
+	hookBus *plugin.EventBus
+	initErr error
 }
 
 func newModeDeps(needStore, mock bool, dataDir, model, storeKind, pluginDir string) *modeDeps {
-	return &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir}
+	d := &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir}
+	// Seed the workspace manager's default root with the process working
+	// directory (a real, browsable tree; the storage data dir is a flat file
+	// store, not a good picker root). Empty workspaceRoots later falls back to
+	// the cwd at scan time, matching the legacy workspace.list fallback.
+	if cwd, err := os.Getwd(); err == nil {
+		d.workspaceRoots = []string{cwd}
+	}
+	return d
 }
 
 // build lazily assembles tooling and (when needStore) storage. Mode code calls
@@ -83,14 +105,21 @@ func (m *modeDeps) build() {
 		// Upstream credential semantics: no key is not a load-time failure and
 		// does not silently fall back to a mock. Only an explicit --mock opts
 		// into the demo adapter; otherwise we build a keyless DeepSeekAdapter
-		// whose Stream() reports MISSING_CREDENTIAL at call time.
+		// whose Stream() reports MISSING_CREDENTIAL at call time, resolving the
+		// key through the credential seam (default reference DEEPSEEK_API_KEY)
+		// once per operation so a changed credential takes effect without a
+		// restart.
 		var adapter llm.LlmAdapter
 		if m.mock {
 			adapter = &llm.MockLlmAdapter{}
 		} else {
+			creds := credential.NewManager(credential.Options{})
 			adapter = llm.NewDeepSeekAdapter(llm.DeepSeekConfig{
-				APIKey: os.Getenv("DEEPSEEK_API_KEY"),
+				APIKey: "",
 				Model:  m.model,
+				APIKeyResolver: func() (string, error) {
+					return creds.ResolveValue("DEEPSEEK_API_KEY")
+				},
 			})
 		}
 		m.adapter = adapter
@@ -98,11 +127,19 @@ func (m *modeDeps) build() {
 		m.subagents = subagent.NewManager(m.toolReg, m.adapter)
 		m.subagents.RegisterSubagentTools(m.toolReg)
 
+		// Agent Teams runtime wiring: the process-global TeamService spawns
+		// teammate children as full DSH agents (shared store/registry/adapter)
+		// whenever spawn_teammate is invoked. Wire lazily through build() so
+		// both server and headless hosts get a live provider.
+		tools.SetTeamSpawner(teamSpawner(m.store, m.toolReg, m.adapter))
+
 		// 插件边界：把"扁平单例"收敛为"能力 + 注册表 + 事件总线"。
 		// 内置能力经 Registry.Register 编译期注册；外部子进程插件经
 		// Registry.ScanDir 扫描插件目录（*.json manifest）后由 Reconcile 拉起。
-		// 两者共享同一 ToolRegistry/CommandRegistry/EventBus。
-		m.plugins = plugin.NewRegistry(m.toolReg, m.toolReg.Commands, plugin.NewEventBus(), log.Default())
+		// 两者共享同一 ToolRegistry/CommandRegistry/EventBus。注册表持有唯一的
+		// EventBus（hookBus），hooks 运行时与插件监听共享同一总线。
+		m.hookBus = plugin.NewEventBus()
+		m.plugins = plugin.NewRegistry(m.toolReg, m.toolReg.Commands, m.hookBus, log.Default())
 		if m.pluginDir != "" {
 			if err := m.plugins.ScanDir(context.Background(), m.pluginDir); err != nil {
 				m.initErr = fmt.Errorf("扫描插件目录失败: %w", err)
@@ -190,6 +227,8 @@ func main() {
 		// server/gui 共用进程级 subagent 管理器：host 下行广播
 		// host/subagent-started|finished，Godot 谱系树据此渲染。
 		srv := gateway.NewServer(store, toolReg, adapter)
+		wireSettings(srv)
+		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
 		_ = embedgui.LaunchAllInOneGUIWithServer(*port, srv)
 
@@ -206,6 +245,8 @@ func main() {
 			fatal(err)
 		}
 		srv := gateway.NewServer(store, toolReg, adapter)
+		wireSettings(srv)
+		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
 		addr := fmt.Sprintf("127.0.0.1:%d", *port)
 		fmt.Printf("DSH Go API Gateway listening on http://%s\n", addr)
@@ -283,6 +324,8 @@ func main() {
 		// server/gui 共用进程级 subagent 管理器：host 下行广播
 		// host/subagent-started|finished，Godot 谱系树据此渲染。
 		srv := gateway.NewServer(store, toolReg, adapter)
+		wireSettings(srv)
+		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
 		_ = embedgui.LaunchAllInOneGUIWithServer(*port, srv)
 	}
@@ -291,6 +334,179 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
+}
+
+// teamSpawner wires the Agent Teams runtime's teammate provider to a real DSH
+// agent. Each spawned teammate is a full agent on the shared store/registry/
+// adapter. The returned TeamChild satisfies tools.TeamChild via the agent.
+// store may be nil (headless spawn of an in-memory child is unsupported, so
+// the host must own a store for Team to be live); callers only invoke this
+// after deps.Full() has opened the store.
+func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter) tools.TeamSpawner {
+	return func(name, description, prompt, context string) (tools.TeamChild, error) {
+		childID := fmt.Sprintf("team-%d/%s", time.Now().UnixNano(), name)
+		header := session.SessionHeader{
+			ID:              childID,
+			CreatedAt:       time.Now().UnixMilli(),
+			Cwd:             ".",
+			Origin:          "team",
+			DelegationDepth: 1,
+		}
+		ringBuf := storage.NewRingBuffer(256)
+		child := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter,
+			fmt.Sprintf("You are teammate '%s'. %s", name, description), "deepseek-chat")
+		child.AutoTitle = true
+		child.Start()
+		return &teamChildAgent{ag: child}, nil
+	}
+}
+
+// teamChildAgent adapts an *agent.Agent to the tools.TeamChild handle the
+// Team runtime drives (PostUserMessage/Interrupt/Status/Model/Stop).
+type teamChildAgent struct{ ag *agent.Agent }
+
+func (t *teamChildAgent) ID() string { return t.ag.Header.ID }
+func (t *teamChildAgent) PostUserMessage(msg session.UserMessagePayload) {
+	t.ag.PostUserMessage(msg)
+}
+func (t *teamChildAgent) Interrupt() {
+	t.ag.PostNextStep(session.ContentBlock{Type: "text", Text: "interrupt"})
+}
+func (t *teamChildAgent) Status() string {
+	if t.ag.IsRunning() {
+		return "running"
+	}
+	return "idle"
+}
+func (t *teamChildAgent) Model() string { return t.ag.ModelName }
+func (t *teamChildAgent) Stop()         { t.ag.Stop() }
+
+// generalSettingsSchema is the JSON Schema for the editable "general"
+// namespace (language + composerEnter), the minimal pre-provisioned namespace
+// proving the settings.describe / settings.mutate round-trip.
+var generalSettingsSchema = []byte(`{
+	"type": "object",
+	"properties": {
+		"language": { "type": "string", "default": "auto" },
+		"composerEnter": { "type": "boolean", "default": true }
+	}
+}`)
+
+// wireServerExt attaches the Phase-4 backend seams (hooks runtime, real
+// workspace backend, message-feedback sidecar) to a gateway server. It is
+// called alongside wireSettings for every server-hosted profile.
+func wireServerExt(srv *gateway.Server, deps *modeDeps) {
+	// CC-style hooks runtime: load the first available hooks.json and attach the
+	// shared registry's event bus + parsed hooks so every created session drives
+	// its four dispatch intercept points. Loaded once at startup; best-effort.
+	if h := deps.loadHooks(); h != nil {
+		srv.Hooks = h
+	}
+	srv.HookBus = deps.hookBus
+
+	// Real workspace backend: one manager rooted at the process working
+	// directory, seeded with the configured roots (if any). Drives
+	// workspace.list (real directory tree) + workspace.create.
+	wm := workspace.NewManager("")
+	for _, root := range deps.workspaceRoots {
+		if root == "" {
+			continue
+		}
+		if _, err := wm.Add(root); err != nil && !errors.Is(err, workspace.ErrAlreadyExists) {
+			log.Printf("workspace: add root %s failed: %v", root, err)
+		}
+	}
+	srv.WorkspaceMgr = wm
+
+	// Message-feedback sidecar: an in-memory per-session rating+note store.
+	if fb, err := feedback.NewStore(feedback.Config{MaxNoteBytes: 2048}); err == nil {
+		srv.Feedback = fb
+	} else {
+		log.Printf("feedback: store init failed: %v", err)
+	}
+
+	// Active model: seeds llm.models' selected id and the token meter's context
+	// window so session.context reports contextPressure against the right model.
+	srv.Model = deps.model
+}
+
+// loadHooks loads a CC-style hooks.json from $DSH_HOME/hooks.json, else
+// <cwd>/.claude/hooks.json, when present. Variable substitution is applied for
+// ${CLAUDE_PROJECT_DIR} (cwd) and ${CLAUDE_PLUGIN_ROOT}. Returns nil when no
+// file exists (hooks runtime inert) or the file fails to parse.
+func (m *modeDeps) loadHooks() *plugin.Hooks {
+	home := os.Getenv("DSH_HOME")
+	candidates := []string{}
+	if home != "" {
+		candidates = append(candidates, filepath.Join(home, "hooks.json"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, ".claude", "hooks.json"))
+	}
+	projectDir, _ := os.Getwd()
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		h, _, perr := plugin.ParseHooks(data, plugin.ParseOptions{
+			ProjectDir: projectDir,
+			PluginRoot: filepath.Dir(path),
+		})
+		if perr != nil {
+			log.Printf("hooks: parse %s failed: %v", path, perr)
+			continue
+		}
+		log.Printf("hooks: loaded %s", path)
+		return h
+	}
+	return nil
+}
+
+// wireSettings attaches the settings and credential backends to a gateway
+// server: it builds a $DSH_HOME/settings.yaml-backed Manager with the general
+// namespace pre-registered, and a credential Manager whose set/unset fan to
+// the server's host downlink as credential/updated events.
+func wireSettings(srv *gateway.Server) {
+	home := os.Getenv("DSH_HOME")
+	if home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			home = h
+		}
+	}
+	if home == "" {
+		return
+	}
+
+	// Settings backend: single-file YAML under $DSH_HOME.
+	settingsPath := filepath.Join(home, "settings.yaml")
+	settingsMgr := settings.NewManager(settingsPath, func(ns string, rev int, next, prev any) {
+		srv.Hub.BroadcastHostEvent("settings/updated", map[string]any{
+			"ns":       ns,
+			"revision": rev,
+			"next":     next,
+			"prev":     prev,
+		})
+	})
+	if err := settingsMgr.Register("general", generalSettingsSchema, settings.Options{Writable: true}); err != nil {
+		log.Printf("settings: register general failed: %v", err)
+		return
+	}
+	store := settings.NewFileStore(settingsPath)
+	if err := store.Load(settingsMgr); err != nil {
+		log.Printf("settings: load failed: %v", err)
+	}
+	srv.Settings = settingsMgr
+
+	// Credential backend: process env > $DSH_HOME/.credentials.yaml > cwd/.env
+	// > $DSH_HOME/.env. set/unset broadcast credential/updated.
+	creds := credential.NewManager(credential.Options{
+		DSHHome: home,
+		OnChanged: func(ref string) {
+			srv.Hub.BroadcastHostEvent("credential/updated", map[string]any{"ref": ref})
+		},
+	})
+	srv.Credentials = creds
 }
 
 func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model, system, prompt string) {

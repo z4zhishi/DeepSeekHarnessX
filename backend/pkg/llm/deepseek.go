@@ -31,6 +31,39 @@ const (
 	defaultDeepSeekWatchdog = 60 * time.Second
 )
 
+// ModelInfo describes one selectable model in the llm.models catalog served to
+// the frontend model picker. It mirrors the upstream DEFAULT_MODELS shape.
+type ModelInfo struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	ContextWindow int      `json:"contextWindow"`
+	Modalities    []string `json:"modalities"`
+}
+
+// DefaultModels is the model catalog aligned with the upstream DEFAULT_MODELS:
+// the deepseek-chat workhorse plus the reasoning variant. ContextWindow mirrors
+// the DeepSeek API's documented 128K window (the heuristic meter prices the
+// transcript against it for contextPressure).
+var DefaultModels = []ModelInfo{
+	{ID: "deepseek-chat", Name: "DeepSeek Chat", ContextWindow: 131072, Modalities: []string{"text"}},
+	{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner", ContextWindow: 131072, Modalities: []string{"text", "reasoning"}},
+}
+
+// ContextLimitForModel returns the context window (tokens) of a catalog model
+// for the token meter's pressure ratio. Unknown ids fall back to the default
+// chat model's window so a stale selection never zeroes pressure reporting.
+func ContextLimitForModel(model string) int {
+	if model == "" {
+		return DefaultModels[0].ContextWindow
+	}
+	for _, m := range DefaultModels {
+		if m.ID == model {
+			return m.ContextWindow
+		}
+	}
+	return DefaultModels[0].ContextWindow
+}
+
 // Typed error sentinels so callers can distinguish retryable vs fatal failures.
 var (
 	// ErrDeepSeekMissingCredential mirrors upstream adapter.ts: without an API
@@ -55,6 +88,12 @@ type DeepSeekConfig struct {
 	Timeout    time.Duration // whole request+stream deadline; <=0 -> defaultDeepSeekTimeout
 	Watchdog   time.Duration // max silence between SSE bytes; <=0 -> defaultDeepSeekWatchdog
 	HTTPClient *http.Client  // nil -> http.DefaultClient
+	// APIKeyResolver, when set, is consulted at Stream time when APIKey is
+	// empty. It lets the host resolve the key through the credential seam
+	// (default reference DEEPSEEK_API_KEY) so a changed credential reaches the
+	// next operation without a restart. It returns the resolved value and an
+	// error; an empty resolved value still reports MISSING_CREDENTIAL.
+	APIKeyResolver func() (string, error)
 }
 
 // DeepSeekAdapter implements LlmAdapter against the DeepSeek Chat Completions API.
@@ -99,10 +138,26 @@ func (d *DeepSeekAdapter) Stream(ctx context.Context, req ModelRequest) (<-chan 
 	chunkChan := make(chan StreamChunk, 64)
 	errChan := make(chan error, 1)
 
+	// Resolve the API key: an explicitly configured key wins; otherwise the
+	// host-provided resolver consults the credential seam (default reference
+	// DEEPSEEK_API_KEY) once per operation, so a changed credential reaches
+	// the next operation without a restart (upstream provider-local resolve).
+	key := d.cfg.APIKey
+	if key == "" && d.cfg.APIKeyResolver != nil {
+		if rk, rerr := d.cfg.APIKeyResolver(); rerr != nil {
+			errChan <- rerr
+			close(chunkChan)
+			close(errChan)
+			return chunkChan, errChan
+		} else {
+			key = rk
+		}
+	}
+
 	// Upstream adapter.ts returns MISSING_CREDENTIAL at stream call time when no
 	// key is configured (loading/catalog stay unaffected). Surface the same
 	// error here instead of proceeding to an upstream 401.
-	if d.cfg.APIKey == "" {
+	if key == "" {
 		errChan <- ErrDeepSeekMissingCredential
 		close(chunkChan)
 		close(errChan)
@@ -114,7 +169,7 @@ func (d *DeepSeekAdapter) Stream(ctx context.Context, req ModelRequest) (<-chan 
 		defer close(chunkChan)
 		defer close(errChan)
 		defer cancel()
-		d.stream(streamCtx, cancel, req, chunkChan, errChan)
+		d.stream(streamCtx, cancel, req, key, chunkChan, errChan)
 	}()
 
 	return chunkChan, errChan
@@ -513,6 +568,7 @@ func (d *DeepSeekAdapter) stream(
 	streamCtx context.Context,
 	cancel context.CancelFunc,
 	req ModelRequest,
+	apiKey string,
 	chunkChan chan<- StreamChunk,
 	errChan chan<- error,
 ) {
@@ -529,7 +585,7 @@ func (d *DeepSeekAdapter) stream(
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Authorization", "Bearer "+d.cfg.APIKey)
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	// Attribution headers mirror upstream adapter.ts: a stable harness user id,
 	// the session id when the call carries one, and the compaction marker.
 	httpReq.Header.Set("x-deepseek-harness-user-id", "dsh-go")

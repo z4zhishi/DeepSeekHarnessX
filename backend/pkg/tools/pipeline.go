@@ -89,6 +89,13 @@ func NewToolRegistry() *ToolRegistry {
 	r.RegisterGlobTool()
 	r.RegisterExitPlanModeTool()
 	r.RegisterScheduleTools()
+	// Phase 2（第二轮迁移 B/C 缺口）补齐的工具族：
+	r.RegisterImageTools()        // 视觉读图 read_image
+	r.RegisterPwshTools()         // pwsh 持久化会话
+	r.RegisterSessionQueryTools() // session_search / session_trace / session_event_read
+	r.RegisterSkillTools()        // skill / skill_list
+	r.RegisterTeamTools()         // Agent Teams 运行时工具（spawn_teammate 等）
+	r.RegisterWorkflowTools()     // workflow_run（subagent 工作流编排）
 	return r
 }
 

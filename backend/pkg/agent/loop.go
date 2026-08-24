@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 
 	"dsh-go/pkg/compaction"
 	"dsh-go/pkg/llm"
+	"dsh-go/pkg/plugin"
 	"dsh-go/pkg/session"
 	"dsh-go/pkg/storage"
 	"dsh-go/pkg/tools"
@@ -61,14 +64,34 @@ type Agent struct {
 	// Schedule is the session-local reminder dispatcher (upstream
 	// ScheduleRuntime): it wakes an idle agent with a due reminder and
 	// appends the schedule/change dispatch events.
-	Schedule   *tools.ScheduleDispatcher
-	ctx        context.Context
-	cancelFunc context.CancelFunc
+	Schedule *tools.ScheduleDispatcher
+	// HookBus optionally wires the CC-style hooks runtime into the agent loop.
+	// When both HookBus and Hooks are set, the four dispatch intercept points
+	// (UserPromptSubmit / PreToolUse / PostToolUse / Stop) run matching command
+	// hooks and emit hook/invoked + hook/result events into the session log.
+	// Dispatch is best-effort: a failing or missing hook never blocks the loop.
+	HookBus *plugin.EventBus
+	// Hooks is the parsed hooks.json configuration driven by HookBus.
+	Hooks *plugin.Hooks
+	// AutoTitle enables one-shot automatic session-title generation after the
+	// first eligible human message (prompt first-eligible last-turn mode).
+	// It defaults false so in-memory/test hosts stay title-free; the gateway,
+	// TUI, and headless hosts opt in. Title generation is never load-bearing:
+	// any failure silently degrades to the deterministic fallback.
+	AutoTitle bool
+	// teamTeardown stops the session's Team runtime (live children + registry)
+	// on Stop(). It is set once by Start() via tools.RegisterTeamSession.
+	teamTeardown func()
+	ctx          context.Context
+	cancelFunc   context.CancelFunc
 
 	seqCounter atomic.Int64
 	turnNumber atomic.Int32
 	stepNumber atomic.Int32
 	isRunning  atomic.Bool
+	// titleDone latches the one-shot automatic session-title generation for the
+	// first eligible user message (upstream session-title first-prompt mode).
+	titleDone atomic.Bool
 
 	// Turn/step lifecycle state machine (upstream loop contract):
 	// turn/start -> step/start -> step/end -> ... -> turn/end. Illegal jumps
@@ -375,16 +398,45 @@ func (a *Agent) Start() {
 	if a.Schedule != nil {
 		a.Schedule.Start()
 	}
+	// 注册本 lead 会话的 Team 运行时：spawn_teammate/wait/interrupt/send 需要
+	// 一个进程级 child 注册表。返回的 teardown 在 Stop() 里关闭 live children
+	// 并注销（重复调用幂等）。
+	a.teamTeardown = tools.RegisterTeamSession(a.Header.ID)
 	go a.actorLoop()
 }
 
 // Stop cancels ongoing execution.
 func (a *Agent) Stop() {
+	// CC Stop hook: runs once on agent teardown (best-effort; a missing runtime
+	// or a hook failure is a no-op and never blocks shutdown). turn 0 because a
+	// Stop may occur outside any turn.
+	a.dispatchHook(plugin.HookPointStop, "", 0)
+	if a.teamTeardown != nil {
+		td := a.teamTeardown
+		a.teamTeardown = nil
+		td()
+	}
 	a.cancelFunc()
 	if a.Schedule != nil {
 		a.Schedule.Stop()
 	}
 	tools.UnregisterScheduleEvents(a.Header.ID)
+}
+
+// IsRunning reports whether the actor is mid-turn (TeamChild.Status uses it).
+func (a *Agent) IsRunning() bool { return a.isRunning.Load() }
+
+// dispatchHook runs the CC-style hooks runtime at one interception point. It is
+// a no-op when the runtime is not wired (HookBus or Hooks nil). Each matching
+// command hook first emits hook/invoked, then (after running) hook/result, so
+// the durable log carries the paired lifecycle audit. A failure is isolated and
+// never blocks the loop; decisions are ignored (blocking via PreToolUse hooks is
+// intentionally not applied here — the loop keeps its own permission policy).
+func (a *Agent) dispatchHook(point, subject string, turn int) {
+	if a.HookBus == nil || a.Hooks == nil {
+		return
+	}
+	a.HookBus.DispatchHook(a.ctx, a.Hooks, point, subject, turn)
 }
 
 func (a *Agent) actorLoop() {
@@ -405,6 +457,9 @@ func (a *Agent) actorLoop() {
 
 			// 2. user/message
 			_, _ = a.EmitEvent(session.EventUserMessage, userMsg, &session.AppendSurfaceOp)
+			// CC UserPromptSubmit hook: runs after the human message enters the log.
+			// The turn number is already assigned by the transition machine.
+			a.dispatchHook(plugin.HookPointUserPromptSubmit, "", turn)
 
 			// Step loop
 			turnFinished := false
@@ -508,8 +563,11 @@ func (a *Agent) actorLoop() {
 					Reason: session.HeaderReasonInitial,
 				})
 
-				// Stream from LLM adapter
-				chunkChan, errChan := a.LlmAdapter.Stream(a.ctx, modelReq)
+				// Stream from LLM adapter, with provider-routed retry on
+				// retryable transient failures (RATE_LIMIT/SERVER/TIMEOUT/
+				// TRANSPORT). The default normal policy retries up to 5 times
+				// with exponential backoff + jitter (upstream llm-retry).
+				chunkChan, errChan := a.llmRetry(a.ctx, turn, step, modelReq, defaultRetryMax)
 				assembler := llm.NewBlockAssembler()
 
 				var pendingNextStep *session.ContentBlock
@@ -624,9 +682,30 @@ func (a *Agent) actorLoop() {
 							},
 						}
 
+						// CC PreToolUse hook: runs with the tool name as subject
+						// before the call executes (best-effort; a hook failure or
+						// "block" decision does not gate the loop's own approval
+						// policy).
+						a.dispatchHook(plugin.HookPointPreToolUse, tc.Name, turn)
+
 						resStr, isErr, _ := a.Tools.ExecutePipeline(execCtx, tc.Name, tc.Arguments)
 
-						view := buildToolResultView(tc.Name, resStr, isErr)
+						// Spill oversized plain-text results out of the model
+						// context: results over the threshold are persisted to a
+						// private session file and replaced with a head/tail
+						// preview + locator + retrieval hint. `read`/terminal
+						// tools skip the model-facing preview so a spill can
+						// never loop back into read (upstream spill-policy
+						// skips `read`). Best-effort: on any failure the inline
+						// result is kept unchanged.
+						resultText := resStr
+						if !skipSpillFor(tc.Name) && !isErr {
+							if preview, serr := tools.Save(a.Header.ID, tc.Name, resStr); serr == nil {
+								resultText = preview
+							}
+						}
+
+						view := buildToolResultView(tc.Name, resultText, isErr)
 						_, _ = a.EmitEvent(session.EventToolResult, session.ToolResultPayload{
 							Turn: turn,
 							Step: step,
@@ -634,12 +713,16 @@ func (a *Agent) actorLoop() {
 								ID:   fmt.Sprintf("tool-%d-%d-%s", turn, step, tc.ID),
 								Role: "user",
 								Content: []session.ContentBlock{
-									{Type: "tool-result", ToolCallID: tc.ID, Content: []session.ContentBlock{{Type: "text", Text: resStr}}, IsError: isErr},
+									{Type: "tool-result", ToolCallID: tc.ID, Content: []session.ContentBlock{{Type: "text", Text: resultText}}, IsError: isErr},
 								},
 								Source: session.MessageSource{Kind: "tool", CallID: tc.ID},
 							},
 							View: view,
 						}, &session.AppendSurfaceOp)
+
+						// CC PostToolUse hook: runs after the tool result entered
+						// the log, with the tool name as subject (best-effort).
+						a.dispatchHook(plugin.HookPointPostToolUse, tc.Name, turn)
 					}
 				} else {
 					// No more tools to run; turn complete
@@ -655,9 +738,309 @@ func (a *Agent) actorLoop() {
 				Reason: session.TurnEndReason{Kind: "completed"},
 			})
 			a.isRunning.Store(false)
+			// One-shot automatic session title on the first completed turn.
+			// Best-effort and never load-bearing: GenerateTitle already degrades
+			// any LLM failure to the deterministic fallback (or "" when there is
+			// no eligible user text), so a failed title never surfaces as an
+			// error here. nil adapter / empty log both emit a no-op title event.
+			if a.AutoTitle && a.titleDone.CompareAndSwap(false, true) {
+				a.generateSessionTitle()
+			}
 			// Idle-session compaction pressure check (log-only brackets).
 			a.maybeCompact()
 		}
+	}
+}
+
+// generateSessionTitle emits a log-only `session/title` snapshot from the full
+// session log (durable store, else ring, else segment log). It always succeeds
+// from the caller's perspective; a nil adapter or empty log simply yields an
+// empty-title no-op event, matching upstream's silent title service.
+func (a *Agent) generateSessionTitle() {
+	var events []session.SessionEnvelope
+	if a.persist != nil {
+		if evs, err := a.persist.GetEvents(a.Header.ID, 0); err == nil && len(evs) > 0 {
+			events = evs
+		}
+	}
+	if len(events) == 0 && a.RingBuf != nil {
+		if ptrs := a.RingBuf.GetSince(0); len(ptrs) > 0 {
+			events = make([]session.SessionEnvelope, len(ptrs))
+			for i, p := range ptrs {
+				events[i] = *p
+			}
+		}
+	}
+	if len(events) == 0 && a.SegmentLog != nil {
+		_, events, _ = a.SegmentLog.ReadAll()
+	}
+	// Eligible human messages that are durable at this point.
+	messages := CollectTitleMessages(events, -1)
+	seqs := make([]int, 0, len(messages))
+	for _, m := range messages {
+		seqs = append(seqs, m.Seq)
+	}
+	title, _ := GenerateTitle(context.Background(), a.LlmAdapter, events)
+	// Deterministic fallback / empty: single provider event, never a mock LLM
+	// dispatch (generation is off the main path).
+	_, _ = a.EmitEvent(session.EventSessionTitle, titleEventData{
+		Title:       title,
+		MessageSeqs: seqs,
+		Source:      titleSource{Kind: "fallback"},
+	})
+}
+
+// titleEventData is the log-only `session/title` snapshot payload (upstream
+// SessionTitleEventData). It never enters the model surface or derived history.
+type titleEventData struct {
+	Title       string      `json:"title"`
+	MessageSeqs []int       `json:"messageSeqs"`
+	Source      titleSource `json:"source"`
+}
+
+// titleSource records how an accepted session title was produced (upstream
+// SessionTitleSource). Only the deterministic fallback is wired here.
+type titleSource struct {
+	Kind string `json:"kind"`
+}
+
+// ---------------------------------------------------------------------------
+// llm-retry (upstream CK/packages/llm/llm-retry)
+// ---------------------------------------------------------------------------
+
+// defaultRetryMax is the default maximum number of retries after the first
+// attempt (upstream DEFAULT_MAX_RETRIES = 5).
+const defaultRetryMax = 5
+
+// defaultRetryInitialMs is the initial exponential-backoff delay (upstream
+// DEFAULT_INITIAL_DELAY_MS = 500).
+const defaultRetryInitialMs = 500
+
+// defaultRetryMaxMs caps the exponential backoff (upstream
+// DEFAULT_MAX_DELAY_MS = 10000).
+const defaultRetryMaxMs = 10_000
+
+// defaultRetryJitter is the symmetric jitter ratio (upstream
+// DEFAULT_JITTER_RATIO = 0.1).
+const defaultRetryJitter = 0.1
+
+// retryableCodes are the provider-neutral failure codes eligible for a normal
+// retry policy (upstream DEFAULT_RETRYABLE_CODES).
+var retryableCodes = map[string]bool{
+	"RATE_LIMIT": true,
+	"SERVER":     true,
+	"TIMEOUT":    true,
+	"TRANSPORT":  true,
+}
+
+// isRetryableCode reports whether a failure code qualifies for a normal retry.
+func isRetryableCode(code string) bool { return retryableCodes[code] }
+
+// llmRetryError is the provider-neutral failure fact the agent loop routes on.
+// It is a strict subset of the DeepSeekProviderError / transport errors the
+// deepseek adapter can produce.
+type llmRetryError struct {
+	message string
+	code    string
+	// providerRetryAfterMs is the upstream-requested delay in milliseconds;
+	// <=0 means absent.
+	providerRetryAfterMs int64
+}
+
+// llmRetry implements the provider-routed exponential-backoff retry policy on
+// the agent loop's model request (upstream llm-retry). It runs a private retry
+// loop in a goroutine that repeatedly calls Stream(); whenever a failed attempt
+// carries a retryable code it schedules a cancellable backoff wait — appending
+// an `llm/retry` event before the wait and an `llm/retry-started` event after it
+// — before retrying. Retries are transparent to the caller: healthy chunks and
+// the final finish stream through the returned chunk channel, and only the
+// terminal outcome (success, an exhausted budget, or a non-retryable failure)
+// is surfaced on the returned error channel. Context cancellation aborts a
+// pending wait without appending retry-started.
+//
+// The initial delay is the upstream's providerRetryAfterMs when present and
+// within the max cap, otherwise the local exponential backoff. Each scheduled
+// retry appends llm/retry (upstream LlmRetryEventData) and llm/retry-started
+// (LlmRetryStartedEventData); a terminal failure appends llm/retry with
+// outcome "gave-up".
+func (a *Agent) llmRetry(ctx context.Context, turn, step int, modelReq llm.ModelRequest, maxRetries int) (<-chan llm.StreamChunk, <-chan error) {
+	initial := time.Duration(defaultRetryInitialMs) * time.Millisecond
+	cap := time.Duration(defaultRetryMaxMs) * time.Millisecond
+	jitter := defaultRetryJitter
+
+	outChunk := make(chan llm.StreamChunk, 64)
+	outErr := make(chan error, 1)
+
+	go func() {
+		defer close(outChunk)
+		defer close(outErr)
+
+		// attempt counts completed retries (0 before any).
+		attempt := 0
+		for {
+			chunkChan, errChan := a.LlmAdapter.Stream(ctx, modelReq)
+
+			// Forward chunks and watch for the terminal error or clean finish.
+			// chunkChan is the authoritative stream (its close is the clean EOF);
+			// errChan only signals a fatal error when it delivers a non-nil value —
+			// a closed or nil errChan alongside a healthy chunk stream is normal
+			// adapter behavior and must not end the stream early.
+			var attemptErr error
+			streamDone := false
+			for !streamDone {
+				select {
+				case <-ctx.Done():
+					// Abort: cancellation wins over any pending retry.
+					return
+				case chunk, ok := <-chunkChan:
+					if !ok {
+						streamDone = true
+						continue
+					}
+					// Forward a healthy chunk (finish included) to the caller.
+					select {
+					case outChunk <- chunk:
+					case <-ctx.Done():
+						return
+					}
+				case err, ok := <-errChan:
+					if ok && err != nil {
+						attemptErr = err
+						streamDone = true
+					}
+					// ok=false (closed) or nil err: chunkChan still drives.
+				}
+			}
+			if attemptErr == nil {
+				// Clean success: the full stream (finish included) was forwarded.
+				return
+			}
+			failure := classifyLlmError(attemptErr)
+			if failure == nil || !isRetryableCode(failure.code) {
+				// Non-retryable terminal failure.
+				_, _ = a.EmitEvent(session.EventLlmRetry, map[string]any{
+					"turn": turn, "step": step, "retry": attempt + 1, "maxRetries": maxRetries,
+					"code": failureCode(failure), "message": attemptErr.Error(), "outcome": "gave-up",
+				})
+				outErr <- attemptErr
+				return
+			}
+			if attempt >= maxRetries {
+				// Budget exhausted: surface the last retryable error.
+				_, _ = a.EmitEvent(session.EventLlmRetry, map[string]any{
+					"turn": turn, "step": step, "retry": attempt, "maxRetries": maxRetries,
+					"code": failure.code, "message": "retry budget exhausted", "outcome": "gave-up",
+				})
+				outErr <- attemptErr
+				return
+			}
+			// Retryable with budget remaining. Respect the provider's retry-after
+			// when present and within the cap, else exponential backoff + jitter.
+			var delay time.Duration
+			if failure.providerRetryAfterMs > 0 {
+				p := time.Duration(failure.providerRetryAfterMs) * time.Millisecond
+				if p > cap {
+					delay = cap
+				} else {
+					delay = p
+				}
+			} else {
+				delay = backoffDelay(initial, cap, jitter, attempt+1)
+			}
+			// Durable audit of the scheduled retry (upstream llm/retry).
+			_, _ = a.EmitEvent(session.EventLlmRetry, map[string]any{
+				"turn": turn, "step": step, "retry": attempt + 1, "maxRetries": maxRetries,
+				"delayMs": int64(delay / time.Millisecond), "code": failure.code, "message": failure.message,
+				"outcome": "retried",
+			})
+			if !waitAbortable(ctx, delay) {
+				// Aborted while waiting: no retry-started; surface cancellation.
+				return
+			}
+			_, _ = a.EmitEvent(session.EventLlmRetryStarted, map[string]any{
+				"turn": turn, "step": step, "retry": attempt + 1,
+			})
+			attempt++
+		}
+	}()
+
+	return outChunk, outErr
+}
+
+// failureCode returns the classifier's code, or a fallback when it is nil.
+func failureCode(f *llmRetryError) string {
+	if f == nil {
+		return "UNKNOWN"
+	}
+	return f.code
+}
+
+// classifyLlmError maps an adapter error onto a provider-neutral retryable
+// classification, or nil when it is not a retryable failure. It understands the
+// deepseek adapter's typed DeepSeekProviderError (code field) and the transport
+// sentinels (ErrDeepSeekStream/Watchdog).
+func classifyLlmError(err error) *llmRetryError {
+	if err == nil {
+		return nil
+	}
+	var dpe *llm.DeepSeekProviderError
+	if errors.As(err, &dpe) {
+		switch dpe.Code {
+		case "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT":
+			return &llmRetryError{
+				message:              dpe.Message,
+				code:                 dpe.Code,
+				providerRetryAfterMs: int64(dpe.ProviderRetryAfter / time.Millisecond),
+			}
+		}
+		return nil
+	}
+	// Unwrapped transport failures: the deepseek adapter surfaces raw net errors
+	// (DNS, connection refused, reset) and its watchdog/stream sentinels.
+	if errors.Is(err, llm.ErrDeepSeekWatchdog) || errors.Is(err, llm.ErrDeepSeekStream) {
+		return &llmRetryError{message: err.Error(), code: "TRANSPORT"}
+	}
+	return nil
+}
+
+// backoffDelay computes the jittered exponential backoff for retry attempt n
+// (1-based): min(initial * 2^(n-1), max) scaled by a symmetric random factor
+// in [1-jitter, 1+jitter], never above max (upstream localDelay).
+func backoffDelay(initial, max time.Duration, jitter float64, retry int) time.Duration {
+	if retry < 1 {
+		retry = 1
+	}
+	exp := retry - 1
+	if exp > 10 {
+		exp = 10 // bounded to keep the doubling from overflowing duration
+	}
+	base := initial
+	for i := 0; i < exp; i++ {
+		base *= 2
+	}
+	if base > max {
+		base = max
+	}
+	factor := 1 - jitter + 2*jitter*rand.Float64()
+	d := time.Duration(float64(base) * factor)
+	if d > max {
+		d = max
+	}
+	return d
+}
+
+// waitAbortable sleeps delay unless ctx is canceled; returns false when aborted.
+func waitAbortable(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -737,6 +1120,22 @@ func isCommandTool(name string) bool {
 	case "run_command", "bash_persistent", "bash_reset", "terminal_open",
 		"terminal_send", "terminal_read", "terminal_list", "terminal_signal",
 		"terminal_close", "job_output", "job_list", "job_kill":
+		return true
+	}
+	return false
+}
+
+// skipSpillFor reports whether a tool's final result must NOT be spilled into a
+// preview. `read`/terminal-family tools are the tools that consume a spilled
+// file's locator and the ones that produce the largest outputs; spilling their
+// results would both drop the exact bytes a later read would fetch and risk a
+// read → spill → read loop (upstream spill-policy skips `read` on the
+// model-facing arm).
+func skipSpillFor(name string) bool {
+	switch name {
+	case "read_file", "read_image", "read", "terminal_open", "terminal_send",
+		"terminal_read", "terminal_list", "terminal_signal", "terminal_close",
+		"job_output":
 		return true
 	}
 	return false
