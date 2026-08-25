@@ -356,6 +356,10 @@ func (r *ToolRegistry) RegisterTerminalTools() {
 	r.Register(ToolDefinition{
 		Name:        "terminal_send",
 		Description: "Send text to a persistent terminal. By default Enter is submitted and the call waits for the command to settle (output silence, timeout or session exit).",
+		// Declared budget slightly above the internal 120s settle deadline so
+		// the inner timeout produces its own meaningful error first instead of
+		// being truncated by the pipeline's default 60s.
+		TimeoutMs: 150000,
 		ParametersJSON: json.RawMessage(`{
 			"type": "object",
 			"properties": {

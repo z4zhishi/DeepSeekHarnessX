@@ -60,11 +60,24 @@ func maybe_start(client: DshClient) -> void:
 func open() -> void:
 	_step = 1
 	visible = true
+	_fade_open()
 	_render_step()
 
 
 func close() -> void:
-	visible = false
+	_fade_close()
+
+
+## §4 minimal motion: quick opacity fade on open/close, layout never animated.
+func _fade_open() -> void:
+	DshTokens.fade_in(_backdrop, DshTokens.MOTION_BASE)
+	DshTokens.fade_in(_card, DshTokens.MOTION_BASE)
+
+
+func _fade_close() -> void:
+	DshTokens.fade_out(_card, DshTokens.MOTION_QUICK, func() -> void: visible = false)
+	if _backdrop != null:
+		DshTokens.fade_out(_backdrop, DshTokens.MOTION_QUICK, Callable())
 
 
 func _build() -> void:
@@ -395,7 +408,7 @@ func _on_finish_model(_ok: bool, _data: Variant) -> void:
 
 
 func _emit_completed() -> void:
-	visible = false
+	_fade_close()
 	onboarding_completed.emit()
 
 
@@ -410,7 +423,7 @@ func _skip_button() -> void:
 
 
 func _skip() -> void:
-	visible = false
+	_fade_close()
 	onboarding_skipped.emit()
 
 

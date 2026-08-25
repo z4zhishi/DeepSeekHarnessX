@@ -49,9 +49,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 
 	"dsh-go/pkg/session"
 )
@@ -159,23 +161,24 @@ func (s *SqliteStore) init(dataDir string) error {
 	}
 	dbPath := filepath.Join(dataDir, "sessions.db")
 	s.path = dbPath
-	// `_txlock=immediate` makes every Begin an IMMEDIATE (write-reservation)
-	// transaction, the Go equivalent of upstream `BEGIN IMMEDIATE`.
-	dsn := "file:" + dbPath + "?_txlock=immediate"
+	// Every pool connection carries the same PRAGMAs via the driver's
+	// `_pragma` DSN parameters (per-connection settings must not depend on
+	// which pooled connection a query lands on). Transactions stay default
+	// (deferred): writes explicitly BEGIN IMMEDIATE, reads take the normal
+	// deferred snapshot like upstream.
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=%d&_pragma=trusted_schema%%3dOFF&_pragma=mmap_size%%3d0&_pragma=foreign_keys%%3dON",
+		dbPath, sqliteBusyTimeoutMs)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open sqlite db: %w", err)
 	}
-	// A single writer is the normal deployment; keep the pool small and
-	// deterministic.
-	db.SetMaxOpenConns(4)
+	// A single connection is the deterministic deployment: SQLite's
+	// trusted_schema/mmap_size/synchronous/foreign_keys/busy_timeout are
+	// per-connection settings and upstream assumes one writer.
+	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s.db = db
 
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMs)); err != nil {
-		db.Close()
-		return fmt.Errorf("failed to set busy_timeout: %w", err)
-	}
 	if err := s.configureDatabase(); err != nil {
 		db.Close()
 		return fmt.Errorf("sqlite open sequence failed: %w", err)
@@ -187,24 +190,46 @@ func (s *SqliteStore) init(dataDir string) error {
 	return nil
 }
 
+// configureDatabase mirrors the upstream open sequence: connection-security
+// PRAGMAs with read-back verification, ownership checks, transactional
+// initialization with exact schema-set validation, WAL selection (with busy
+// retry), and durability PRAGMAs.
 func (s *SqliteStore) configureDatabase() error {
 	db := s.db
-	for _, pragma := range []string{"PRAGMA trusted_schema = OFF", "PRAGMA mmap_size = 0"} {
-		if _, err := db.Exec(pragma); err != nil {
-			return fmt.Errorf("security pragma failed (%s): %w", pragma, err)
-		}
+	// Per-connection security PRAGMAs also ride the DSN `_pragma` list; verify
+	// them by read-back exactly like upstream configureConnectionSecurity.
+	if trustedSchema, err := pragmaInt(db, "PRAGMA trusted_schema"); err != nil {
+		return err
+	} else if trustedSchema != 0 {
+		return fmt.Errorf("session database at %q retained trusted_schema=%d, expected 0", s.path, trustedSchema)
+	}
+	if mmapSize, err := pragmaInt(db, "PRAGMA mmap_size"); err != nil {
+		return err
+	} else if mmapSize != 0 {
+		return fmt.Errorf("session database at %q retained mmap_size=%d, expected 0", s.path, mmapSize)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("failed to enable foreign keys: %w", err)
 	}
 
-	onDisk, err := pragmaInt(db, "PRAGMA user_version")
+	// Initialization and ownership validation run inside one IMMEDIATE
+	// transaction so a crash can never leave a half-created schema stamped as
+	// versioned (the upstream initializeDatabase-in-begin-immediate shape).
+	tx, err := s.beginImmediate()
+	if err != nil {
+		return fmt.Errorf("failed to begin initialization transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	onDisk, err := pragmaIntTx(tx, "PRAGMA user_version")
 	if err != nil {
 		return err
 	}
-	applicationID, err := pragmaInt(db, "PRAGMA application_id")
+	applicationID, err := pragmaIntTx(tx, "PRAGMA application_id")
 	if err != nil {
 		return err
 	}
 	var objectCount int64
-	if err := db.QueryRow(
+	if err := tx.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
 	).Scan(&objectCount); err != nil {
 		return fmt.Errorf("failed to count schema objects: %w", err)
@@ -222,9 +247,15 @@ func (s *SqliteStore) configureDatabase() error {
 			s.path, applicationID, SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)
 	}
 	if onDisk == 0 {
-		if err := s.initializeDatabase(); err != nil {
+		if err := initializeDatabaseTx(tx); err != nil {
 			return err
 		}
+	}
+	if err := validateRequiredSchemaTx(tx, s.path); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit schema initialization/validation: %w", err)
 	}
 
 	if err := s.selectJournalMode(); err != nil {
@@ -240,23 +271,26 @@ func (s *SqliteStore) configureDatabase() error {
 	if synchronous != 2 {
 		return fmt.Errorf("session database at %q retained synchronous=%d, expected FULL (2)", s.path, synchronous)
 	}
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		return fmt.Errorf("failed to enable foreign keys: %w", err)
-	}
 	return nil
 }
 
-func pragmaInt(db *sql.DB, pragma string) (int64, error) {
-	var v int64
-	if err := db.QueryRow(pragma).Scan(&v); err != nil {
-		return 0, fmt.Errorf("failed to read %s: %w", pragma, err)
-	}
-	return v, nil
+// sqliteBusyError reports whether err is SQLite's busy result code (errcode 5).
+func sqliteBusyError(err error) bool {
+	var sqlErr *sqlite.Error
+	return errors.As(err, &sqlErr) && sqlErr.Code() == 5
 }
 
 func (s *SqliteStore) selectJournalMode() error {
-	if _, err := s.db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		return fmt.Errorf("failed to select journal mode WAL: %w", err)
+	deadline := time.Now().Add(time.Duration(sqliteBusyTimeoutMs) * time.Millisecond)
+	for {
+		_, err := s.db.Exec("PRAGMA journal_mode = WAL")
+		if err == nil {
+			break
+		}
+		if !sqliteBusyError(err) || !time.Now().Before(deadline) {
+			return fmt.Errorf("failed to select journal mode WAL: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	var mode string
 	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
@@ -268,9 +302,10 @@ func (s *SqliteStore) selectJournalMode() error {
 	return nil
 }
 
-func (s *SqliteStore) initializeDatabase() error {
-	db := s.db
-	ddl := `
+// initializeDatabaseDDL is the canonical schema-17 DDL (byte-equal to the
+// upstream resources/sql/schema.sql), shared by initialization and by the
+// in-memory reference that defines the accepted object set.
+const initializeDatabaseDDL = `
 CREATE TABLE persistence_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   store_id  TEXT NOT NULL
@@ -301,21 +336,137 @@ CREATE TABLE events (
   ignorable         INTEGER CHECK (ignorable IS NULL OR ignorable IN (0, 1)),
   PRIMARY KEY (session_id, seq)
 ) STRICT;`
-	if _, err := db.Exec(ddl); err != nil {
+
+// initializeDatabaseTx creates the canonical three-table STRICT schema inside
+// the caller's transaction; the version stamps assert the layout is complete
+// before the transaction commits.
+func initializeDatabaseTx(tx *sqliteTx) error {
+	if _, err := tx.Exec(initializeDatabaseDDL); err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
-	if _, err := db.Exec(
+	if _, err := tx.Exec(
 		"INSERT INTO persistence_state (singleton, store_id) VALUES (1, ?)", newUUIDString()); err != nil {
 		return fmt.Errorf("failed to insert store identity: %w", err)
 	}
-	// stamp LAST so the stamp asserts the layout is complete.
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA application_id = %d", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA application_id = %d", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)); err != nil {
 		return fmt.Errorf("failed to stamp application id: %w", err)
 	}
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SCHEMA_VERSION)); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", SCHEMA_VERSION)); err != nil {
 		return fmt.Errorf("failed to stamp schema version: %w", err)
 	}
 	return nil
+}
+
+// schemaObject is one row of the canonical schema-17 object set
+// (upstream `select-schema-objects`).
+type schemaObject struct {
+	Type string
+	Name string
+	Tbl  string
+	SQL  string
+}
+
+// normalizeSql collapses whitespace runs, mirroring upstream normalizeSql.
+func normalizeSql(v string) string {
+	return strings.Join(strings.Fields(v), " ")
+}
+
+// schemaObjectsOf reads the (type, name, tbl_name, whitespace-normalized sql)
+// tuple set of a database's user-visible schema objects.
+func schemaObjectsOf(q interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}) ([]schemaObject, error) {
+	rows, err := q.Query(
+		`SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read schema objects: %w", err)
+	}
+	defer rows.Close()
+	var out []schemaObject
+	for rows.Next() {
+		var o schemaObject
+		if err := rows.Scan(&o.Type, &o.Name, &o.Tbl, &o.SQL); err != nil {
+			return nil, fmt.Errorf("failed to scan schema object row: %w", err)
+		}
+		o.SQL = normalizeSql(o.SQL)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+var (
+	canonicalSchemaOnce sync.Once
+	canonicalSchema     []schemaObject
+)
+
+// requiredSchemaObjects derives the exact schema-17 object set from an
+// in-memory reference database built with the same DDL (the upstream
+// expectedSchema approach): whatever a freshly initialized database exposes
+// is precisely what this build accepts.
+func requiredSchemaObjects() ([]schemaObject, error) {
+	canonicalSchemaOnce.Do(func() {
+		ref, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			panic("storage: cannot open in-memory schema reference: " + err.Error())
+		}
+		defer ref.Close()
+		if _, err := ref.Exec(initializeDatabaseDDL); err != nil {
+			panic("storage: schema reference init failed: " + err.Error())
+		}
+		if _, err := ref.Exec(
+			"INSERT INTO persistence_state (singleton, store_id) VALUES (1, ?)", newUUIDString()); err != nil {
+			panic("storage: schema reference insert failed: " + err.Error())
+		}
+		objs, err := schemaObjectsOf(ref)
+		if err != nil {
+			panic("storage: schema reference read failed: " + err.Error())
+		}
+		canonicalSchema = objs
+	})
+	return canonicalSchema, nil
+}
+
+// validateRequiredSchemaTx requires the durable schema object set (type, name,
+// tbl_name, whitespace-normalized sql) to equal the canonical schema-17 set
+// exactly — a database with an extra unrelated table would be rejected by
+// upstream readers, so this build refuses it too.
+func validateRequiredSchemaTx(tx *sqliteTx, path string) error {
+	got, err := schemaObjectsOf(tx)
+	if err != nil {
+		return err
+	}
+	want, err := requiredSchemaObjects()
+	if err != nil {
+		return err
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("session database at %q does not contain the required schema objects (%d objects, want %d)",
+			path, len(got), len(want))
+	}
+	for i, o := range got {
+		w := want[i]
+		if o.Type != w.Type || o.Name != w.Name || o.Tbl != w.Tbl || o.SQL != w.SQL {
+			return fmt.Errorf("session database at %q does not contain the required schema objects (mismatch at %s %q)",
+				path, o.Type, o.Name)
+		}
+	}
+	return nil
+}
+
+func pragmaInt(db *sql.DB, pragma string) (int64, error) {
+	var v int64
+	if err := db.QueryRow(pragma).Scan(&v); err != nil {
+		return 0, fmt.Errorf("failed to read %s: %w", pragma, err)
+	}
+	return v, nil
+}
+
+func pragmaIntTx(tx *sqliteTx, pragma string) (int64, error) {
+	var v int64
+	if err := tx.QueryRow(pragma).Scan(&v); err != nil {
+		return 0, fmt.Errorf("failed to read %s: %w", pragma, err)
+	}
+	return v, nil
 }
 
 func (s *SqliteStore) loadStoreIdentity() error {
@@ -440,15 +591,63 @@ func (s *SqliteStore) LoadStoredFrom(id string, fromSeq int) (*StoredSuffix, err
 func (s *SqliteStore) AppendEvents(meta *session.SessionHeader, events []*session.SessionEnvelope) error {
 	return s.appendBatch(meta, events, false)
 }
+// validateSchemaForMutation rechecks schema ownership inside the caller's
+// mutation transaction (upstream validateSchemaForMutation): another writer may
+// have changed the application identity, schema objects, or version since open.
+func validateSchemaForMutation(tx *sqliteTx, path string) error {
+	applicationID, err := pragmaIntTx(tx, "PRAGMA application_id")
+	if err != nil {
+		return err
+	}
+	if applicationID != SESSION_PERSISTENCE_SQLITE_APPLICATION_ID {
+		return fmt.Errorf("session database application id changed before mutation (expected %d, got %d)",
+			SESSION_PERSISTENCE_SQLITE_APPLICATION_ID, applicationID)
+	}
+	got, err := schemaObjectsOf(tx)
+	if err != nil {
+		return err
+	}
+	want, err := requiredSchemaObjects()
+	if err != nil {
+		return err
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("session database at %q does not contain the required schema objects (%d objects, want %d)",
+			path, len(got), len(want))
+	}
+	for i, o := range got {
+		w := want[i]
+		if o.Type != w.Type || o.Name != w.Name || o.Tbl != w.Tbl || o.SQL != w.SQL {
+			return fmt.Errorf("session database at %q does not contain the required schema objects (mismatch at %s %q)",
+				path, o.Type, o.Name)
+		}
+	}
+	version, err := pragmaIntTx(tx, "PRAGMA user_version")
+	if err != nil {
+		return err
+	}
+	if version != SCHEMA_VERSION {
+		return fmt.Errorf("session database schema changed before mutation (expected %d, got %d)",
+			SCHEMA_VERSION, version)
+	}
+	return nil
+}
+
 func (s *SqliteStore) appendBatch(meta *session.SessionHeader, events []*session.SessionEnvelope, isMaterialized bool) error {
 	if len(events) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
+	// Writes take an explicit IMMEDIATE (write-reservation) transaction; the
+	// pool-wide default stays deferred so reads keep upstream's snapshot shape.
+	tx, err := s.beginImmediate()
 	if err != nil {
 		return fmt.Errorf("failed to begin immediate transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
+
+	if err := validateSchemaForMutation(tx, s.path); err != nil {
+		return err
+	}
 
 	if !isMaterialized {
 		if err := writeSessionRowTx(tx, meta); err != nil {
@@ -488,14 +687,23 @@ func (s *SqliteStore) commitRepair(meta *session.SessionHeader, tornMarker *int,
 	if tornMarker == nil && len(closers) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginImmediate()
 	if err != nil {
 		return fmt.Errorf("failed to begin immediate transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() //nolint:errcheck
 
-	if err := ensureSessionRowTx(tx, meta); err != nil {
+	if err := validateSchemaForMutation(tx, s.path); err != nil {
 		return err
+	}
+	// Repair only ever applies to a known session: a missing metadata row is
+	// an error, never a fresh materialization (upstream store.ts:211).
+	row, err := sessionRowTx(tx, meta.ID)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return fmt.Errorf("session %s metadata row is missing", meta.ID)
 	}
 	current, tornFrom, err := scanAllRowsTx(tx, meta.ID)
 	if err != nil {
@@ -535,13 +743,16 @@ func (s *SqliteStore) commitRepair(meta *session.SessionHeader, tornMarker *int,
 
 // PutSession saves or updates a session header (gateway compatibility
 // surface; persists the metadata row exactly as appendBatch does for
-// materialized sessions).
+// non-materialized sessions).
 func (s *SqliteStore) PutSession(header *session.SessionHeader) error {
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	tx, err := s.beginImmediate()
 	if err != nil {
-		return fmt.Errorf("failed to begin: %w", err)
+		return fmt.Errorf("failed to begin immediate transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if err := validateSchemaForMutation(tx, s.path); err != nil {
+		return err
+	}
 	if err := writeSessionRowTx(tx, header); err != nil {
 		return err
 	}
@@ -561,22 +772,23 @@ func (s *SqliteStore) GetSession(sessionID string) (*session.SessionHeader, erro
 }
 
 // GetEvents retrieves all events for a session starting from `fromSeq` in
-// logical seq order (scalar + expanded packed rows).
+// logical seq order (scalar + expanded packed rows). A fromSeq inside a packed
+// row's span resolves through the packed predecessor so no covered events are
+// skipped (same physicalSpanFrom discipline as loadStoredFrom).
 func (s *SqliteStore) GetEvents(sessionID string, fromSeq int) ([]session.SessionEnvelope, error) {
-	rows, err := s.selectEvents(sessionID, fromSeq)
+	base, rows, err := s.physicalSpanFrom(sessionID, fromSeq)
 	if err != nil {
 		return nil, err
 	}
+	preserved, tornFrom, err := scanRows(rows, base)
+	if err != nil {
+		return nil, err
+	}
+	_ = tornFrom // GetEvents is a read surface: torn tails simply stop the prefix.
 	var out []session.SessionEnvelope
-	for _, row := range rows {
-		logical, err := decodeRow(row)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode row at seq %d: %w", row.Seq, err)
-		}
-		for _, env := range logical {
-			if env.Seq >= fromSeq {
-				out = append(out, *env)
-			}
+	for _, env := range preserved {
+		if env.Seq >= fromSeq {
+			out = append(out, *env)
 		}
 	}
 	return out, nil
@@ -650,7 +862,7 @@ SELECT id, version, created_at, cwd, parent_session, seed_length, origin,
 	return out, rows.Err()
 }
 
-func writeSessionRowTx(tx *sql.Tx, meta *session.SessionHeader) error {
+func writeSessionRowTx(tx *sqliteTx, meta *session.SessionHeader) error {
 	_, err := tx.Exec(`
 INSERT INTO sessions
   (id, version, created_at, cwd, parent_session, seed_length, origin,
@@ -675,16 +887,104 @@ ON CONFLICT(id) DO UPDATE SET
 	return nil
 }
 
-func ensureSessionRowTx(tx *sql.Tx, meta *session.SessionHeader) error {
-	var exists int
-	err := tx.QueryRow("SELECT 1 FROM sessions WHERE id = ?", meta.ID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return writeSessionRowTx(tx, meta)
-	}
-	return err
+// beginImmediate opens a write-reservation (IMMEDIATE) transaction on a single
+// pinned connection, the Go equivalent of upstream `BEGIN IMMEDIATE`. database/
+// sql transactions cannot nest a raw BEGIN, so the lock is taken with Exec on
+// the connection and finished with Commit/Rollback; with SetMaxOpenConns(1)
+// this reserves the write lock exactly like upstream. Reads use the pool's
+// default deferred transactions instead.
+type sqliteTx struct {
+	conn   *sql.Conn
+	owned  bool // true when the caller must finish the transaction
+	closed bool
 }
 
-func incrementRevisionTx(tx *sql.Tx, id string) error {
+func (t *sqliteTx) Exec(query string, args ...any) (sql.Result, error) {
+	return t.conn.ExecContext(context.Background(), query, args...)
+}
+
+func (t *sqliteTx) Query(query string, args ...any) (*sql.Rows, error) {
+	return t.conn.QueryContext(context.Background(), query, args...)
+}
+
+func (t *sqliteTx) QueryRow(query string, args ...any) *sql.Row {
+	return t.conn.QueryRowContext(context.Background(), query, args...)
+}
+
+func (t *sqliteTx) Commit() error {
+	if !t.owned || t.closed {
+		return nil
+	}
+	t.closed = true
+	_, err := t.Exec("COMMIT")
+	cerr := t.conn.Close()
+	if err != nil {
+		return err
+	}
+	return cerr
+}
+
+func (t *sqliteTx) Rollback() error {
+	if !t.owned || t.closed {
+		return nil
+	}
+	t.closed = true
+	_, err := t.Exec("ROLLBACK")
+	cerr := t.conn.Close()
+	if err != nil {
+		return err
+	}
+	return cerr
+}
+
+func (s *SqliteStore) beginImmediate() (*sqliteTx, error) {
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	tx := &sqliteTx{conn: conn}
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	tx.owned = true
+	return tx, nil
+}
+
+// ensureSessionRowTx verifies the session metadata row exists for a
+// materialized append; unlike the non-materialized upsert it never creates a
+// row — appending to an unknown session is an error (upstream relies on
+// incrementRevision's changes!=1 to fail here).
+func ensureSessionRowTx(tx *sqliteTx, meta *session.SessionHeader) error {
+	row, err := sessionRowTx(tx, meta.ID)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return fmt.Errorf("session %s metadata row is missing", meta.ID)
+	}
+	return nil
+}
+
+// sessionRowTx reads one session metadata row inside a transaction
+// (nil when absent).
+func sessionRowTx(tx *sqliteTx, id string) (*sessionRow, error) {
+	var r sessionRow
+	err := tx.QueryRow(`
+SELECT id, version, created_at, cwd, parent_session, seed_length, origin,
+       delegation_depth, agent_preset, incarnation, revision
+FROM sessions WHERE id = ?`, id).Scan(&r.ID, &r.Version, &r.CreatedAt, &r.Cwd, &r.ParentSession,
+		&r.SeedLength, &r.Origin, &r.DelegationDepth, &r.AgentPreset, &r.Incarnation, &r.Revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to load session %s: %w", id, err)
+	}
+	return &r, nil
+}
+
+func incrementRevisionTx(tx *sqliteTx, id string) error {
 	res, err := tx.Exec("UPDATE sessions SET revision = revision + 1 WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to increment revision for %s: %w", id, err)
@@ -696,7 +996,7 @@ func incrementRevisionTx(tx *sql.Tx, id string) error {
 	return nil
 }
 
-func deleteEventsFromTx(tx *sql.Tx, id string, fromSeq int) error {
+func deleteEventsFromTx(tx *sqliteTx, id string, fromSeq int) error {
 	if _, err := tx.Exec("DELETE FROM events WHERE session_id = ? AND seq >= ?", id, fromSeq); err != nil {
 		return fmt.Errorf("failed to truncate session %s at seq %d: %w", id, fromSeq, err)
 	}
@@ -834,7 +1134,7 @@ ORDER BY seq`, id, floor, fromSeq)
 }
 
 // logicalLastEventTx returns the last preserved logical event, or nil if empty.
-func logicalLastEventTx(tx *sql.Tx, id string) (*session.SessionEnvelope, error) {
+func logicalLastEventTx(tx *sqliteTx, id string) (*session.SessionEnvelope, error) {
 	rows, err := tx.Query(`
 SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
 FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 2`, id)
@@ -880,7 +1180,7 @@ FROM events WHERE session_id = ? AND seq >= ? ORDER BY seq`, id, floor)
 	return preserved[len(preserved)-1], nil
 }
 
-func scanAllRowsTx(tx *sql.Tx, id string) ([]*session.SessionEnvelope, *int, error) {
+func scanAllRowsTx(tx *sqliteTx, id string) ([]*session.SessionEnvelope, *int, error) {
 	rows, err := tx.Query(`
 SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
 FROM events WHERE session_id = ? ORDER BY seq`, id)
@@ -895,7 +1195,7 @@ FROM events WHERE session_id = ? ORDER BY seq`, id)
 	return scanRows(eventRows, 0)
 }
 
-func insertRecordTx(tx *sql.Tx, id string, rec BoundRecord) error {
+func insertRecordTx(tx *sqliteTx, id string, rec BoundRecord) error {
 	_, err := tx.Exec(`
 INSERT INTO events
   (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
@@ -982,46 +1282,94 @@ func zstdEncode(data []byte) ([]byte, error) {
 // Chunk codec: pack / unpack
 // ---------------------------------------------------------------------------
 
+// jsonKeySet decodes a JSON object into its key set (nil when the value is not
+// an object).
+func jsonKeySet(raw json.RawMessage) map[string]bool {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return nil
+	}
+	keys := make(map[string]bool, len(obj))
+	for k := range obj {
+		keys[k] = true
+	}
+	return keys
+}
+
+// hasExactKeys reports whether keys is exactly the given whitelist.
+func hasExactKeys(keys map[string]bool, want ...string) bool {
+	if keys == nil || len(keys) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !keys[w] {
+			return false
+		}
+	}
+	return true
+}
+
 // classifyDelta returns the delta kind for an assistant/chunk event, or "".
-// It recognizes the exact serialized envelope shape the Go loop emits
-// (data { turn, step, chunk } with a chunk.type delta).
+// Eligibility mirrors the upstream exact-keys whitelist (codec.ts classify):
+// the envelope must be exactly {type,seq,time,data} — any ignorable flag,
+// surfaceOp, sourceEventSeqs, or unknown extension makes the event ineligible
+// so it is stored verbatim instead of lossily packed — data must be exactly
+// {turn,step,chunk}, and the chunk must match one of the three delta variants'
+// precise key sets. Unrecognized shapes are never packed; packing can only
+// lose compression, never data.
 func classifyDelta(env *session.SessionEnvelope) string {
-	if env.Type != session.EventAssistantChunk || env.Seq < 0 {
+	if env.Type != session.EventAssistantChunk {
+		return ""
+	}
+	if env.Ignorable || env.SurfaceOp != nil || len(env.SourceEventSeqs) > 0 {
+		return ""
+	}
+	if env.Seq < 0 {
 		return ""
 	}
 	var data struct {
-		Turn  int             `json:"turn"`
-		Step  int             `json:"step"`
+		Turn  *json.Number    `json:"turn"`
+		Step  *json.Number    `json:"step"`
 		Chunk json.RawMessage `json:"chunk"`
 	}
 	if err := json.Unmarshal(env.Data, &data); err != nil {
 		return ""
 	}
+	dataKeys := jsonKeySet(env.Data)
+	if !hasExactKeys(dataKeys, "turn", "step", "chunk") {
+		return ""
+	}
+	if data.Turn == nil || data.Step == nil {
+		return ""
+	}
+	chunkKeys := jsonKeySet(data.Chunk)
+	if chunkKeys == nil {
+		return ""
+	}
 	var chunk struct {
-		Type    string `json:"type"`
-		Index   int    `json:"index"`
-		Text    string `json:"text"`
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		ArgDelt string `json:"argumentsDelta"`
+		Type    string  `json:"type"`
+		Index   *int    `json:"index"`
+		Text    *string `json:"text"`
+		ID      *string `json:"id"`
+		Name    *string `json:"name"`
+		ArgDelt *string `json:"argumentsDelta"`
 	}
 	if err := json.Unmarshal(data.Chunk, &chunk); err != nil {
 		return ""
 	}
 	switch chunk.Type {
 	case "text-delta", "reasoning-delta":
-		if chunk.Text == "" && !bytes.Contains(data.Chunk, []byte(`"text"`)) {
-			return ""
+		if hasExactKeys(chunkKeys, "type", "index", "text") && chunk.Index != nil && chunk.Text != nil {
+			return chunk.Type
 		}
-		return chunk.Type
 	case "tool-call-delta":
-		if chunk.ID == "" || chunk.ArgDelt == "" {
-			return ""
+		exact := hasExactKeys(chunkKeys, "type", "index", "id", "argumentsDelta")
+		withName := hasExactKeys(chunkKeys, "type", "index", "id", "name", "argumentsDelta")
+		if (exact || withName) && chunk.Index != nil && chunk.ID != nil && chunk.ArgDelt != nil && (!withName || chunk.Name != nil) {
+			return chunk.Type
 		}
-		return chunk.Type
-	default:
-		return ""
 	}
+	return ""
 }
 
 // deltaFields extracts the packed chunk sub-shape for a recognized delta event.
@@ -1206,9 +1554,15 @@ func packChunkRuns(events []*session.SessionEnvelope) []StorageRecord {
 }
 
 // decodeRow decodes one physical row into its complete logical event span.
+// It fails loudly on malformed rows so scanRows can classify committed
+// corruption versus a repairable torn tail (upstream decodeRow semantics).
 func decodeRow(row *EventRow) ([]*session.SessionEnvelope, error) {
 	if row.HasIgnorable && row.Ignorable != PACKED_ROW_SENTINEL {
-		return []*session.SessionEnvelope{decodeScalarRow(row)}, nil
+		env, err := decodeScalarRow(row)
+		if err != nil {
+			return nil, err
+		}
+		return []*session.SessionEnvelope{env}, nil
 	}
 	switch row.Type {
 	case "text-chunks", "reasoning-chunks", "tool-call-chunks":
@@ -1217,11 +1571,20 @@ func decodeRow(row *EventRow) ([]*session.SessionEnvelope, error) {
 		}
 		return decodeSerializedChunkRow(row.Type, row.Seq, row.Time, decodeData(row.Data))
 	default:
-		return []*session.SessionEnvelope{decodeScalarRow(row)}, nil
+		if row.HasIgnorable {
+			// ignorable == 0 is the packed sentinel: a non-chunk tag under it
+			// is corruption, never a scalar row.
+			return nil, fmt.Errorf("malformed %s storage row: packed discriminator requires a chunk tag", row.Type)
+		}
+		env, err := decodeScalarRow(row)
+		if err != nil {
+			return nil, err
+		}
+		return []*session.SessionEnvelope{env}, nil
 	}
 }
 
-func decodeScalarRow(row *EventRow) *session.SessionEnvelope {
+func decodeScalarRow(row *EventRow) (*session.SessionEnvelope, error) {
 	env := &session.SessionEnvelope{
 		Seq:  row.Seq,
 		Time: row.Time,
@@ -1229,24 +1592,26 @@ func decodeScalarRow(row *EventRow) *session.SessionEnvelope {
 		Data: json.RawMessage(decodeData(row.Data)),
 	}
 	if row.SourceEventSeqs != nil {
-		env.SourceEventSeqs = decodeSourceEventSeqs(row.SourceEventSeqs)
+		seqs, err := decodeSourceEventSeqs(row.SourceEventSeqs)
+		if err != nil {
+			return nil, err
+		}
+		env.SourceEventSeqs = seqs
 	}
 	if row.SurfaceOp != nil {
 		var op session.SurfaceOp
 		if err := json.Unmarshal(row.SurfaceOp, &op); err != nil {
-			// A malformed surface_op marks the row unreadable; the scanRows
-			// caller treats a decode error as committed corruption or torn
-			// tail, so surface fields simply stay unset here.
-			env.SurfaceOp = nil
-			env.SourceEventSeqs = nil
-			return env
+			// A malformed surface_op marks the row unreadable; returning the
+			// error lets scanRows classify it as committed corruption or torn
+			// tail instead of silently dropping the surface fields.
+			return nil, fmt.Errorf("malformed surface_op at seq %d: %w", row.Seq, err)
 		}
 		env.SurfaceOp = &op
 	}
 	if row.HasIgnorable && row.Ignorable == 1 {
 		env.Ignorable = true
 	}
-	return env
+	return env, nil
 }
 
 func decodeData(data []byte) []byte {
@@ -1273,50 +1638,103 @@ func zstdDecode(data []byte) ([]byte, error) {
 }
 
 // decodeSerializedChunkRow expands one packed row into logical events,
-// validating the packed shape and byte bound.
+// validating the packed shape and byte bound. The data object must carry the
+// exact key set of its variant (upstream validateRow): text/reasoning rows are
+// exactly {turn,step,index,dt,texts}; tool-call rows exactly
+// {turn,step,index,id[,name],dt,args}. Malformed shapes error so scanRows can
+// classify the row — never a silent zero-value reconstruction.
 func decodeSerializedChunkRow(tag string, seq0 int, time0 int64, serialized []byte) ([]*session.SessionEnvelope, error) {
 	if len(serialized) > MAX_PACKED_DATA_BYTES {
 		return nil, fmt.Errorf("malformed %s storage row: data exceeds %d UTF-8 bytes", tag, MAX_PACKED_DATA_BYTES)
 	}
-	var data RunData
-	if err := json.Unmarshal(serialized, &data); err != nil {
+	var raw struct {
+		Turn  *json.Number    `json:"turn"`
+		Step  *json.Number    `json:"step"`
+		Index *int            `json:"index"`
+		ID    *string         `json:"id"`
+		Name  json.RawMessage `json:"name"`
+		DT    []int64         `json:"dt"`
+		Texts []string        `json:"texts"`
+		Args  []string        `json:"args"`
+	}
+	if err := json.Unmarshal(serialized, &raw); err != nil {
 		return nil, fmt.Errorf("malformed %s storage row: %v", tag, err)
 	}
+	dataKeys := jsonKeySet(serialized)
+	if dataKeys == nil {
+		return nil, fmt.Errorf("malformed %s storage row: data must be an object", tag)
+	}
 	var members []string
+	hasName := false
 	switch tag {
 	case "tool-call-chunks":
-		if data.ID == "" && data.Args == nil {
+		withName := hasExactKeys(dataKeys, "turn", "step", "index", "id", "name", "dt", "args")
+		if !withName && !hasExactKeys(dataKeys, "turn", "step", "index", "id", "dt", "args") {
 			return nil, fmt.Errorf("malformed %s storage row: invalid tool-call data fields", tag)
 		}
-		members = data.Args
+		hasName = withName
+		members = raw.Args
 	case "text-chunks", "reasoning-chunks":
-		members = data.Texts
+		if !hasExactKeys(dataKeys, "turn", "step", "index", "dt", "texts") {
+			return nil, fmt.Errorf("malformed %s storage row: invalid text data fields", tag)
+		}
+		members = raw.Texts
 	default:
 		return nil, fmt.Errorf("malformed %s storage row: unknown tag", tag)
+	}
+	if raw.Turn == nil || raw.Step == nil || raw.Index == nil {
+		return nil, fmt.Errorf("malformed %s storage row: turn/step/index must be numbers", tag)
+	}
+	if hasName {
+		var nameVal string
+		if err := json.Unmarshal(raw.Name, &nameVal); err != nil {
+			return nil, fmt.Errorf("malformed %s storage row: id and optional name must be strings", tag)
+		}
 	}
 	if len(members) < MIN_PACKED_ROW_MEMBERS || len(members) > MAX_PACKED_ROW_MEMBERS {
 		return nil, fmt.Errorf("malformed %s storage row: member count out of range", tag)
 	}
-	if len(data.DT) != len(members)-1 {
-		return nil, fmt.Errorf("malformed %s storage row: dt length must match member count", tag)
+	if len(raw.DT) != len(members)-1 {
+		return nil, fmt.Errorf("malformed %s storage row: dt length must match the member count", tag)
 	}
+	turn, errTurn := raw.Turn.Int64()
+	step, errStep := raw.Step.Int64()
+	if errTurn != nil || errStep != nil {
+		return nil, fmt.Errorf("malformed %s storage row: turn/step must be numbers", tag)
+	}
+	index := *raw.Index
 	kind := map[string]string{
 		"text-chunks": "text-delta", "reasoning-chunks": "reasoning-delta", "tool-call-chunks": "tool-call-delta",
 	}[tag]
+	var idVal string
+	var namePtr *string
+	if tag == "tool-call-chunks" {
+		if raw.ID == nil {
+			return nil, fmt.Errorf("malformed %s storage row: id and optional name must be strings", tag)
+		}
+		idVal = *raw.ID
+		if hasName {
+			var nameVal string
+			if err := json.Unmarshal(raw.Name, &nameVal); err != nil {
+				return nil, fmt.Errorf("malformed %s storage row: id and optional name must be strings", tag)
+			}
+			namePtr = &nameVal
+		}
+	}
 	out := make([]*session.SessionEnvelope, 0, len(members))
 	timeVal := time0
 	for i := 0; i < len(members); i++ {
 		if i > 0 {
-			timeVal += data.DT[i-1]
+			timeVal += raw.DT[i-1]
 		}
-		chunk := map[string]any{"type": kind, "index": data.Index}
+		chunk := map[string]any{"type": kind, "index": index}
 		switch tag {
 		case "text-chunks", "reasoning-chunks":
 			chunk["text"] = members[i]
 		case "tool-call-chunks":
-			chunk["id"] = data.ID
-			if data.Name != "" {
-				chunk["name"] = data.Name
+			chunk["id"] = idVal
+			if namePtr != nil {
+				chunk["name"] = *namePtr
 			}
 			chunk["argumentsDelta"] = members[i]
 		}
@@ -1326,7 +1744,7 @@ func decodeSerializedChunkRow(tag string, seq0 int, time0 int64, serialized []by
 			Time: timeVal,
 			Type: session.EventAssistantChunk,
 		}
-		env.Data = json.RawMessage(fmt.Sprintf(`{"turn":%d,"step":%d,"chunk":%s}`, data.Turn, data.Step, payload))
+		env.Data = json.RawMessage(fmt.Sprintf(`{"turn":%d,"step":%d,"chunk":%s}`, turn, step, payload))
 		out = append(out, env)
 	}
 	return out, nil
@@ -1416,26 +1834,24 @@ func appendVarint(buf []byte, v uint64) []byte {
 	return append(buf, byte(v))
 }
 
-func decodeSourceEventSeqs(bytes []byte) []int {
+// maxSafeInteger mirrors JS Number.MAX_SAFE_INTEGER; the zig-zag space is
+// bounded at twice that (upstream MAX_ZIGZAG_INTEGER).
+const (
+	maxSafeInteger    = int64(9_007_199_254_740_991)
+	maxZigzagInteger  = uint64(18_014_398_509_481_982) // 2 * maxSafeInteger
+)
+
+func decodeSourceEventSeqs(raw []byte) ([]int, error) {
 	values := []int{}
 	var prev uint64
 	off := 0
 	first := true
-	for off < len(bytes) {
-		var decoded uint64
-		var shift uint
-		for off < len(bytes) {
-			b := bytes[off]
-			off++
-			decoded |= uint64(b&0x7f) << shift
-			if b&0x80 == 0 {
-				break
-			}
-			shift += 7
-			if shift > 56 {
-				panic("malformed source_event_seqs storage value: varint out of range")
-			}
+	for off < len(raw) {
+		decoded, next, err := readVarint(raw, off, first)
+		if err != nil {
+			return nil, err
 		}
+		off = next
 		var delta int64
 		if first {
 			delta = int64(decoded)
@@ -1446,13 +1862,44 @@ func decodeSourceEventSeqs(bytes []byte) []int {
 			delta = -int64((decoded + 1) / 2)
 		}
 		value := int64(prev) + delta
-		if value < 0 {
-			panic("malformed source_event_seqs storage value: decoded seq out of range")
+		if value < 0 || value > maxSafeInteger {
+			return nil, fmt.Errorf("malformed source_event_seqs storage value: decoded seq is out of range")
 		}
 		values = append(values, int(value))
 		prev = uint64(value)
 	}
-	return values
+	return values, nil
+}
+
+// readVarint decodes one little-endian base-128 varint. It rejects truncated
+// byte streams, non-canonical (overlong) encodings — a trailing continuation
+// whose final payload byte is zero — values beyond the first/zig-zag limits,
+// and shifts past 56 bits, mirroring upstream compression.ts readVarint.
+func readVarint(bytes []byte, offset int, first bool) (value uint64, next int, err error) {
+	limit := maxZigzagInteger
+	if first {
+		limit = uint64(maxSafeInteger)
+	}
+	var shift uint
+	for offset < len(bytes) {
+		b := bytes[offset]
+		offset++
+		value |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			if shift > 0 && b&0x7f == 0 {
+				return 0, 0, fmt.Errorf("malformed source_event_seqs storage value: non-canonical varint")
+			}
+			if value > limit {
+				return 0, 0, fmt.Errorf("malformed source_event_seqs storage value: varint is out of range")
+			}
+			return value, offset, nil
+		}
+		shift += 7
+		if shift > 56 {
+			return 0, 0, fmt.Errorf("malformed source_event_seqs storage value: varint is out of range")
+		}
+	}
+	return 0, 0, fmt.Errorf("malformed source_event_seqs storage value: truncated varint")
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,9 +1988,13 @@ func scanZstdFrames(data []byte) (frames []zstdFrameRange, tornStart int, err er
 }
 
 // JsonlLog is a decoded session artifact: the header line plus event records.
+// CommittedBytes is the byte offset of the end of the last fully
+// newline-terminated record — the only safe append/truncation boundary
+// (upstream SessionLogScanner.committedBytes).
 type JsonlLog struct {
-	Header *session.SessionHeader
-	Events []*session.SessionEnvelope
+	Header         *session.SessionHeader
+	Events         []*session.SessionEnvelope
+	CommittedBytes int64
 }
 
 // ReadJsonlZstd parses a `.jsonl.zstd` artifact: one checksummed zstd frame per
@@ -1582,78 +2033,177 @@ func ReadJsonlZstd(path string) (*JsonlLog, error) {
 	return parseJsonlRecords(plaintext.Bytes())
 }
 
+// parseJsonlRecords parses plaintext JSONL records with the upstream
+// SessionLogScanner semantics:
+//
+//   - only newline-terminated records count as committed; a final fragment
+//     without '\n' is a torn tail (dropped, never interpreted);
+//   - CommittedBytes tracks the end of the last complete record;
+//   - a record that fails to decode is an issue: scanning continues, but the
+//     moment a later committed line carries a turn/end the issue escalates to
+//     a hard error; if no turn/end follows, the preserved prefix up to the
+//     issue is returned (the repairable-prefix policy);
+//   - a logical seq gap in the contiguous prefix behaves the same way —
+//     deferred unless a turn/end proves the region committed;
+//   - malformed packed rows and bad surfaceOp values fail decoding exactly
+//     like unparsable lines (never silently dropped).
 func parseJsonlRecords(text []byte) (*JsonlLog, error) {
-	var header *session.SessionHeader
-	var events []*session.SessionEnvelope
-	lineStart := 0
-	for lineStart <= len(text) {
-		nl := bytes.IndexByte(text[lineStart:], '\n')
-		var end int
-		if nl < 0 {
-			end = len(text)
-		} else {
-			end = lineStart + nl
-		}
-		lineBytes := text[lineStart:end]
-		if len(lineBytes) == 0 {
-			if nl < 0 {
-				break
-			}
-			lineStart = end + 1
-			continue
-		}
-		record, ok := parseRecord(lineBytes)
-		if !ok {
-			return nil, fmt.Errorf("corrupt session log: invalid record on a JSONL line")
-		}
-		if header == nil {
-			h, ok := parseHeaderLine(record)
-			if !ok {
-				return nil, fmt.Errorf("corrupt session log: first record is not a session header")
-			}
-			header = h
-		} else {
-			events = append(events, decodeStorageRecordValue(record)...)
-		}
-		if nl < 0 {
-			break
-		}
-		lineStart = end + 1
-	}
-	if header == nil {
+	headerEnd := bytes.IndexByte(text, '\n')
+	if headerEnd < 0 {
 		return nil, fmt.Errorf("empty or header-less session log")
 	}
-	return &JsonlLog{Header: header, Events: events}, nil
-}
-
-func parseRecord(line []byte) (json.RawMessage, bool) {
-	line = bytes.TrimRight(line, "\r")
-	var rec json.RawMessage
-	if err := json.Unmarshal(line, &rec); err != nil {
-		return nil, false
+	headerRecord := text[:headerEnd+1]
+	header, err := parseHeaderLine(headerRecord)
+	if err != nil {
+		return nil, err
 	}
-	return rec, true
+
+	var events []*session.SessionEnvelope
+	var committed int64 = int64(headerEnd + 1)
+	var issue error
+	lineStart := headerEnd + 1
+	eventLine := 0
+	fail := func(format string, args ...any) error {
+		return fmt.Errorf("corrupt session log: "+format, args...)
+	}
+	for lineStart < len(text) {
+		nl := bytes.IndexByte(text[lineStart:], '\n')
+		if nl < 0 {
+			// Unterminated final record: torn tail, not committed. Stop.
+			break
+		}
+		end := lineStart + nl
+		line := bytes.TrimRight(text[lineStart:end], "\r")
+		lineStart = end + 1
+		if len(line) == 0 {
+			continue
+		}
+		eventLine++
+		thisLine := eventLine
+
+		decoded, decErr := decodeStorageRecordValue(line)
+		if decErr != nil {
+			if json.Valid(line) {
+				// Well-formed JSON failing structural validation is real
+				// corruption — a torn write cannot produce a complete JSON
+				// value — so it must surface immediately, never defer.
+				return nil, fail("malformed committed event at line %d: %v", thisLine, decErr)
+			}
+			if issue == nil {
+				issue = fail("unparsable committed event at line %d: %v", thisLine, decErr)
+			}
+			continue
+		}
+		if issue != nil {
+			for _, ev := range decoded {
+				if ev.Type == session.EventTurnEnd {
+					return nil, issue // a turn/end proves the broken region committed
+				}
+			}
+			continue
+		}
+
+		gapAt := -1
+		for i, ev := range decoded {
+			if ev.Seq != len(events) {
+				gapAt = i
+				break
+			}
+			events = append(events, ev)
+		}
+		if gapAt >= 0 {
+			expected := len(events)
+			events = events[:expected]
+			issue = fail("seq gap in committed region at line %d (expected %d, got %d)",
+				thisLine, expected, decoded[gapAt].Seq)
+			for _, ev := range decoded {
+				if ev.Type == session.EventTurnEnd {
+					return nil, issue
+				}
+			}
+			continue
+		}
+		committed = int64(lineStart)
+	}
+	if issue != nil && len(events) > 0 {
+		// Preserve the recoverable prefix for repair paths; surface the issue
+		// through the truncation boundary so callers can see the log was cut.
+		return &JsonlLog{Header: header, Events: events, CommittedBytes: committed}, nil
+	}
+	return &JsonlLog{Header: header, Events: events, CommittedBytes: committed}, nil
 }
 
-// parseHeaderLine parses the `type: "session"`-tagged header record.
-func parseHeaderLine(record json.RawMessage) (*session.SessionHeader, bool) {
+// sessionFormatVersion is the JSONL session format version this build reads.
+const sessionFormatVersion = 0
+
+// parseHeaderLine parses and validates the `type: "session"`-tagged header
+// record (with or without its trailing newline). Mirroring the upstream
+// isHeaderLine guard + refuseForeignFormatVersion + fromHeaderLine:
+//
+//   - version != 0 is refused as an unsupported format (upgrade hint), before
+//     any structural validation — a future format must not surface as corrupt;
+//   - createdAt / delegationDepth must be non-negative integers;
+//   - origin, when present, must be "subagent";
+//   - retired sandboxMode/approvalPolicy fields are refused.
+func parseHeaderLine(record []byte) (*session.SessionHeader, error) {
+	line := bytes.TrimSpace(bytes.TrimRight(record, "\n"))
+	var probe struct {
+		Version *int   `json:"version"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return nil, fmt.Errorf("corrupt session log: header line is not valid JSON")
+	}
+	// Refuse a foreign format version before any structural check.
+	var generic map[string]json.RawMessage
+	_ = json.Unmarshal(line, &generic)
+	if _, ok := generic["version"]; ok && probe.Version == nil {
+		return nil, fmt.Errorf("session format unsupported for session %q: header version is not a number", probe.ID)
+	}
+	if probe.Version != nil && *probe.Version != sessionFormatVersion {
+		return nil, fmt.Errorf("session format unsupported for session %q: version %d, this build reads %d",
+			probe.ID, *probe.Version, sessionFormatVersion)
+	}
+
 	var h struct {
 		Type            string  `json:"type"`
 		Version         int     `json:"version"`
 		ID              string  `json:"id"`
-		CreatedAt       int64   `json:"createdAt"`
+		CreatedAt       *int64  `json:"createdAt"`
 		Cwd             *string `json:"cwd"`
 		ParentSession   *string `json:"parentSession"`
 		SeedLength      *int64  `json:"seedLength"`
 		Origin          *string `json:"origin"`
-		DelegationDepth int     `json:"delegationDepth"`
+		DelegationDepth *int    `json:"delegationDepth"`
 		AgentPreset     *string `json:"agentPreset"`
 	}
-	if err := json.Unmarshal(record, &h); err != nil || h.Type != "session" || h.ID == "" {
-		return nil, false
+	if err := json.Unmarshal(line, &h); err != nil {
+		return nil, fmt.Errorf("corrupt session log: header line is not valid JSON")
+	}
+	if _, ok := generic["sandboxMode"]; ok {
+		return nil, fmt.Errorf("session header uses retired policy baseline fields")
+	}
+	if _, ok := generic["approvalPolicy"]; ok {
+		return nil, fmt.Errorf("session header uses retired policy baseline fields")
+	}
+	if h.Type != "session" || h.ID == "" || h.CreatedAt == nil {
+		return nil, fmt.Errorf("corrupt session log: first record is not a session header")
+	}
+	if *h.CreatedAt < 0 {
+		return nil, fmt.Errorf("corrupt session log: header createdAt must be non-negative")
+	}
+	depth := 0
+	if h.DelegationDepth != nil {
+		if *h.DelegationDepth < 0 {
+			return nil, fmt.Errorf("corrupt session log: header delegationDepth must be non-negative")
+		}
+		depth = *h.DelegationDepth
+	}
+	if h.Origin != nil && *h.Origin != "subagent" {
+		return nil, fmt.Errorf("corrupt session log: header origin must be subagent when present")
 	}
 	header := &session.SessionHeader{
-		Version: h.Version, ID: h.ID, CreatedAt: h.CreatedAt, DelegationDepth: h.DelegationDepth,
+		Version: h.Version, ID: h.ID, CreatedAt: *h.CreatedAt, DelegationDepth: depth,
 	}
 	if h.Cwd != nil {
 		header.Cwd = *h.Cwd
@@ -1662,6 +2212,9 @@ func parseHeaderLine(record json.RawMessage) (*session.SessionHeader, bool) {
 		header.ParentSession = *h.ParentSession
 	}
 	if h.SeedLength != nil {
+		if *h.SeedLength < 0 {
+			return nil, fmt.Errorf("corrupt session log: header seedLength must be non-negative")
+		}
 		header.SeedLength = int(*h.SeedLength)
 	}
 	if h.Origin != nil {
@@ -1670,22 +2223,22 @@ func parseHeaderLine(record json.RawMessage) (*session.SessionHeader, bool) {
 	if h.AgentPreset != nil {
 		header.AgentPreset = *h.AgentPreset
 	}
-	return header, true
+	return header, nil
 }
 
 // decodeStorageRecordValue parses one JSONL record: a scalar event or a packed
-// chunk row.
-func decodeStorageRecordValue(record json.RawMessage) []*session.SessionEnvelope {
+// chunk row. Malformed records (unparsable JSON, malformed packed rows, bad
+// surfaceOp) return an error — the scanner owns the deferred-vs-fatal policy,
+// and nothing is ever silently dropped (contract: 畸形行绝不静默丢).
+func decodeStorageRecordValue(record []byte) ([]*session.SessionEnvelope, error) {
 	var probe struct {
 		Type  string          `json:"type"`
-		Seq   int             `json:"seq"`
-		Time  int64           `json:"time"`
 		Seq0  int             `json:"seq0"`
 		Time0 int64           `json:"time0"`
 		Data  json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(record, &probe); err != nil {
-		return nil
+		return nil, fmt.Errorf("record is not valid JSON")
 	}
 	switch probe.Type {
 	case "text-chunks", "reasoning-chunks", "tool-call-chunks":
@@ -1695,9 +2248,9 @@ func decodeStorageRecordValue(record json.RawMessage) []*session.SessionEnvelope
 		}
 		events, err := decodeRow(row)
 		if err != nil {
-			return nil
+			return nil, err
 		}
-		return events
+		return events, nil
 	default:
 		var ev struct {
 			Seq       int             `json:"seq"`
@@ -1709,23 +2262,19 @@ func decodeStorageRecordValue(record json.RawMessage) []*session.SessionEnvelope
 			Ignorable bool            `json:"ignorable,omitempty"`
 		}
 		if err := json.Unmarshal(record, &ev); err != nil {
-			return nil
+			return nil, fmt.Errorf("event record is not valid JSON")
 		}
 		env := &session.SessionEnvelope{Seq: ev.Seq, Time: ev.Time, Type: ev.Type, Data: ev.Data}
-		if len(ev.Source) > 0 {
-			env.SourceEventSeqs = ev.Source
-		}
+		env.SourceEventSeqs = ev.Source
 		if len(ev.SurfOp) > 0 {
 			op, err := parseSurfaceOpJSON(ev.SurfOp)
 			if err != nil {
-				return nil
+				return nil, fmt.Errorf("malformed surfaceOp on event seq %d: %w", ev.Seq, err)
 			}
 			env.SurfaceOp = op
 		}
-		if ev.Ignorable {
-			env.Ignorable = true
-		}
-		return []*session.SessionEnvelope{env}
+		env.Ignorable = ev.Ignorable
+		return []*session.SessionEnvelope{env}, nil
 	}
 }
 

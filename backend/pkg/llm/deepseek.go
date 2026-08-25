@@ -22,10 +22,16 @@ const (
 	// at the origin (NOT /v1/chat/completions).
 	deepSeekChatPath = "/chat/completions"
 
-	// defaultDeepSeekTimeout bounds the whole request+stream lifecycle.
+	// defaultDeepSeekTimeout is the connect+headers deadline applied by
+	// startStream (upstream AbortSignal.timeout(300_000)); it does NOT bound
+	// the streaming body — a healthy stream may outlive it (deepseek-llm-contract.md:93).
 	defaultDeepSeekTimeout = 300 * time.Second
-	// defaultDeepSeekWatchdog is the max silence between SSE bytes before abort.
-	defaultDeepSeekWatchdog = 60 * time.Second
+	// defaultDeepSeekWatchdog is the max silence between SSE bytes before
+	// abort. 300s mirrors defaultDeepSeekTimeout: a reasoning-heavy generation
+	// can legitimately stay quiet for minutes between visible bytes, and the
+	// watchdog is an idle bound — not a whole-call deadline (a healthy stream
+	// may outlive it as long as bytes keep arriving).
+	defaultDeepSeekWatchdog = 300 * time.Second
 )
 
 // ModelInfo describes one selectable model in the llm.models catalog served to

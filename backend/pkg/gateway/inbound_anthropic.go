@@ -22,12 +22,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": err.Error()}})
 		return
 	}
-	userText := lastUserTextFromMessages(jsonRaw(body["messages"], raw, "messages"))
+	msgsRaw := jsonRaw(body["messages"], raw, "messages")
+	userText := lastUserTextFromMessages(msgsRaw)
 	if userText == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "messages must include a user text turn"}})
 		return
 	}
-	ag, sessionID, err := s.inboundEnsureSession(inboundSessionID(r, body))
+	ag, sessionID, freshLog, err := s.inboundEnsureSession(inboundSessionID(r, body))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
 		return
@@ -36,6 +37,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	model := stringField(body, "model", s.configuredModel())
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	stream := boolField(body, "stream")
+
+	// 无状态多轮投影（同 chat/completions）：Anthropic 顶层 system（字符串
+	// 或块数组）作为 system 前置参与拼接；会话复用路径保持原行为。
+	sysExtra := contentToText(body["system"])
+	driveText := userText
+	if freshLog {
+		if proj := projectInboundConversation(msgsRaw, sysExtra); proj != "" {
+			driveText = proj
+		}
+	}
 
 	if stream {
 		flusher := prepareSSE(w)
@@ -56,7 +67,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			"content_block": map[string]any{"type": "text", "text": ""},
 		})
 		var text string
-		_ = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "content_block_delta", map[string]any{
@@ -78,7 +89,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	var fromChunks, fromMessage string
-	err = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+	err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 		if t := assistantMessageText(env); t != "" {
 			fromMessage += t
 		}

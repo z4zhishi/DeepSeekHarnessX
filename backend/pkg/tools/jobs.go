@@ -248,6 +248,9 @@ func (r *ToolRegistry) RegisterJobTools() {
 	r.Register(ToolDefinition{
 		Name:        "job_output",
 		Description: "Read the output of a background job started with run_in_background. Optionally wait up to timeout_ms (default 30000, capped at 600000) for the job to finish.",
+		// Declared budget slightly above the tool's own 600s wait cap so a
+		// full-length wait is never truncated by the pipeline's default 60s.
+		TimeoutMs: 610000,
 		ParametersJSON: json.RawMessage(`{
 			"type": "object",
 			"properties": {

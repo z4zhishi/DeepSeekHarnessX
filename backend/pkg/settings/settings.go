@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // nsPattern mirrors upstream NAMESPACE_PATTERN: lowercase kebab-case.
@@ -66,45 +68,80 @@ type registration struct {
 }
 
 // Manager is the settings backend: namespace registration, resolution,
-// document mutation, and change notification. It is safe for concurrent use.
+// document mutation, and change notification. It is safe for concurrent use:
+// a single RWMutex serializes every access to registrations, the document,
+// revisions, and resolved values, and persistence serializes an immutable
+// snapshot so Save never needs the manager lock (it is invoked inside the
+// write critical section).
+//
+// onChange handlers are invoked synchronously while the manager lock is held;
+// they must be quick and must not call back into the Manager.
 type Manager struct {
 	path     string
 	regs     map[string]*registration
 	doc      map[string]any // ns -> user section
 	onChange func(ns string, revision int, next, prev any)
 	persist  func() error // optional: persists the document after a committed write
+
+	mu        sync.RWMutex                   // guards regs, doc, persist, docLoaded and every registration's fields
+	pub       atomic.Pointer[map[string]any] // immutable document snapshot for lock-free persistence
+	docLoaded bool                           // a FileStore.Load has established the baseline document
 }
 
 // NewManager constructs a settings manager. path is the user document file
 // ($DSH_HOME/settings.yaml); onChange, when non-nil, is invoked after a
 // committed change to a namespace's resolved value (deep-equal gated).
 func NewManager(path string, onChange func(ns string, revision int, next, prev any)) *Manager {
-	return &Manager{
+	m := &Manager{
 		path:     path,
 		regs:     map[string]*registration{},
 		doc:      map[string]any{},
 		onChange: onChange,
 	}
+	m.publishLocked()
+	return m
 }
 
-// SetPersist installs a persistence callback invoked after every committed
-// write (Mutate/Set). It lets the host flush the document to disk through its
-// FileStore. A nil callback disables persistence.
+// SetPersist installs a persistence callback invoked during every write
+// BEFORE the in-memory commit, so the store stays the source of truth: a
+// returned error aborts the write with the manager state untouched. It lets
+// the host flush the document to disk through its FileStore. A nil callback
+// disables persistence.
 func (m *Manager) SetPersist(fn func() error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.persist = fn
 }
 
-// persistLocked flushes the document through the installed callback. Caller
-// holds m.mu (or is single-threaded during construction).
-func (m *Manager) persistLocked() {
+// persistLocked flushes the STAGED document through the installed callback.
+// Caller holds m.mu; the staged candidate must already be visible in the
+// published snapshot. A returned error aborts the surrounding write before
+// anything is committed to memory.
+func (m *Manager) persistLocked() error {
 	if m.persist == nil {
-		return
+		return nil
 	}
-	if err := m.persist(); err != nil {
-		// Persistence is best-effort: a failed flush must not roll back the
-		// in-memory commit, but it is surfaced so hosts can log it.
-		fmt.Printf("settings: persist failed: %v\n", err)
+	return m.persist()
+}
+
+// publishLocked republishes an immutable deep copy of the document so
+// persistence can serialize a coherent candidate without taking (or
+// deadlocking on) m.mu. Caller holds m.mu.
+func (m *Manager) publishLocked() {
+	snap := cloneMap(m.doc)
+	if snap == nil {
+		snap = map[string]any{}
 	}
+	m.pub.Store(&snap)
+}
+
+// publishedDocument returns the latest published immutable document snapshot
+// for serialization by FileStore.Save.
+func (m *Manager) publishedDocument() map[string]any {
+	if p := m.pub.Load(); p != nil {
+		return *p
+	}
+	return map[string]any{}
 }
 
 // ErrNamespaceNotRegistered is returned when a mutation names an unknown namespace.
@@ -113,11 +150,46 @@ var ErrNamespaceNotRegistered = errors.New("settings: namespace is not registere
 // ErrNamespaceInvalid reports a malformed namespace name.
 var ErrNamespaceInvalid = errors.New("settings: namespace must be lowercase kebab-case")
 
+// ConflictError reports a write refused because the namespace moved since the
+// caller last read it (upstream SettingsConflictError): the expectedRevision
+// the write carried no longer matches the namespace's current revision. Wire
+// layers extract it with errors.As to map the rejection into their own error
+// taxonomy; the Error() text carries both revisions for envelope-only clients.
+type ConflictError struct {
+	// NS is the namespace whose write was refused.
+	NS string
+	// Expected is the revision the caller sent.
+	Expected int
+	// Actual is the revision the namespace actually stands at.
+	Actual int
+}
+
+func (e *ConflictError) Error() string {
+	return fmt.Sprintf("settings namespace %q changed since it was read (expected revision %d, now %d)", e.NS, e.Expected, e.Actual)
+}
+
+// conflictLocked builds the CAS failure for ns at the current revision.
+func conflictLocked(reg *registration, expected int) error {
+	return &ConflictError{NS: reg.ns, Expected: expected, Actual: reg.revision}
+}
+
+// checkExpectedRevision enforces an optional compare-and-swap token against
+// the registration's current revision (upstream checks it at the head of the
+// write queue). Caller holds m.mu.
+func checkExpectedRevision(reg *registration, expectedRevision []int) error {
+	if len(expectedRevision) > 0 && expectedRevision[0] != reg.revision {
+		return conflictLocked(reg, expectedRevision[0])
+	}
+	return nil
+}
+
 // Register a namespace. Duplicate registration fails loud.
 func (m *Manager) Register(ns string, schema json.RawMessage, opts Options) error {
 	if !validNamespace(ns) {
 		return fmt.Errorf("%w: %q", ErrNamespaceInvalid, ns)
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, exists := m.regs[ns]; exists {
 		return fmt.Errorf("settings namespace %q is already registered", ns)
 	}
@@ -137,18 +209,22 @@ func (m *Manager) Register(ns string, schema json.RawMessage, opts Options) erro
 	return nil
 }
 
-// Get returns the resolved value for a registered namespace, or nil while
-// unregistered.
+// Get returns a detached copy of the resolved value for a registered
+// namespace, or nil while unregistered.
 func (m *Manager) Get(ns string) (any, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	reg := m.regs[ns]
 	if reg == nil {
 		return nil, fmt.Errorf("%w: %s", ErrNamespaceNotRegistered, ns)
 	}
-	return reg.resolved, nil
+	return cloneValue(reg.resolved), nil
 }
 
 // Describe returns one descriptor per registered namespace, in registration order.
 func (m *Manager) Describe() []Descriptor {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]Descriptor, 0, len(m.regs))
 	for _, reg := range m.regs {
 		d := Descriptor{
@@ -171,13 +247,23 @@ func (m *Manager) Describe() []Descriptor {
 
 // Mutate applies ordered path edits to a namespace's user section, persists,
 // and commits. It returns the namespace's new revision.
-func (m *Manager) Mutate(ns string, ops []Op) (int, error) {
+//
+// The optional expectedRevision is an optimistic-concurrency token (upstream
+// expectedRevision): when provided it must equal the namespace's current
+// revision or the write is rejected with a ConflictError before anything is
+// staged, persisted, or committed. Callers take the token from Describe.
+func (m *Manager) Mutate(ns string, ops []Op, expectedRevision ...int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	reg := m.regs[ns]
 	if reg == nil {
 		return 0, fmt.Errorf("%w: %s", ErrNamespaceNotRegistered, ns)
 	}
 	if !reg.writable {
 		return 0, fmt.Errorf("settings provider is read-only: %q cannot be updated", ns)
+	}
+	if err := checkExpectedRevision(reg, expectedRevision); err != nil {
+		return 0, err
 	}
 	if len(ops) == 0 {
 		return reg.revision, nil
@@ -198,14 +284,29 @@ func (m *Manager) Mutate(ns string, ops []Op) (int, error) {
 		return 0, err
 	}
 
-	// Revision moves whenever the RAW section changed, so a field going from
-	// inherited to overridden is observable to editors even when the resolved
-	// value is unchanged.
-	reg.revision += 1
+	// Stage the candidate so persistence serializes the post-write document,
+	// then commit only after the store accepted it (persist-before-commit:
+	// memory must never claim a write the disk refused).
+	prevSection, hadPrev := m.doc[ns]
 	if m.doc == nil {
 		m.doc = map[string]any{}
 	}
 	m.doc[ns] = nextSection
+	m.publishLocked()
+	if perr := m.persistLocked(); perr != nil {
+		if hadPrev {
+			m.doc[ns] = prevSection
+		} else {
+			delete(m.doc, ns)
+		}
+		m.publishLocked()
+		return 0, fmt.Errorf("settings write to %q not committed, persist failed: %w", ns, perr)
+	}
+
+	// Commit: revision moves whenever the RAW section changed, so a field
+	// going from inherited to overridden is observable to editors even when
+	// the resolved value is unchanged.
+	reg.revision += 1
 
 	// Resolve and notify only when the resolved value changed (deep-equal gate).
 	prev := reg.resolved
@@ -216,7 +317,6 @@ func (m *Manager) Mutate(ns string, ops []Op) (int, error) {
 			m.onChange(ns, reg.revision, next, prev)
 		}
 	}
-	m.persistLocked()
 	return reg.revision, nil
 }
 
@@ -346,7 +446,10 @@ func cloneValue(v any) any {
 }
 
 // mergeLayers layers `over` onto `under`: plain objects merge recursively,
-// every other value replaces the lower layer wholesale.
+// every other value replaces the lower layer wholesale. Only a missing layer
+// (nil map) is skipped; an explicit JSON null entry REPLACES the lower layer
+// (upstream merges skip undefined only, never null), so writing "key": null
+// clears an override.
 func mergeLayers(under, over map[string]any) map[string]any {
 	if under == nil {
 		under = map[string]any{}
@@ -355,9 +458,6 @@ func mergeLayers(under, over map[string]any) map[string]any {
 		return under
 	}
 	for k, v := range over {
-		if v == nil {
-			continue
-		}
 		ov, ok := v.(map[string]any)
 		uv, uok := under[k].(map[string]any)
 		if ok && uok {
@@ -464,10 +564,13 @@ func deepEqualSlice(a, b any) bool {
 	return true
 }
 
-// Set replaces a namespace's user section wholesale and persists. It returns
-// the new revision. (Used by credential-free in-process consumers; the gateway
-// path is Mutate.)
-func (m *Manager) Set(ns string, section map[string]any) (int, error) {
+// Set replaces a namespace's user section wholesale, persists, and commits.
+// It returns the new revision. The optional expectedRevision works exactly as
+// in Mutate. (Used by credential-free in-process consumers; the gateway path
+// is Mutate.)
+func (m *Manager) Set(ns string, section map[string]any, expectedRevision ...int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	reg := m.regs[ns]
 	if reg == nil {
 		return 0, fmt.Errorf("%w: %s", ErrNamespaceNotRegistered, ns)
@@ -475,9 +578,29 @@ func (m *Manager) Set(ns string, section map[string]any) (int, error) {
 	if !reg.writable {
 		return 0, fmt.Errorf("settings provider is read-only: %q cannot be updated", ns)
 	}
-	prev := reg.resolved
+	if err := checkExpectedRevision(reg, expectedRevision); err != nil {
+		return 0, err
+	}
+
+	// Stage first, persist, commit only on success (see Mutate).
+	prevSection, hadPrev := m.doc[ns]
+	if m.doc == nil {
+		m.doc = map[string]any{}
+	}
 	m.doc[ns] = cloneMap(section)
+	m.publishLocked()
+	if perr := m.persistLocked(); perr != nil {
+		if hadPrev {
+			m.doc[ns] = prevSection
+		} else {
+			delete(m.doc, ns)
+		}
+		m.publishLocked()
+		return 0, fmt.Errorf("settings write to %q not committed, persist failed: %w", ns, perr)
+	}
+
 	reg.revision += 1
+	prev := reg.resolved
 	next := m.resolve(reg)
 	if !deepEqual(prev, next) {
 		reg.resolved = next
@@ -485,12 +608,38 @@ func (m *Manager) Set(ns string, section map[string]any) (int, error) {
 			m.onChange(ns, reg.revision, next, prev)
 		}
 	}
-	m.persistLocked()
 	return reg.revision, nil
 }
 
 // DocumentExists reports whether a stored user section exists for any
 // registered namespace. It backs settings.describe's hasDocument field.
 func (m *Manager) DocumentExists() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.doc) > 0
+}
+
+// loadDocument swaps in a freshly read document (FileStore.Load). The FIRST
+// load establishes the baseline: revisions stay where registration left them,
+// matching upstream, where the provider loads the document before namespaces
+// are registered. Every subsequent load is an observed external change: each
+// registered namespace whose RAW section changed gets its revision advanced
+// (upstream publish/bumpRevision) so stale writers are rejected by CAS, then
+// all namespaces re-resolve with onChange fired for resolved-value changes.
+func (m *Manager) loadDocument(doc map[string]any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := m.doc
+	first := !m.docLoaded
+	m.docLoaded = true
+	m.doc = doc
+	m.publishLocked()
+	if !first && before != nil {
+		for _, reg := range m.regs {
+			if !deepEqual(before[reg.ns], doc[reg.ns]) {
+				reg.revision += 1
+			}
+		}
+	}
+	m.reloadLocked()
 }

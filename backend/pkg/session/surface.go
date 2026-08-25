@@ -237,18 +237,22 @@ func surfaceOpOf(event *SessionEnvelope) (*SurfaceOp, error) {
 
 func assertProvenance(event *SessionEnvelope, shadowed []int) error {
 	sources := map[int]bool{}
-	if len(event.SourceEventSeqs) > 0 {
-		for _, source := range event.SourceEventSeqs {
-			if source < 0 {
-				return fmt.Errorf("session event %q sourceEventSeqs must densely contain non-negative safe integers", event.Type)
-			}
-			if sources[source] {
-				return fmt.Errorf("sourceEventSeqs must not contain duplicates")
-			}
-			sources[source] = true
-			if source >= event.Seq {
-				return fmt.Errorf("sourceEventSeqs must reference earlier events: %d >= current seq %d", source, event.Seq)
-			}
+	// An explicit empty sourceEventSeqs list is legal only on assistant/message
+	// (it prices a known-empty stream); any other surface event carrying an
+	// empty set is malformed (upstream surface.ts assertProvenance).
+	if event.SourceEventSeqs != nil && len(event.SourceEventSeqs) == 0 && event.Type != EventAssistantMessage {
+		return fmt.Errorf("sourceEventSeqs on event %q at seq %d must not be empty except on assistant/message", event.Type, event.Seq)
+	}
+	for _, source := range event.SourceEventSeqs {
+		if source < 0 {
+			return fmt.Errorf("session event %q sourceEventSeqs must densely contain non-negative safe integers", event.Type)
+		}
+		if sources[source] {
+			return fmt.Errorf("sourceEventSeqs must not contain duplicates")
+		}
+		sources[source] = true
+		if source >= event.Seq {
+			return fmt.Errorf("sourceEventSeqs must reference earlier events: %d >= current seq %d", source, event.Seq)
 		}
 	}
 	for _, seq := range shadowed {

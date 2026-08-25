@@ -24,6 +24,67 @@ const (
 	ApprovalCancel    ApprovalDecision = "cancel"
 )
 
+// UserQuestionOption is one selectable choice offered with a structured
+// question. ID mirrors the label today (the wire schema has no separate
+// optionId); the field exists so hosts can grow stable ids without another
+// signature break.
+type UserQuestionOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// UserQuestion is one question handed to a UserQuestionAnswerer (the
+// structured upgrade path of the legacy approval waterfall).
+type UserQuestion struct {
+	ID          string               `json:"id"`
+	Header      string               `json:"header,omitempty"`
+	Prompt      string               `json:"prompt"`
+	Options     []UserQuestionOption `json:"options,omitempty"`
+	MultiSelect bool                 `json:"multiSelect"`
+}
+
+// UserQuestionAnswer is one structured answer: selected option id(s) or a
+// free-text custom answer. The zero value (empty ID) means the user
+// dismissed/cancelled the dialog — every real answer echoes the question id.
+type UserQuestionAnswer struct {
+	ID       string   `json:"id"`
+	Selected []string `json:"selected,omitempty"`
+	Custom   string   `json:"custom,omitempty"`
+}
+
+// Cancelled reports whether the answer carries no user choice (dismissed
+// dialog, host collapse, or empty provider reply).
+func (a UserQuestionAnswer) Cancelled() bool {
+	return a.ID == "" && len(a.Selected) == 0 && a.Custom == ""
+}
+
+// UserQuestionAnswerer is the structured question/answer bridge for hosts
+// (GUI dialogs, ACP clients) that can carry custom options and typed answers
+// instead of collapsing them into the allow/deny/cancel ApprovalDecision
+// enum. Hosts opt in by storing any value implementing this interface in
+// ToolExecutionContext.Answerer — the interface and types are defined here in
+// pkg/tools so sibling packages (pkg/gateway, pkg/acp) need NO signature
+// changes; they adopt it incrementally via a plain type assertion.
+type UserQuestionAnswerer interface {
+	RequestUserStructured(question UserQuestion) ([]UserQuestionAnswer, error)
+}
+
+// defaultToolTimeout is the fallback execution budget for tools that declare
+// neither TimeoutMs nor NoTimeout.
+const defaultToolTimeout = 60 * time.Second
+
+// noTimeoutByDesign names tools whose design budget intentionally exceeds any
+// fixed deadline (they orchestrate whole agent loops / subagent fan-outs that
+// own their internal budgets). Their registration literals live outside this
+// package's editable surface (workflow_run -> workflow_tool.go,
+// invoke_subagent -> pkg/subagent/manager.go), so the exemption is applied by
+// name here instead of a TimeoutMs declaration on the definition.
+var noTimeoutByDesign = map[string]bool{
+	"workflow_run":    true,
+	"invoke_subagent": true,
+}
+
 // ToolExecutionContext carries contextual data during tool execution.
 type ToolExecutionContext struct {
 	Context     context.Context
@@ -46,6 +107,11 @@ type ToolExecutionContext struct {
 	CallerID        string
 	CallerName      string
 	ParentSessionID string
+	// Answerer optionally carries a structured question/answer bridge for
+	// interactive tools (ask_user custom options). Any value implementing
+	// UserQuestionAnswerer is honored via type assertion; nil (or any other
+	// type) keeps the legacy RequestUser approval semantics untouched.
+	Answerer any
 }
 
 // ToolDefinition defines the contract for a model-invocable tool.
@@ -54,7 +120,17 @@ type ToolDefinition struct {
 	Description    string          `json:"description"`
 	ParametersJSON json.RawMessage `json:"parameters"`
 	Execute        func(ctx ToolExecutionContext, argsJSON string) (any, error)
-	RequiresPerm   bool `json:"requiresPerm"`
+	RequiresPerm   bool   `json:"requiresPerm"`
+	// TimeoutMs declares this tool's own execution budget in milliseconds;
+	// ExecutePipeline arms exactly this deadline instead of the shared
+	// defaultToolTimeout. Declare slightly MORE than the tool's internal
+	// budget (e.g. terminal_send settles at 120s -> declare 150000) so the
+	// inner timeout produces the meaningful error first.
+	TimeoutMs int64
+	// NoTimeout opts this tool out of any pipeline-imposed deadline. Only
+	// for orchestrators that run whole agent loops and manage their own
+	// budgets; ordinary tools should declare TimeoutMs instead.
+	NoTimeout bool
 }
 
 // ToolRegistry manages registered tools and runs the execution pipeline.
@@ -179,7 +255,21 @@ func (r *ToolRegistry) ExecutePipeline(ctx ToolExecutionContext, name string, ar
 			return "Permission denied by user.", true, nil
 		}
 	} // 2. Execution Stage with timeout
-	execCtx, cancel := context.WithTimeout(ctx.Context, 60*time.Second)
+	// Per-tool budget: a declared TimeoutMs (or an explicit NoTimeout opt-out)
+	// wins over the shared default, so tools whose internal design budgets
+	// exceed 60s (terminal_send 120s, job_output waits up to 600s) are never
+	// truncated by the pipeline before their own deadline fires.
+	execCtx := ctx.Context
+	var cancel context.CancelFunc
+	switch {
+	case tool.NoTimeout || noTimeoutByDesign[name]:
+		// Orchestrators that own their internal budgets run unbounded.
+		cancel = func() {}
+	case tool.TimeoutMs > 0:
+		execCtx, cancel = context.WithTimeout(ctx.Context, time.Duration(tool.TimeoutMs)*time.Millisecond)
+	default:
+		execCtx, cancel = context.WithTimeout(ctx.Context, defaultToolTimeout)
+	}
 	defer cancel()
 	ctx.Context = execCtx
 

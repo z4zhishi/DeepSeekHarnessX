@@ -55,12 +55,10 @@ func (r *ToolRegistry) RegisterImageTools() {
 
 			targetPath := resolvePath(ctx.Cwd, args.FilePath)
 
-			// Read-only workspaces forbid image reads as well as writes.
-			if r.Policy != nil && ctx.Cwd != "" {
-				if marker := r.Policy.checkWrite(ctx.SessionID, ctx.Cwd, targetPath); marker != "" {
-					return marker, nil
-				}
-			}
+			// read_image is read-only: only extension + existence are checked.
+			// The write sandbox (checkWrite) must NOT gate reads — under
+			// read-only mode it denied every image and under workspace-write
+			// it rejected legitimate reads outside the workspace root.
 
 			data, err := os.ReadFile(targetPath)
 			if err != nil {

@@ -117,9 +117,9 @@ func buildResponsesRequest(req ModelRequest) responsesRequest {
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature
 	}
-	if req.MaxTokens > 0 {
-		body.MaxOutputTokens = req.MaxTokens
-	}
+	// Output cap: an unset (<=0) request falls back to DefaultMaxTokens so the
+	// wire always carries a bounded max_output_tokens.
+	body.MaxOutputTokens = effectiveMaxTokens(req.MaxTokens)
 	for _, t := range req.Tools {
 		params := t.Parameters
 		if len(params) == 0 {
@@ -132,8 +132,14 @@ func buildResponsesRequest(req ModelRequest) responsesRequest {
 			Parameters:  params,
 		})
 	}
-	if req.Purpose != "session-title" && req.ReasoningEffort != "" && req.ReasoningEffort != "off" {
-		effort := req.ReasoningEffort
+	// Reasoning mapping mirrors upstream resolveThinking: session-title omits
+	// reasoning; "off" is the explicit opt-out; an omitted effort defaults ON
+	// at DefaultReasoningEffort ("high"); "max" maps to the wire's top level.
+	effort := req.ReasoningEffort
+	if effort == "" {
+		effort = DefaultReasoningEffort
+	}
+	if req.Purpose != "session-title" && effort != "off" {
 		if effort == "max" {
 			effort = "high"
 		}
@@ -153,9 +159,7 @@ func buildResponsesInput(req ModelRequest) []any {
 			if text != "" {
 				out = append(out, map[string]any{"role": "system", "content": text})
 			}
-		case "user":
-			text := flattenTextBlocks(m.Content)
-			out = append(out, map[string]any{"role": "user", "content": text})
+			continue
 		case "assistant":
 			var text strings.Builder
 			for _, b := range m.Content {
@@ -179,22 +183,33 @@ func buildResponsesInput(req ModelRequest) []any {
 			if text.Len() > 0 {
 				out = append(out, map[string]any{"role": "assistant", "content": text.String()})
 			}
-		case "tool":
-			for _, b := range m.Content {
-				if b.Type != "tool-result" {
-					continue
+			continue
+		}
+		// User-role messages: text rides as the user item and each
+		// tool-result block expands into its own function_call_output item
+		// after it (results stay verbatim in user messages).
+		var text strings.Builder
+		var outputs []any
+		for _, b := range m.Content {
+			switch b.Type {
+			case "text":
+				text.WriteString(b.Text)
+			case "tool-result":
+				output := flattenTextBlocks(b.Content)
+				if output == "" {
+					output = "(no output)"
 				}
-				text := flattenTextBlocks(b.Content)
-				if text == "" {
-					text = "(no output)"
-				}
-				out = append(out, map[string]any{
+				outputs = append(outputs, map[string]any{
 					"type":    "function_call_output",
 					"call_id": b.ToolCallID,
-					"output":  text,
+					"output":  output,
 				})
 			}
 		}
+		if text.Len() > 0 || len(outputs) == 0 {
+			out = append(out, map[string]any{"role": "user", "content": text.String()})
+		}
+		out = append(out, outputs...)
 	}
 	return out
 }

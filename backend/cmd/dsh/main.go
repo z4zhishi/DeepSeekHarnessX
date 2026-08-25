@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"dsh-go/pkg/acp"
@@ -35,6 +37,20 @@ import (
 
 // version is injected at build time via `-ldflags "-X main.version=..."`.
 var version = "dev"
+
+// knownModes is the whitelist of launch modes. Anything else (e.g. a typo)
+// is rejected with the list of valid values instead of silently launching
+// the desktop GUI.
+var knownModes = []string{"gui", "tui", "server", "web", "acp", "mcp", "sdk", "headless"}
+
+func isKnownMode(m string) bool {
+	for _, k := range knownModes {
+		if m == k {
+			return true
+		}
+	}
+	return false
+}
 
 // modeDeps lazily assembles the heavyweight runtime (storage, tool registry,
 // LLM adapter, subagent tools) exactly once, on first use. --help/--version
@@ -60,11 +76,25 @@ type modeDeps struct {
 	// hooks runtime can dispatch through the same bus plugins use. Set in
 	// build(); may be nil for tooling-only modes.
 	hookBus *plugin.EventBus
-	initErr error
+	// mcpConfig is the --mcp-config path honored by every mode ("" = no MCP).
+	mcpConfig string
+	// mcpMount tracks the async MCP mounting kicked off by build() (nil when
+	// no config was given). Collect() after Done() yields supervisors to close.
+	mcpMount *mcp.ProductMount
+	initErr  error
 }
 
-func newModeDeps(needStore, mock bool, dataDir, model, storeKind, pluginDir string) *modeDeps {
-	d := &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir}
+// mcpMountInitTimeout bounds one async MCP config mount's initial-connect
+// budget. The mount runs off the startup path entirely; this only decides how
+// long a slow/hung server may hold the initial generation before its supervisor
+// falls back to the background reconnect loop (or the whole mount degrades).
+const mcpMountInitTimeout = 10 * time.Second
+
+// mcpCloseWait caps how long Close blocks on an in-flight async MCP mount.
+const mcpCloseWait = 15 * time.Second
+
+func newModeDeps(needStore, mock bool, dataDir, model, storeKind, pluginDir, mcpConfig string) *modeDeps {
+	d := &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir, mcpConfig: mcpConfig}
 	// Seed the workspace manager's default root with the process working
 	// directory (a real, browsable tree; the storage data dir is a flat file
 	// store, not a good picker root). Empty workspaceRoots later falls back to
@@ -124,7 +154,13 @@ func (m *modeDeps) build() {
 		}
 		m.adapter = llm.NewRouter(adapter)
 
-		m.subagents = subagent.NewManager(m.toolReg, m.adapter)
+		// 子代理管理器：接入父会话同一持久化 store（子会话事件落库，不再
+		// 只在内存），并继承当前模型路由（每次 spawn 时查询，热切换生效）。
+		subOpts := []subagent.Option{subagent.WithModelGetter(func() string { return m.model })}
+		if m.store != nil {
+			subOpts = append(subOpts, subagent.WithStore(m.store))
+		}
+		m.subagents = subagent.NewManager(m.toolReg, m.adapter, subOpts...)
 		m.subagents.RegisterSubagentTools(m.toolReg)
 
 		// Agent Teams runtime wiring: the process-global TeamService spawns
@@ -147,6 +183,15 @@ func (m *modeDeps) build() {
 			}
 		}
 		m.plugins.Reconcile(context.Background())
+
+		// MCP 产品会话挂载：存在 --mcp-config 时把服务器工具异步挂进主工具
+		// 注册表（gui/tui/server/acp/sdk/headless 全模式共享本注册表）。配置
+		// 缺失/解析失败/挂载错误一律静默降级为无 MCP，不阻断启动；挂载在
+		// 后台 goroutine 完成，主启动路径零等待。专职 `dshx mcp` 校验模式
+		// 不走这里（mcpConfig 置空），由其分支同步 MountConfigFile。
+		if m.mcpConfig != "" {
+			m.mcpMount = mcp.MountAsync(m.mcpConfig, m.toolReg, log.Default(), mcp.MountConfigFile, mcpMountInitTimeout)
+		}
 	})
 }
 
@@ -168,8 +213,19 @@ func (m *modeDeps) Subagents() *subagent.Manager {
 	return m.subagents
 }
 
-// Close releases the store if it was opened. Safe to call unconditionally.
+// Close releases the async MCP mount, the plugin registry, and the store if it
+// was opened. Safe to call unconditionally.
 func (m *modeDeps) Close() {
+	if m.mcpMount != nil {
+		// 挂载仍在后台进行时按上限等待，避免退出被慢 MCP 服务器无限拖延；
+		// 超时放弃的实例随进程退出回收，但插件与存储的收尾不受影响。
+		select {
+		case <-m.mcpMount.Done():
+			mcp.CloseSupervisors(m.mcpMount.Collect(), log.Default())
+		case <-time.After(mcpCloseWait):
+			log.Printf("mcp: 挂载未在 %v 内完成，跳过其收尾（随进程退出回收）", mcpCloseWait)
+		}
+	}
 	if m.plugins != nil {
 		m.plugins.Close()
 	}
@@ -182,6 +238,7 @@ func (m *modeDeps) Close() {
 func main() {
 	var (
 		port       = flag.Int("port", 3080, "HTTP/WS API server port")
+		host       = flag.String("host", "127.0.0.1", "HTTP/WS API server bind address (server/gui modes)")
 		profile    = flag.String("profile", "", "Profile to launch: gui | tui | web | headless | server | acp")
 		model      = flag.String("model", "deepseek-v4-flash", "Default model name")
 		storeKind  = flag.String("store", "sqlite", "Storage engine: sqlite (default) | bbolt")
@@ -189,7 +246,7 @@ func main() {
 		systemText = flag.String("system", "You are DSHX Assistant.", "System prompt")
 		showVer    = flag.Bool("version", false, "Print version and exit")
 		mockLlm    = flag.Bool("mock", false, "Use the mock LLM adapter (test/demo only; default behavior reports MISSING_CREDENTIAL when DEEPSEEK_API_KEY is unset)")
-		mcpConfig  = flag.String("mcp-config", "", "MCP servers JSON config file (mcp mode)")
+		mcpConfig  = flag.String("mcp-config", "", "MCP servers JSON config file; honored by every mode (missing/invalid file degrades to no MCP; dedicated validation mode: 'dshx mcp')")
 		pluginDir  = flag.String("plugin-dir", "", "External plugin directory (JSON-RPC subprocess plugins; *.json manifests)")
 	)
 	flag.Parse()
@@ -203,13 +260,34 @@ func main() {
 
 	args := flag.Args()
 
-	// Default to "gui" for desktop double-click execution.
+	// Default mode is adaptive: prefer the desktop GUI when a display session
+	// is available, otherwise fall back to the TUI (original-design.md:13
+	// "dsh（自适应/TUI）"). On Linux without DISPLAY/WAYLAND there is no GUI to
+	// launch, so TUI keeps the no-arg invocation usable on headless servers.
 	mode := "gui"
 	if *profile != "" {
 		mode = *profile
 	} else if len(args) > 0 {
 		mode = args[0]
 		args = args[1:]
+	}
+	if mode == "gui" && !guiAvailable() {
+		if runtime.GOOS == "windows" {
+			// Windows always reports a desktop session in practice; if it does
+			// not (service context), still fall back rather than hang.
+			fmt.Fprintln(os.Stderr, "[DSHX] No desktop display session detected; falling back to TUI.")
+			mode = "tui"
+		} else {
+			fmt.Fprintln(os.Stderr, "[DSHX] No display environment detected (DISPLAY/WAYLAND unset); falling back to TUI. Use 'dshx gui' to force GUI mode.")
+			mode = "tui"
+		}
+	}
+
+	// Unknown subcommands must fail loudly: silently launching a desktop
+	// window for a typo makes scripted use and debugging impossible.
+	if !isKnownMode(mode) {
+		fmt.Fprintf(os.Stderr, "Error: unknown mode %q. Valid modes: %s\n", mode, strings.Join(knownModes, ", "))
+		os.Exit(2)
 	}
 
 	// ACP is automation-only over stdio: it never opens storage. Every other
@@ -218,7 +296,14 @@ func main() {
 	if *pluginDir == "" {
 		*pluginDir = filepath.Join(*dataDir, "plugins")
 	}
-	deps := newModeDeps(needStore, *mockLlm, *dataDir, *model, *storeKind, *pluginDir)
+	// The dedicated `dshx mcp` validation mode mounts its config synchronously
+	// in its own branch; blank it here so deps.build() does not mount a second
+	// time (duplicate serverName would be a namespace-conflict error).
+	depsMcpConfig := *mcpConfig
+	if mode == "mcp" {
+		depsMcpConfig = ""
+	}
+	deps := newModeDeps(needStore, *mockLlm, *dataDir, *model, *storeKind, *pluginDir, depsMcpConfig)
 	defer deps.Close()
 
 	switch mode {
@@ -229,11 +314,16 @@ func main() {
 		}
 		// server/gui 共用进程级 subagent 管理器：host 下行广播
 		// host/subagent-started|finished，Godot 谱系树据此渲染。
-		srv := gateway.NewServer(store, toolReg, adapter)
+		srv := gateway.NewServerWithVersion(store, toolReg, adapter, version)
 		wireSettings(srv)
 		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
-		_ = embedgui.LaunchAllInOneGUIWithServer(*port, srv)
+		if err := embedgui.LaunchAllInOneGUIWithServer(*host, *port, srv); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: GUI launch failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "[DSHX] Try 'dshx tui' for the terminal interface.")
+			deps.Close()
+			os.Exit(1)
+		}
 
 	case "tui":
 		store, toolReg, adapter, err := deps.Full()
@@ -247,15 +337,31 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		srv := gateway.NewServer(store, toolReg, adapter)
+		srv := gateway.NewServerWithVersion(store, toolReg, adapter, version)
 		wireSettings(srv)
 		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
-		addr := fmt.Sprintf("127.0.0.1:%d", *port)
-		fmt.Printf("DSHX Go API Gateway listening on http://%s\n", addr)
-		if err := http.ListenAndServe(addr, srv.Routes()); err != nil {
-			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-			os.Exit(1)
+		addr := fmt.Sprintf("%s:%d", *host, *port)
+		httpSrv := &http.Server{Addr: addr, Handler: srv.Routes()}
+		fmt.Printf("DSHX Go API Gateway (%s) listening on http://%s\n", version, addr)
+
+		// 优雅停机：SIGINT/SIGTERM 触发 srv.Shutdown，保证 defer deps.Close()
+		// （插件子进程关闭/store Close）在退出前执行，而非被信号直接杀死。
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		serveErr := make(chan error, 1)
+		go func() { serveErr <- httpSrv.ListenAndServe() }()
+		select {
+		case err := <-serveErr:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+				os.Exit(1)
+			}
+		case <-ctx.Done():
+			fmt.Println("\n[DSHX] Shutdown signal received; draining connections...")
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutdownCtx)
 		}
 
 	case "acp":
@@ -317,26 +423,36 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		runHeadless(store, toolReg, adapter, *model, *systemText, prompt)
+		if code := runHeadless(store, toolReg, adapter, *model, *systemText, prompt); code != 0 {
+			deps.Close()
+			os.Exit(code)
+		}
 
 	default:
-		store, toolReg, adapter, err := deps.Full()
-		if err != nil {
-			fatal(err)
-		}
-		// server/gui 共用进程级 subagent 管理器：host 下行广播
-		// host/subagent-started|finished，Godot 谱系树据此渲染。
-		srv := gateway.NewServer(store, toolReg, adapter)
-		wireSettings(srv)
-		wireServerExt(srv, deps)
-		srv.AttachSubagentManager(deps.Subagents())
-		_ = embedgui.LaunchAllInOneGUIWithServer(*port, srv)
+		// The whitelist check above makes this branch unreachable for unknown
+		// modes; it exists only to keep the compiler happy.
+		fatal(fmt.Errorf("unhandled mode %q", mode))
 	}
 }
 
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
+}
+
+// guiAvailable reports whether the current process plausibly has a display
+// session for the desktop GUI. Windows is assumed to have one (the desktop
+// session exists for any interactive logon); on Linux the DISPLAY/WAYLAND
+// environment variables are the standard signal, with DSH_GUI=1 as an escape
+// hatch to force GUI mode in unusual setups.
+func guiAvailable() bool {
+	if v := os.Getenv("DSH_GUI"); v != "" && v != "0" {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
 }
 
 // teamSpawner wires the Agent Teams runtime's teammate provider to a real DSH
@@ -536,11 +652,12 @@ func wireSettings(srv *gateway.Server) {
 	srv.Credentials = creds
 }
 
-func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model, system, prompt string) {
+func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model, system, prompt string) int {
 	header := session.SessionHeader{
 		ID:        fmt.Sprintf("headless-%d", time.Now().UnixNano()),
 		CreatedAt: time.Now().UnixMilli(),
 		Cwd:       ".",
+		Origin:    "headless",
 	}
 
 	ringBuf := storage.NewRingBuffer(256)
@@ -566,6 +683,7 @@ func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapte
 		Source: session.MessageSource{Kind: "user"},
 	})
 
+	exitCode := 0
 	for env := range eventsChan {
 		if env.Type == session.EventAssistantMessage {
 			var msg session.AssistantMessagePayload
@@ -578,7 +696,20 @@ func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapte
 		}
 		if env.Type == session.EventTurnEnd {
 			fmt.Println()
+			// 脚本化场景必须能以退出码判成败：turn/end reason.Kind==error
+			// 时向 stderr 输出错误原因并以非零码结束（original-design.md:138
+			// headless 验收前提），不再静默吞错返回 0。
+			var end session.TurnEndPayload
+			if err := json.Unmarshal(env.Data, &end); err == nil && end.Reason.Kind == "error" {
+				msg := end.Reason.Message
+				if msg == "" {
+					msg = "turn failed (no detail reported)"
+				}
+				fmt.Fprintf(os.Stderr, "[DSHX] headless error: %s\n", msg)
+				exitCode = 1
+			}
 			break
 		}
 	}
+	return exitCode
 }

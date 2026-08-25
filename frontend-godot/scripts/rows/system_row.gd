@@ -48,9 +48,16 @@ func bind(node: Dictionary) -> void:
 		caption.add_theme_color_override("font_color", DshTokens.text_tertiary())
 		return
 	if text == "":
-		text = str(p.get("reason", ""))
-	if text == "":
-		text = _t("chat.systemStopped", "Stopped.")
+		var reason := str(p.get("reason", ""))
+		match reason:
+			"error":
+				text = _t("chat.systemFailed", "Failed to send prompt.")
+			"aborted", "interrupted":
+				text = _t("chat.systemStopped", "Stopped.")
+			"":
+				text = _t("chat.systemStopped", "Stopped.")
+			_:
+				text = reason
 	caption.text = text
 	if kind == "turn-error" or str(p.get("reason", "")) == "error":
 		caption.add_theme_color_override("font_color", DshTokens.danger())

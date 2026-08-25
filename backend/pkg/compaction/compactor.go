@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -141,15 +142,19 @@ type SummarizationInput struct {
 }
 
 // Summarizer turns one replayed region into the compact checkpoint summary.
+// rawOutput is the complete provider output before the text-only projection
+// and llmStreamCall marks a call made through the harness LLM seam — both are
+// recorded verbatim on compaction/summary so the auxiliary call stays
+// reconstructible from the log alone (upstream SummaryResult).
 type Summarizer interface {
-	Summarize(ctx context.Context, input SummarizationInput) ([]session.ContentBlock, *session.TokenUsage, error)
+	Summarize(ctx context.Context, input SummarizationInput) (summary []session.ContentBlock, usage *session.TokenUsage, rawOutput []session.ContentBlock, llmStreamCall bool, err error)
 }
 
 // TemplateSummarizer frames the standard checkpoint using a fixed text
 // summary without a model call (tests and offline runs).
 type TemplateSummarizer struct{}
 
-func (TemplateSummarizer) Summarize(_ context.Context, input SummarizationInput) ([]session.ContentBlock, *session.TokenUsage, error) {
+func (TemplateSummarizer) Summarize(_ context.Context, input SummarizationInput) ([]session.ContentBlock, *session.TokenUsage, []session.ContentBlock, bool, error) {
 	var lines []string
 	lines = append(lines, "## Primary Request and Intent", "- "+firstUserText(input.Messages))
 	lines = append(lines, "", "## Key Technical Concepts", "- (none)")
@@ -159,7 +164,9 @@ func (TemplateSummarizer) Summarize(_ context.Context, input SummarizationInput)
 	lines = append(lines, "", "## Current Work", "- (none)")
 	lines = append(lines, "", "## Next Step", "- (none)")
 	lines = append(lines, "", "## Critical Context", "- (none)")
-	return []session.ContentBlock{{Type: "text", Text: strings.Join(lines, "\n")}}, nil, nil
+	text := strings.Join(lines, "\n")
+	blocks := []session.ContentBlock{{Type: "text", Text: text}}
+	return blocks, nil, blocks, false, nil
 }
 
 func firstUserText(messages []session.ModelMessage) string {
@@ -184,6 +191,14 @@ type CompactEngine struct {
 	Provider     string
 	Model        string
 	MaxTokens    int
+	// ContextLimit is the routed model's context window in tokens. 0 (the
+	// zero value) keeps the legacy always-compact-when-selectable behavior;
+	// when set, PressureQualified gates automatic compaction on projected
+	// transcript size against ThresholdTokens.
+	ContextLimit int
+	// ThresholdRatio is the pressure fraction of ContextLimit that qualifies
+	// a session for compaction (upstream thresholdRatio; default 0.8).
+	ThresholdRatio float64
 }
 
 // NewCompactEngine builds the engine with defaults (TemplateSummarizer when
@@ -257,6 +272,40 @@ func (e *CompactEngine) SelectCompactableRange(events []session.SessionEnvelope,
 	return &SurfaceSpan{Start: nodes[0], End: nodes[keepFromIdx-1]}, nil
 }
 
+// DefaultThresholdRatio mirrors upstream DEFAULT_THRESHOLD_RATIO: the default
+// pressure fraction of the context window that qualifies for compaction.
+const DefaultThresholdRatio = 0.8
+
+// ThresholdTokens resolves the absolute token pressure target this engine
+// compacts at (upstream resolveCompactSpec's floor(contextWindow*ratio)).
+func (e *CompactEngine) ThresholdTokens() int {
+	ratio := e.ThresholdRatio
+	if ratio <= 0 || ratio > 1 {
+		ratio = DefaultThresholdRatio
+	}
+	return int(float64(e.ContextLimit) * ratio)
+}
+
+// PressureQualified reports whether projected transcript tokens have reached
+// the compaction threshold (upstream compactIfNeeded's pressure gate:
+// `measurement.totalTokens < spec.thresholdTokens → return null`). With no
+// ContextLimit configured the gate is always open, preserving the legacy
+// select-then-compact behavior; loop.go wires this before CompactTransaction:
+//
+//	qualified, err := a.Compactor.PressureQualified(log)
+//	if err != nil || !qualified { return }
+func (e *CompactEngine) PressureQualified(events []session.SessionEnvelope) (bool, error) {
+	if e.ContextLimit <= 0 {
+		return true, nil
+	}
+	meter := llm.Meter{ContextLimit: e.ContextLimit}
+	metrics, err := meter.Measure(events)
+	if err != nil {
+		return false, err
+	}
+	return metrics.ProjectedTokens >= e.ThresholdTokens(), nil
+}
+
 // SurfaceSelection is one validated inclusive span of current surface positions.
 type SurfaceSelection struct {
 	Span         SurfaceSpan
@@ -316,7 +365,9 @@ func (e *CompactEngine) ValidateSurfaceRegion(events []session.SessionEnvelope, 
 // CompactTransactionOptions carries the transaction bracket options.
 type CompactTransactionOptions struct {
 	// Owner is the numbered turn that encloses an automatic compaction; nil
-	// writes a standalone bracket (manual, idle).
+	// writes a standalone bracket (manual, idle). A non-manual transaction
+	// with a nil Owner additionally asserts an open turn exists (upstream
+	// 'current-turn' owner semantics).
 	Owner *int
 	// Manual marks a direct human-command compaction (cancel-sensitive).
 	Manual bool
@@ -325,6 +376,23 @@ type CompactTransactionOptions struct {
 	// Start/End select the surface-position span to compact.
 	Start int
 	End   int
+	// Flush runs once after the bracket closed successfully (upstream
+	// durability checkpoint); its failure classifies as persistence.
+	Flush func() error
+	// Reload observes the live log at the stability checkpoint (upstream
+	// reads session.events directly). When set, it must return the freshest
+	// durable log plus its folded surface nodes; the transaction replays the
+	// selected span against them after summarization and refuses to commit
+	// over a changed surface (SurfaceChangedError). Nil disables the recheck
+	// (single-writer embedded runs where nothing can interleave).
+	Reload func() ([]session.SessionEnvelope, []int, error)
+	// Automatic marks a current-turn-owner compaction (upstream
+	// owner:'current-turn'): the bracket must lie inside the session's open
+	// turn — a missing open turn is rejected ('no open turn') instead of
+	// silently writing a standalone bracket across a turn boundary. The
+	// owner turn number is derived from the log; Start/End still select the
+	// span. Manual transactions ignore this flag.
+	Automatic bool
 }
 
 // CompactTransaction runs the single durable compaction transaction over the
@@ -354,12 +422,23 @@ func (e *CompactEngine) CompactTransaction(
 	if options.Manual && state.openTurn != nil {
 		return nil, &ManualCompactionError{Code: ManualErrBusy, Message: "manual compaction: the session already has an open turn"}
 	}
+	// Automatic (current-turn owner) path: the bracket must be enclosed in an
+	// open turn (upstream throws 'no open turn'); otherwise the standalone
+	// bracket would straddle a turn boundary, which upstream invariants
+	// forbid. Manual and idle transactions skip this assertion.
+	if options.Automatic && state.openTurn == nil {
+		return nil, fmt.Errorf("compactRegion: no open turn — automatic compaction events must be enclosed in a turn")
+	}
 
 	compactionId := newCompactionID()
+	ownerTurn := options.Owner
+	if ownerTurn == nil {
+		ownerTurn = state.openTurn
+	}
 	startEnv, err := session.NewEnvelope(0, session.EventCompactionStart, CompactionStartPayload{
 		CompactionId:    compactionId,
 		SourceCommandId: options.SourceCommandId,
-		Turn:            options.Owner,
+		Turn:            ownerTurn,
 	})
 	if err != nil {
 		return nil, err
@@ -368,44 +447,69 @@ func (e *CompactEngine) CompactTransaction(
 		return nil, &ManualCompactionError{Code: ManualErrPersistence, Message: "compaction/start could not be persisted", Cause: err}
 	}
 
-	// Summarize with stability recheck before commit.
+	// Summarize, recheck surface stability against the live log, then commit.
+	//
+	// Prepare phase (upstream prepareCompaction): snapshot the selected span's
+	// per-node prices BEFORE the asynchronous summarization so the stability
+	// recheck can compare against them afterwards.
+	preparedPrices, err := e.Measure(events, nodes)
+	if err != nil || len(preparedPrices) != len(nodes) {
+		err := fmt.Errorf("compaction: token-meter surface does not match the current session surface")
+		e.closeFailure(startEnv, compactionId, options, err, appendFn)
+		return nil, e.classifyFailure(options, false, err)
+	}
+	preparedSpan := append([]int(nil), preparedPrices[selection.StartIdx:selection.EndIdx+1]...)
+
 	input, err := regionMessages(events, selection.ShadowedSeqs)
 	if err != nil {
 		e.closeFailure(startEnv, compactionId, options, err, appendFn)
-		return nil, err
+		return nil, e.classifyFailure(options, false, err)
 	}
-	summary, usage, err := e.Summarizer.Summarize(ctx, input)
+	summaryBlocks, usage, rawOutput, llmStreamCall, err := e.Summarizer.Summarize(ctx, input)
 	if err != nil {
 		e.closeFailure(startEnv, compactionId, options, err, appendFn)
-		return nil, err
+		return nil, e.classifyFailure(options, false, err)
 	}
 	if options.Manual && ctx.Err() != nil {
-		e.closeFailure(startEnv, compactionId, options, ctx.Err(), appendFn)
-		return nil, &ManualCompactionError{Code: ManualErrCancelled, Message: "compaction cancelled during summarization"}
+		err := ctx.Err()
+		e.closeFailure(startEnv, compactionId, options, err, appendFn)
+		return nil, &ManualCompactionError{Code: ManualErrCancelled, Message: "compaction cancelled during summarization", Cause: err}
 	}
+
+	// Stability recheck: replay the live log and require the selected span to
+	// still be present, contiguous, equally priced, and balanced. Nodes added
+	// outside the span do not invalidate the summary; anything inside does.
+	if err := e.assertSelectedSpanStable(selection, preparedSpan, options); err != nil {
+		e.closeFailure(startEnv, compactionId, options, err, appendFn)
+		return nil, e.classifyFailure(options, false, err)
+	}
+
 	shadowedTokens, err := e.shadowedTokenCount(events, nodes, selection)
 	if err != nil {
 		e.closeFailure(startEnv, compactionId, options, err, appendFn)
-		return nil, err
+		return nil, e.classifyFailure(options, false, err)
 	}
-	framed := frameSummary(summary)
+	framed := frameSummary(summaryBlocks)
 	framedTokens := countTokens(framed)
 	if framedTokens >= shadowedTokens {
 		err = fmt.Errorf("summary is not smaller than the shadowed content (%d estimated framed tokens >= %d)", framedTokens, shadowedTokens)
 		e.closeFailure(startEnv, compactionId, options, err, appendFn)
-		return nil, err
+		return nil, e.classifyFailure(options, false, err)
 	}
 
-	summaryEvent, err := e.commitBody(header, startEnv, compactionId, options, selection, shadowedTokens, framed, usage, appendFn)
+	summaryEvent, err := e.commitBody(header, startEnv, compactionId, options, selection, shadowedTokens, summaryBlocks, framed, usage, rawOutput, llmStreamCall, appendFn)
 	if err != nil {
 		e.closeFailure(startEnv, compactionId, options, err, appendFn)
-		return nil, err
+		return nil, e.classifyFailure(options, true, err)
 	}
-	endEvent, err := e.commitEnd(header, compactionId, options, appendFn)
+	endEvent, err := e.commitEnd(header, compactionId, options, ownerTurn, appendFn)
 	if err != nil {
-		return nil, &ManualCompactionError{Code: ManualErrCommit, Message: "compaction/end could not be persisted", Cause: err}
+		wrapped := &ManualCompactionError{Code: ManualErrCommit, Message: "compaction/end could not be persisted", Cause: err}
+		e.closeFailure(startEnv, compactionId, options, wrapped, appendFn)
+		return nil, wrapped
 	}
-	return &CompactionResult{
+
+	result := &CompactionResult{
 		CompactionId:       compactionId,
 		SourceCommandId:    options.SourceCommandId,
 		StartSeq:           startEnv.Seq,
@@ -415,7 +519,75 @@ func (e *CompactEngine) CompactTransaction(
 		ShadowedRange:      selection.Span,
 		ShadowedSeqs:       append([]int(nil), selection.ShadowedSeqs...),
 		ShadowedTokenCount: shadowedTokens,
-	}, nil
+	}
+	// Post-success durability checkpoint (upstream options.flush): classified
+	// as persistence on failure, never silently swallowed.
+	if options.Flush != nil {
+		if err := options.Flush(); err != nil {
+			return result, &ManualCompactionError{Code: ManualErrPersistence, Message: "compaction durability checkpoint failed", Cause: err}
+		}
+	}
+	return result, nil
+}
+
+// classifyFailure wraps a transaction failure for manual callers: commit-stage
+// errors become commit, a stability violation becomes changed, everything else
+// after start is summary. Non-manual callers get the bare cause (upstream only
+// wraps for `owner === null`).
+func (e *CompactEngine) classifyFailure(options CompactTransactionOptions, commitStage bool, cause error) error {
+	if !options.Manual {
+		return cause
+	}
+	if commitStage {
+		return &ManualCompactionError{Code: ManualErrCommit, Message: "manual compaction did not commit cleanly", Cause: cause}
+	}
+	var changed *SurfaceChangedError
+	if errors.As(cause, &changed) {
+		return &ManualCompactionError{Code: ManualErrChanged, Message: "the compacted history changed during manual compaction", Cause: cause}
+	}
+	var manual *ManualCompactionError
+	if errors.As(cause, &manual) {
+		return manual
+	}
+	return &ManualCompactionError{Code: ManualErrSummary, Message: "manual compaction could not produce a smaller summary", Cause: cause}
+}
+
+// assertSelectedSpanStable replays the current log through the Reload seam and
+// verifies the selected span survived summarization unchanged (upstream
+// assertSelectedSpanStable): same shadowed seqs in order, equal per-node
+// prices, boundaries still balanced. A nil Reload skips the check — the
+// embedded single-writer loop cannot interleave appends between Summarize and
+// commit because both run synchronously on the actor goroutine.
+func (e *CompactEngine) assertSelectedSpanStable(selection *SurfaceSelection, preparedSpan []int, options CompactTransactionOptions) error {
+	if options.Reload == nil {
+		return nil
+	}
+	events, nodes, err := options.Reload()
+	if err != nil {
+		return &SurfaceChangedError{message: fmt.Sprintf("compaction: stability recheck could not read the session log: %v", err)}
+	}
+	current, err := e.ValidateSurfaceRegion(events, nodes, selection.Span.Start, selection.Span.End)
+	if err != nil {
+		return &SurfaceChangedError{message: fmt.Sprintf("compaction: the selected span is no longer a valid replacement target: %v", err)}
+	}
+	if len(current.ShadowedSeqs) != len(selection.ShadowedSeqs) {
+		return &SurfaceChangedError{message: "compaction: the selected span changed during summarization"}
+	}
+	for i := range current.ShadowedSeqs {
+		if current.ShadowedSeqs[i] != selection.ShadowedSeqs[i] {
+			return &SurfaceChangedError{message: "compaction: the selected span changed during summarization"}
+		}
+	}
+	pricedNow, err := e.Measure(events, nodes)
+	if err != nil || len(pricedNow) != len(nodes) || current.EndIdx >= len(pricedNow) {
+		return &SurfaceChangedError{message: "compaction: the selected span was rewritten during summarization"}
+	}
+	for i := current.StartIdx; i <= current.EndIdx; i++ {
+		if i-current.StartIdx >= len(preparedSpan) || pricedNow[i] != preparedSpan[i-current.StartIdx] {
+			return &SurfaceChangedError{message: "compaction: the selected span was rewritten during summarization"}
+		}
+	}
+	return nil
 }
 
 // commitBody appends the compaction/summary record and the replacement
@@ -428,13 +600,18 @@ func (e *CompactEngine) commitBody(
 	selection *SurfaceSelection,
 	shadowedTokens int,
 	summary []session.ContentBlock,
+	framed []session.ContentBlock,
 	usage *session.TokenUsage,
+	rawOutput []session.ContentBlock,
+	llmStreamCall bool,
 	appendFn func(env *session.SessionEnvelope) error,
 ) (*session.SessionEnvelope, error) {
+	// compaction/summary records the summarizer's own output (upstream writes
+	// summaryResult.summary verbatim); the framing lives on the checkpoint.
 	summaryPayload := CompactionSummaryPayload{
 		CompactionId:       compactionId,
 		SourceCommandId:    options.SourceCommandId,
-		Summary:            summary,
+		Summary:            append([]session.ContentBlock(nil), summary...),
 		ShadowedRange:      selection.Span,
 		ShadowedSeqs:       append([]int(nil), selection.ShadowedSeqs...),
 		ShadowedTokenCount: shadowedTokens,
@@ -442,6 +619,8 @@ func (e *CompactEngine) commitBody(
 		Model:              e.Model,
 		MaxTokens:          e.MaxTokens,
 		Usage:              usage,
+		LLMStreamCall:      llmStreamCall,
+		RawOutput:          rawOutput,
 	}
 	summaryEnv, err := session.NewEnvelope(0, session.EventCompactionSummary, summaryPayload)
 	if err != nil {
@@ -452,14 +631,20 @@ func (e *CompactEngine) commitBody(
 	}
 
 	// The replacement user/message shadows the range; its source seqs are
-	// [startSeq, summarySeq, ...shadowedSeqs] per the upstream protocol.
+	// [startSeq, summarySeq, ...shadowedSeqs] per the upstream protocol. The
+	// framed block array lands verbatim as the content (upstream
+	// createUserMessage({content: frameSummary(...)})) and the source carries
+	// the correlated checkpoint provenance (compactionId + optional command).
 	replacement := session.UserMessagePayload{
-		ID:   fmt.Sprintf("cp-%s", compactionId),
-		Role: "user",
-		Content: []session.ContentBlock{
-			{Type: "text", Text: blockText(summary)},
+		ID:      newCheckpointMessageID(),
+		Role:    "user",
+		Content: append([]session.ContentBlock(nil), framed...),
+		Source: session.MessageSource{
+			Kind:            "plugin",
+			Plugin:          "compact",
+			CompactionId:    compactionId,
+			SourceCommandId: options.SourceCommandId,
 		},
-		Source: session.MessageSource{Kind: "plugin", Plugin: "compact"},
 	}
 	replacementEnv, err := session.NewEnvelope(0, session.EventUserMessage, replacement)
 	if err != nil {
@@ -481,12 +666,13 @@ func (e *CompactEngine) commitEnd(
 	header *session.SessionHeader,
 	compactionId string,
 	options CompactTransactionOptions,
+	ownerTurn *int,
 	appendFn func(env *session.SessionEnvelope) error,
 ) (*session.SessionEnvelope, error) {
 	payload := CompactionEndPayload{
 		CompactionId:    compactionId,
 		SourceCommandId: options.SourceCommandId,
-		Turn:            options.Owner,
+		Turn:            ownerTurn,
 	}
 	endEvent, err := session.NewEnvelope(0, session.EventCompactionEnd, payload)
 	if err != nil {
@@ -559,36 +745,11 @@ func regionMessages(events []session.SessionEnvelope, shadowedSeqs []int) (Summa
 	return SummarizationInput{Messages: out}, nil
 }
 
-// projectEvent mirrors `session.deriveEventMessage`: projects one surface
-// event into its model message, or nil when it produces none.
+// projectEvent mirrors `session.ProjectEventMessage`: projects one surface
+// event into its model message, or nil when it produces none — verbatim
+// pass-through of the nested message (upstream deriveEventMessage).
 func projectEvent(env *session.SessionEnvelope) (*session.ModelMessage, error) {
-	switch env.Type {
-	case session.EventUserMessage:
-		var userMsg session.UserMessagePayload
-		if err := json.Unmarshal(env.Data, &userMsg); err != nil {
-			return nil, fmt.Errorf("invalid user/message event data at seq %d: %w", env.Seq, err)
-		}
-		return &session.ModelMessage{Role: "user", Content: userMsg.Content}, nil
-	case session.EventAssistantMessage:
-		var asstMsg session.AssistantMessagePayload
-		if err := json.Unmarshal(env.Data, &asstMsg); err != nil {
-			return nil, fmt.Errorf("invalid assistant/message event data at seq %d: %w", env.Seq, err)
-		}
-		if len(asstMsg.Message.Content) == 0 {
-			return nil, nil
-		}
-		return &session.ModelMessage{Role: "assistant", Content: asstMsg.Message.Content}, nil
-	case session.EventToolResult:
-		var toolRes session.ToolResultPayload
-		if err := json.Unmarshal(env.Data, &toolRes); err != nil {
-			return nil, fmt.Errorf("invalid tool/result event data at seq %d: %w", env.Seq, err)
-		}
-		if len(toolRes.Message.Content) != 1 || toolRes.Message.Content[0].Type != "tool-result" {
-			return nil, fmt.Errorf("invalid tool/result event data at seq %d: message.content must be one tool-result block", env.Seq)
-		}
-		return &session.ModelMessage{Role: "tool", Content: []session.ContentBlock{toolRes.Message.Content[0]}}, nil
-	}
-	return nil, nil
+	return session.ProjectEventMessage(env)
 }
 
 // entryState captures the scan result of inspectCompactionEntryState.
@@ -684,21 +845,19 @@ type CompactionEntry struct {
 }
 
 func newCompactionID() string {
-	var raw [12]byte
-	_, _ = rand.Read(raw[:])
-	return hex.EncodeToString(raw[:])
+	// Upstream CompactionId(randomUUID()) — a random v4 UUID.
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
 }
 
-func blockText(blocks []session.ContentBlock) string {
-	var sb strings.Builder
-	for _, b := range blocks {
-		if b.Type == "text" {
-			sb.WriteString(b.Text)
-			sb.WriteString("\n")
-		}
-	}
-	return strings.TrimSpace(sb.String())
-}
+// newCheckpointMessageID is the replacement checkpoint message id (upstream
+// createUserMessage assigns a UUID MessageId).
+func newCheckpointMessageID() string { return newCompactionID() }
 
 // frameSummary wraps the summary content in the checkpoint preamble/tag
 // framing (upstream frameSummary in compaction-basic/src/summarizer.ts).
@@ -713,10 +872,10 @@ func frameSummary(summary []session.ContentBlock) []session.ContentBlock {
 	framed = append(framed, session.ContentBlock{Type: "text", Text: closeTag})
 	return framed
 }
+
+// countTokens prices framed checkpoint content with the shared fixed-density
+// heuristic (delegating to the llm package's single-source arithmetic, which
+// recurses into nested blocks).
 func countTokens(blocks []session.ContentBlock) int {
-	total := 0
-	for _, b := range blocks {
-		total += (len(b.Text) + 3) / 4
-	}
-	return total
+	return llm.EstimateContentTokens(blocks)
 }

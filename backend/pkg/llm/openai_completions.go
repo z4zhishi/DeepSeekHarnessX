@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"dsh-go/pkg/session"
@@ -93,10 +94,49 @@ type deepSeekFunctionCall struct {
 
 type deepSeekMessage struct {
 	Role             string             `json:"role"`
-	Content          string             `json:"content,omitempty"` // "" for text-less turns, NEVER null
+	// Content is "" for text-less turns — NEVER null. It stays a pointer so
+	// MarshalJSON below can distinguish "omit the key entirely" (never used
+	// for assistant) from the explicit empty string.
+	Content          *string            `json:"-"`
 	ToolCallID       string             `json:"tool_call_id,omitempty"`
 	ToolCalls        []deepSeekToolCall `json:"tool_calls,omitempty"`
 	ReasoningContent string             `json:"reasoning_content,omitempty"`
+}
+
+// MarshalJSON mirrors upstream serialize.ts:213-231 exactly:
+//
+//	system/user/tool → {"role":…,"content":"<text>"}          (content always present)
+//	assistant        → {"role":"assistant","content":"<text or \"\">",
+//	                    …reasoning?{"reasoning_content":…},
+//	                    …toolCalls?{"tool_calls":[…]}}
+//
+// The assistant content key is ALWAYS emitted (empty string for pure
+// tool-call turns). A missing key decodes as null on the wire, which some
+// gateways reject with a 400 — and since the message sits durably in the
+// session log, that bricks every later turn of the session.
+func (m deepSeekMessage) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Role             string             `json:"role"`
+		Content          string             `json:"content"`
+		ToolCallID       string             `json:"tool_call_id,omitempty"`
+		ToolCalls        []deepSeekToolCall `json:"tool_calls,omitempty"`
+		ReasoningContent string             `json:"reasoning_content,omitempty"`
+	}
+	a := alias{
+		Role:             m.Role,
+		Content:          derefContent(m.Content),
+		ToolCallID:       m.ToolCallID,
+		ToolCalls:        m.ToolCalls,
+		ReasoningContent: m.ReasoningContent,
+	}
+	return json.Marshal(a)
+}
+
+func derefContent(c *string) string {
+	if c == nil {
+		return ""
+	}
+	return *c
 }
 type deepSeekTool struct {
 	Type     string           `json:"type"` // "function"
@@ -169,17 +209,21 @@ type deepSeekChunk struct {
 func buildDeepSeekMessages(req ModelRequest) []deepSeekMessage {
 	// Mirrors upstream serializeMessages: system content is flattened text;
 	// assistant messages flatten text, pass reasoning back as
-	// reasoning_content, and map tool-call blocks to tool_calls; user-role
-	// messages contribute their text first and each tool-result block
-	// becomes its own role:"tool" wire message (empty output -> "(no output)").
+	// reasoning_content, and map tool-call blocks to tool_calls. Tool-result
+	// blocks ride in verbatim projected messages (the harness keeps them in
+	// user-role messages, upstream surface.ts passes them through as-is);
+	// every tool-result block expands into its own role:"tool" wire message
+	// (empty output -> "(no output)").
 	out := make([]deepSeekMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
-		out = append(out, deepSeekMessage{Role: "system", Content: req.System})
+		out = append(out, deepSeekMessage{Role: "system", Content: strPtr(req.System)})
 	}
 	for _, m := range req.Messages {
+		assertTextOnlyBlocks(m.Role, m.Content)
 		switch m.Role {
 		case "system":
-			out = append(out, deepSeekMessage{Role: "system", Content: flattenTextBlocks(m.Content)})
+			out = append(out, deepSeekMessage{Role: "system", Content: strPtr(flattenTextBlocks(m.Content))})
+			continue
 		case "assistant":
 			dsm := deepSeekMessage{Role: "assistant"}
 			var text, reasoning strings.Builder
@@ -199,32 +243,38 @@ func buildDeepSeekMessages(req ModelRequest) []deepSeekMessage {
 			}
 			// Text-less turns send "" — NEVER null; reasoning-only turns carry
 			// the reasoning channel back (upstream contract).
-			dsm.Content = text.String()
+			dsm.Content = strPtr(text.String())
 			if reasoning.Len() > 0 {
 				dsm.ReasoningContent = reasoning.String()
 			}
 			out = append(out, dsm)
-		case "tool":
-			// Harness tool messages carry exactly one tool-result block whose
-			// nested content holds the result blocks; expand text verbatim.
-			for _, b := range m.Content {
-				if b.Type != "tool-result" {
-					continue
+			continue
+		}
+		// User-role messages contribute their text first and each tool-result
+		// block becomes its own role:"tool" wire message after the text
+		// (upstream serializeMessages ordering).
+		var text strings.Builder
+		var results []deepSeekMessage
+		for _, b := range m.Content {
+			switch b.Type {
+			case "text":
+				text.WriteString(b.Text)
+			case "tool-result":
+				result := flattenTextBlocks(b.Content)
+				if result == "" {
+					result = "(no output)"
 				}
-				text := flattenTextBlocks(b.Content)
-				if text == "" {
-					text = "(no output)"
-				}
-				out = append(out, deepSeekMessage{
+				results = append(results, deepSeekMessage{
 					Role:       "tool",
 					ToolCallID: b.ToolCallID,
-					Content:    text,
+					Content:    strPtr(result),
 				})
 			}
-		case "user":
-			dsm := deepSeekMessage{Role: "user", Content: flattenTextBlocks(m.Content)}
-			out = append(out, dsm)
 		}
+		if text.Len() > 0 || len(results) == 0 {
+			out = append(out, deepSeekMessage{Role: "user", Content: strPtr(text.String())})
+		}
+		out = append(out, results...)
 	}
 	return out
 }
@@ -240,6 +290,37 @@ func flattenTextBlocks(blocks []session.ContentBlock) string {
 	return text.String()
 }
 
+// strPtr hands a value to deepSeekMessage.Content (pointer so MarshalJSON can
+// always emit the content key — "" included, never null).
+func strPtr(s string) *string {
+	return &s
+}
+
+// assertTextOnlyBlocks rejects image content before any text-flattening path
+// can silently erase it (upstream serialize.ts assertTextOnly). The chat
+// completions adapter is text-only until multimodal support lands; an image
+// block must fail the request loudly instead of disappearing into "".
+func assertTextOnlyBlocks(role string, blocks []session.ContentBlock) {
+	for _, b := range blocks {
+		if b.Type == "image" || containsImageBlock(b.Content) {
+			panic(fmt.Sprintf(
+				"deepseek chat-completions: %s message carries unsupported image content (UNSUPPORTED_CONTENT)",
+				role,
+			))
+		}
+	}
+}
+
+// containsImageBlock walks nested tool-result blocks for image leaves.
+func containsImageBlock(blocks []session.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "image" || containsImageBlock(b.Content) {
+			return true
+		}
+	}
+	return false
+}
+
 func buildDeepSeekRequest(req ModelRequest) deepSeekRequest {
 	body := deepSeekRequest{
 		Model:    req.Model,
@@ -249,9 +330,9 @@ func buildDeepSeekRequest(req ModelRequest) deepSeekRequest {
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature
 	}
-	if req.MaxTokens > 0 {
-		body.MaxTokens = req.MaxTokens
-	}
+	// Output cap: an unset (<=0) request falls back to DefaultMaxTokens so the
+	// wire always carries a bounded max_tokens.
+	body.MaxTokens = effectiveMaxTokens(req.MaxTokens)
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, deepSeekTool{
 			Type: "function",
@@ -266,18 +347,24 @@ func buildDeepSeekRequest(req ModelRequest) deepSeekRequest {
 		body.ToolChoice = "auto"
 	}
 	body.StreamOptions.IncludeUsage = true
-	// Thinking-mode mapping mirrors upstream resolveThinking: session-title
-	// disables thinking; "off" effort disables; low/high/max enable with the
-	// effort on the wire.
+	// Thinking-mode mapping mirrors upstream resolveThinking (serialize.ts:80-96,
+	// index.ts:103-104): session-title disables thinking; an omitted effort
+	// resolves to DefaultReasoningEffort ("high") so thinking is ON by default;
+	// "off" is the explicit opt-out; low/high/max enable with the effort on the
+	// wire.
 	if req.Purpose == "session-title" {
 		body.Thinking = &deepSeekThinking{Type: "disabled"}
-	} else if req.ReasoningEffort != "" {
-		switch req.ReasoningEffort {
+	} else {
+		effort := req.ReasoningEffort
+		if effort == "" {
+			effort = DefaultReasoningEffort
+		}
+		switch effort {
 		case "off":
 			body.Thinking = &deepSeekThinking{Type: "disabled"}
 		case "low", "high", "max":
 			body.Thinking = &deepSeekThinking{Type: "enabled"}
-			body.ReasoningEffort = req.ReasoningEffort
+			body.ReasoningEffort = effort
 		}
 	}
 	return body
@@ -327,36 +414,47 @@ func (d *DeepSeekAdapter) streamCompletions(
 	d.mu.Unlock()
 	applyExtraHeaders(httpReq.Header, extra)
 
-	contentType := "" // "" | "text" | "reasoning"
-	toolOpened := map[int]bool{}
-	openedBlocks := 0
+	// One stateful harness block per content, reasoning, or tool-call index,
+	// mirroring upstream translate.ts:90-104/152-170. Parallel tool calls
+	// stream INTERLEAVED deltas keyed by their wire index, so several blocks
+	// stay open at once — closing one early would split its siblings' deltas
+	// across blocks. Every block-end is therefore deferred to [DONE] and
+	// emitted in first-open order, each carrying its fully assembled block.
+	textOpen := false
+	reasoningOpen := false
+	type openTool struct {
+		id     string // stable harness BlockID ("tool-<wire index>")
+		callID string
+		name   string
+		args   strings.Builder
+	}
+	textBuf := strings.Builder{}
+	reasoningBuf := strings.Builder{}
+	openTools := map[int]*openTool{}
+	var order []string // BlockIDs in first-open order — commit order
 
 	emit := func(c StreamChunk) {
 		emitChunk(streamCtx, chunkChan, c)
 	}
-	closeContent := func() {
-		if contentType != "" {
-			emit(StreamChunk{Type: ChunkBlockEnd})
-			contentType = ""
-		}
+	openBlock := func(id, kind string) {
+		order = append(order, id)
+		emit(StreamChunk{
+			Type:      ChunkBlockStart,
+			Index:     len(order) - 1,
+			BlockID:   id,
+			BlockType: kind,
+		})
 	}
-	setContent := func(t string) {
-		if contentType == t {
-			return
-		}
-		closeContent()
-		openedBlocks++
-		emit(StreamChunk{Type: ChunkBlockStart, BlockType: t})
-		contentType = t
-	}
-	closeTools := func() {
-		for idx := range toolOpened {
-			if toolOpened[idx] {
-				emit(StreamChunk{Type: ChunkBlockEnd})
+	// blockIndex reports a block's position in the open order (-1 unknown).
+	blockIndex := func(id string) int {
+		for i, v := range order {
+			if v == id {
+				return i
 			}
 		}
-		toolOpened = map[int]bool{}
+		return -1
 	}
+
 	var pendingUsage *session.TokenUsage
 	var pendingFinish *string
 	finished := false
@@ -366,8 +464,22 @@ func (d *DeepSeekAdapter) streamCompletions(
 			return
 		}
 		finished = true
-		closeContent()
-		closeTools()
+		// Deferred closes, strictly in first-open order.
+		for i, id := range order {
+			var blk *session.ContentBlock
+			switch {
+			case id == "text":
+				blk = &session.ContentBlock{Type: "text", Text: textBuf.String()}
+			case id == "reasoning":
+				blk = &session.ContentBlock{Type: "reasoning", Text: reasoningBuf.String()}
+			default: // "tool-<n>"
+				n, _ := strconv.Atoi(strings.TrimPrefix(id, "tool-"))
+				if t := openTools[n]; t != nil {
+					blk = &session.ContentBlock{Type: "tool-call", ID: t.callID, Name: t.name, Arguments: t.args.String()}
+				}
+			}
+			emit(StreamChunk{Type: ChunkBlockEnd, Index: i, BlockID: id, Block: blk})
+		}
 		if pendingUsage != nil {
 			emit(StreamChunk{Type: ChunkUsage, Usage: pendingUsage})
 		}
@@ -375,7 +487,7 @@ func (d *DeepSeekAdapter) streamCompletions(
 		if pendingFinish != nil {
 			reason = mapFinishReason(*pendingFinish)
 		}
-		if reason == "stop" && openedBlocks == 0 {
+		if reason == "stop" && len(order) == 0 {
 			reason = "error"
 		}
 		emit(StreamChunk{Type: ChunkFinish, FinishReason: reason})
@@ -393,34 +505,58 @@ func (d *DeepSeekAdapter) streamCompletions(
 
 		for _, choice := range c.Choices {
 			delta := choice.Delta
-			for _, tc := range delta.ToolCalls {
-				idx := tc.Index
-				if !toolOpened[idx] {
-					closeContent()
-					openedBlocks++
-					emit(StreamChunk{
-						Type:      ChunkBlockStart,
-						BlockType: "tool-call",
-						ID:        tc.ID,
-						Name:      tc.Function.Name,
-					})
-					toolOpened[idx] = true
+			// Reasoning before text: thinking mode interleaves it that way,
+			// matching upstream ordering.
+			if delta.ReasoningContent != "" {
+				if !reasoningOpen {
+					reasoningOpen = true
+					openBlock("reasoning", "reasoning")
 				}
+				reasoningBuf.WriteString(delta.ReasoningContent)
 				emit(StreamChunk{
-					Type:           ChunkToolCallDelta,
-					Index:          idx,
-					ID:             tc.ID,
-					Name:           tc.Function.Name,
-					ArgumentsDelta: tc.Function.Arguments,
+					Type:    ChunkReasoningDelta,
+					Index:   blockIndex("reasoning"),
+					BlockID: "reasoning",
+					Text:    delta.ReasoningContent,
 				})
 			}
-			if delta.ReasoningContent != "" {
-				setContent("reasoning")
-				emit(StreamChunk{Type: ChunkReasoningDelta, Text: delta.ReasoningContent})
-			}
 			if delta.Content != "" {
-				setContent("text")
-				emit(StreamChunk{Type: ChunkTextDelta, Text: delta.Content})
+				if !textOpen {
+					textOpen = true
+					openBlock("text", "text")
+				}
+				textBuf.WriteString(delta.Content)
+				emit(StreamChunk{
+					Type:    ChunkTextDelta,
+					Index:   blockIndex("text"),
+					BlockID: "text",
+					Text:    delta.Content,
+				})
+			}
+			for _, tc := range delta.ToolCalls {
+				idx := tc.Index
+				t := openTools[idx]
+				if t == nil {
+					t = &openTool{id: fmt.Sprintf("tool-%d", idx), callID: tc.ID, name: tc.Function.Name}
+					openTools[idx] = t
+					openBlock(t.id, "tool-call")
+				} else {
+					if tc.ID != "" && t.callID == "" {
+						t.callID = tc.ID
+					}
+					if tc.Function.Name != "" && t.name == "" {
+						t.name = tc.Function.Name
+					}
+				}
+				t.args.WriteString(tc.Function.Arguments)
+				emit(StreamChunk{
+					Type:           ChunkToolCallDelta,
+					Index:          blockIndex(t.id),
+					BlockID:        t.id,
+					ID:             t.callID,
+					Name:           t.name,
+					ArgumentsDelta: tc.Function.Arguments,
+				})
 			}
 			if choice.FinishReason != nil {
 				pendingFinish = choice.FinishReason

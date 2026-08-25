@@ -34,31 +34,9 @@ func (HeuristicMeter) MeasureNodes(events []session.SessionEnvelope, nodes []int
 			out[i] = 0
 			continue
 		}
-		out[i] = estimateMessageTokens(message)
+		out[i] = llm.EstimateMessageTokens(message)
 	}
 	return out, nil
-}
-
-// estimateMessageTokens prices one projected model message with the fixed
-// heuristic: ~4 chars per token for text, plus fixed per-block overhead.
-func estimateMessageTokens(message *session.ModelMessage) int {
-	total := 0
-	for _, block := range message.Content {
-		switch block.Type {
-		case "text", "reasoning":
-			total += (len(block.Text) + 3) / 4
-		case "tool-call":
-			total += 8 + (len(block.Arguments)+3)/4
-		case "tool-result":
-			total += 16 + (len(block.Text)+3)/4
-		default:
-			total += 4
-		}
-	}
-	if total == 0 {
-		total = 1
-	}
-	return total
 }
 
 // LlmSummarizer runs the compaction summarization through a real LLM adapter,
@@ -107,10 +85,13 @@ Rules:
 - Output only the checkpoint text: do not call any tool or take any other action.`
 
 // Summarize streams one summarization request and returns the assembled text
-// blocks plus the provider-reported usage.
-func (s LlmSummarizer) Summarize(ctx context.Context, input SummarizationInput) ([]session.ContentBlock, *session.TokenUsage, error) {
+// blocks plus the provider-reported usage, the complete raw provider output,
+// and llmStreamCall:true — the exact call envelope recorded on
+// compaction/summary so the auxiliary call is reconstructible from the log
+// (upstream summarizeWithLlm).
+func (s LlmSummarizer) Summarize(ctx context.Context, input SummarizationInput) ([]session.ContentBlock, *session.TokenUsage, []session.ContentBlock, bool, error) {
 	if s.Adapter == nil {
-		return nil, nil, fmt.Errorf("llm summarizer requires an adapter")
+		return nil, nil, nil, false, fmt.Errorf("llm summarizer requires an adapter")
 	}
 	messages := append([]session.ModelMessage(nil), input.Messages...)
 	messages = append(messages, session.ModelMessage{
@@ -134,7 +115,7 @@ func (s LlmSummarizer) Summarize(ctx context.Context, input SummarizationInput) 
 		select {
 		case err, ok := <-errChan:
 			if ok && err != nil {
-				return nil, nil, err
+				return nil, nil, nil, false, err
 			}
 		case chunk, ok := <-chunkChan:
 			if !ok {
@@ -143,15 +124,24 @@ func (s LlmSummarizer) Summarize(ctx context.Context, input SummarizationInput) 
 			}
 			assembler.IngestChunk(chunk)
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			return nil, nil, nil, false, ctx.Err()
 		}
 	}
 	blocks, usage, finish := assembler.Result()
 	if finish == "error" || finish == "aborted" {
-		return nil, nil, fmt.Errorf("summarization finished with reason %q", finish)
+		return nil, nil, nil, false, fmt.Errorf("summarization finished with reason %q", finish)
 	}
-	if len(blocks) == 0 {
-		return nil, nil, fmt.Errorf("summarization produced no content")
+	rawOutput := append([]session.ContentBlock(nil), blocks...)
+	// Keep only text before synthesizing the checkpoint (upstream summaryText
+	// rejects visual output and filters to text blocks).
+	var summary []session.ContentBlock
+	for _, b := range blocks {
+		if b.Type == "text" {
+			summary = append(summary, b)
+		}
 	}
-	return blocks, usage, nil
+	if len(summary) == 0 {
+		return nil, nil, rawOutput, true, fmt.Errorf("summarization produced no text summary content")
+	}
+	return summary, usage, rawOutput, true, nil
 }

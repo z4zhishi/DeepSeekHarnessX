@@ -87,24 +87,50 @@ func (r *ToolRegistry) RegisterAskUserTool() {
 				if q.ID == "" || q.Question == "" {
 					return nil, fmt.Errorf("each question requires id and question")
 				}
-				options := make([]string, 0, len(q.Options))
+				optionLabels := make([]string, 0, len(q.Options))
+				structuredOptions := make([]UserQuestionOption, 0, len(q.Options))
 				for _, o := range q.Options {
-					options = append(options, o.Label)
+					optionLabels = append(optionLabels, o.Label)
+					structuredOptions = append(structuredOptions, UserQuestionOption{ID: o.Label, Label: o.Label, Description: o.Description})
 				}
 				var prompt strings.Builder
 				if q.Header != "" {
 					prompt.WriteString("[" + q.Header + "] ")
 				}
 				prompt.WriteString(q.Question)
-				if len(options) > 0 {
-					prompt.WriteString(" Options: " + strings.Join(options, " | "))
+				if len(optionLabels) > 0 {
+					prompt.WriteString(" Options: " + strings.Join(optionLabels, " | "))
 				}
-				if ctx.RequestUser == nil {
+				if ctx.RequestUser == nil && ctx.Answerer == nil {
 					// No answerer composed: fail closed like the approval
 					// chain (upstream: missing answerers fail closed).
 					return nil, fmt.Errorf("ask_user_question: no user-answerer is available in this host")
 				}
-				decision, err := ctx.RequestUser(prompt.String(), options)
+				if answerer, ok := ctx.Answerer.(UserQuestionAnswerer); ok {
+					// Structured bridge: the host receives the full question
+					// (id, header, options with descriptions, multi-select) and
+					// returns typed answers — selected option ids or free text.
+					// Custom options no longer collapse into allow/deny/cancel.
+					structured, err := answerer.RequestUserStructured(UserQuestion{
+						ID:          q.ID,
+						Header:      q.Header,
+						Prompt:      q.Question,
+						Options:     structuredOptions,
+						MultiSelect: q.MultiSelect,
+					})
+					if err != nil {
+						return nil, fmt.Errorf("ask_user_question: structured answerer failed for question %q: %w", q.ID, err)
+					}
+					for _, sa := range structured {
+						if sa.ID == "" {
+							sa.ID = q.ID // tolerate hosts that omit the echo
+						}
+						answers = append(answers, askAnswer{ID: sa.ID, Selected: sa.Selected, Custom: sa.Custom})
+					}
+					continue
+				}
+				// Legacy approval waterfall: the hook returns the selected label.
+				decision, err := ctx.RequestUser(prompt.String(), optionLabels)
 				answer := askAnswer{ID: q.ID}
 				switch decision {
 				case ApprovalAllowOnce:

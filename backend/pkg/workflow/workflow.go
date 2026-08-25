@@ -15,6 +15,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -103,6 +104,16 @@ type Agent struct {
 	Prompt string
 	// Phase optionally groups this agent under a declared meta.Phase title.
 	Phase string
+	// Provider optionally overrides the LLM provider for this member alone
+	// (upstream agent(prompt, opts) target override; provider and model may
+	// each be provided alone). Empty = inherit the host's global routing.
+	// Whether an override is actionable is decided by the spawner across the
+	// AgentSpawn seam — the Runner only carries it (JSON tags follow upstream
+	// lowercase field names).
+	Provider string `json:"provider,omitempty"`
+	// Model optionally overrides the model id for this member alone (upstream
+	// opts.model). Empty = inherit the parent session's current routing.
+	Model string `json:"model,omitempty"`
 }
 
 // Workflow is a model-authored workflow definition.
@@ -142,9 +153,21 @@ type Result struct {
 	Outputs       []AgentOutput `json:"outputs"`
 }
 
+// SpawnRequest carries one member's spawn inputs across the AgentSpawn seam.
+// Role/Prompt are the delegation contract; Provider/Model are the optional
+// per-member LLM target overrides (upstream agent(prompt, {provider?, model?})
+// — each may be provided alone). Honoring them is the spawner's decision, so
+// the seam stays neutral about what the host can route.
+type SpawnRequest struct {
+	Role     string
+	Prompt   string
+	Provider string
+	Model    string
+}
+
 // AgentSpawn executes one subagent and returns its settlement. It is the seam
 // through which the Runner drives a child agent.
-type AgentSpawn func(ctx context.Context, role, prompt string) (AgentRun, error)
+type AgentSpawn func(ctx context.Context, req SpawnRequest) (AgentRun, error)
 
 // AgentRun is the settlement of one spawned subagent.
 type AgentRun struct {
@@ -185,8 +208,12 @@ func NewRunner(opts RunnerOptions) *Runner {
 // Run executes the workflow and returns its aggregate result. A terminal
 // failure is carried in Result.StopReason/Result.Error; a canceled ctx settles
 // the run as cancelled. It always emits run-end (upstream "result never
-// rejects" / append-on-quiescence contract).
+// rejects" / append-on-quiescence contract). An invalid meta block is rejected
+// before any event is emitted, through the error return.
 func (r *Runner) Run(ctx context.Context, wf Workflow) (Result, error) {
+	if err := validateMeta(wf.Meta); err != nil {
+		return Result{}, err
+	}
 	if wf.ID == "" {
 		wf.ID = RunID(fmt.Sprintf("run-%d", r.seq.Add(1)))
 	}
@@ -282,7 +309,7 @@ func (r *Runner) runOne(ctx context.Context, runID RunID, ag *Agent, start Agent
 		return AgentOutput{Seq: start.Seq, Label: ag.Label, Outcome: OutcomeFailed, Output: "no spawner configured"}
 	}
 
-	run, err := r.spawn(ctx, ag.Role, ag.Prompt)
+	run, err := r.spawn(ctx, SpawnRequest{Role: ag.Role, Prompt: ag.Prompt, Provider: ag.Provider, Model: ag.Model})
 	outcome := OutcomeCompleted
 	out := run.Output
 	switch {
@@ -320,6 +347,31 @@ func settle(stop, runErr string, out AgentOutput) (string, string) {
 		return stop, runErr
 	}
 	return stop, runErr
+}
+
+// validateMeta checks a workflow identity block against the upstream
+// WorkflowMeta contract (workflow-worker-thread/meta.ts) before anything runs:
+// required non-empty name/description, and declared phases must carry a
+// non-empty title. Every violation is named in one structured error text — the
+// same wording family as upstream META_INVALID — returned through Run's error
+// return so callers can correct the call without a run record being opened.
+func validateMeta(m Meta) error {
+	var violations []string
+	if m.Name == "" {
+		violations = append(violations, "meta.name must be a non-empty string")
+	}
+	if m.Description == "" {
+		violations = append(violations, "meta.description must be a non-empty string")
+	}
+	for i, p := range m.Phases {
+		if p.Title == "" {
+			violations = append(violations, fmt.Sprintf("meta.phases[%d].title must be a non-empty string", i))
+		}
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("invalid workflow meta: %s", strings.Join(violations, "; "))
+	}
+	return nil
 }
 
 // childID synthesizes a deterministic child-session id for an agent. The

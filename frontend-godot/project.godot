@@ -24,6 +24,7 @@ config/icon="res://assets/brand/dshx_mark.svg"
 [autoload]
 
 DshI18n="*res://scripts/autoload/i18n.gd"
+DshTokens="*res://theme/tokens.gd"
 
 [display]
 

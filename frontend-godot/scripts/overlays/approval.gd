@@ -103,11 +103,33 @@ func show_request(call_id: String, prompt: String, options: Array = []) -> void:
 	_rebuild_buttons(options)
 	_apply_style()
 	visible = true
+	_fade_open()
 
 
 func hide_request() -> void:
 	visible = false
 	_call_id = ""
+
+
+func _decide(decision: String) -> void:
+	if _call_id == "":
+		return
+	var cid := _call_id
+	_call_id = ""
+	_fade_close()
+	decision_made.emit(cid, decision)
+
+
+## §4 minimal motion: quick opacity fade on open/close, layout never animated.
+func _fade_open() -> void:
+	DshTokens.fade_in(_backdrop, DshTokens.MOTION_BASE)
+	DshTokens.fade_in(_card, DshTokens.MOTION_BASE)
+
+
+func _fade_close() -> void:
+	DshTokens.fade_out(_card, DshTokens.MOTION_QUICK, func() -> void: visible = false)
+	if _backdrop != null:
+		DshTokens.fade_out(_backdrop, DshTokens.MOTION_QUICK, Callable())
 
 
 func _rebuild_buttons(options: Array) -> void:
@@ -199,15 +221,6 @@ func _label_for(decision: String) -> String:
 	if decision == "cancel":
 		return DshI18n.t("approval.cancel")
 	return decision
-
-
-func _decide(decision: String) -> void:
-	if _call_id == "":
-		return
-	var cid := _call_id
-	_call_id = ""
-	visible = false
-	decision_made.emit(cid, decision)
 
 
 func _on_backdrop_input(event: InputEvent) -> void:

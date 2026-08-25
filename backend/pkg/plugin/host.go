@@ -86,8 +86,10 @@ type Host struct {
 	done    chan struct{}
 }
 
-// NewHost 构造并连接一个外部插件 Host（首次握手 + 同步）。连接失败不阻断
-// 构造：Host 转入后台指数退避重连（对齐 MCP Supervisor 语义）。
+// NewHost 构造并连接一个外部插件 Host（首次握手 + 整代同步）。首次连接失败
+// 即返回错误——调用方（Registry.Reconcile）据此登记 lastErr、跳过 mounted 登记，
+// 使坏插件在 GUI 呈现 error 状态而非恒报 mounted。连接成功后的断线仍由后台
+// 指数退避重连接管（对齐 MCP Supervisor 语义）。
 func NewHost(ctx context.Context, cfg hostConfig, reg *tools.ToolRegistry, cmds *tools.CommandRegistry, bus *EventBus) (*Host, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
@@ -116,8 +118,8 @@ func NewHost(ctx context.Context, cfg hostConfig, reg *tools.ToolRegistry, cmds 
 	}
 	go h.run()
 	if err := h.connectGeneration(ctx, true); err != nil {
-		h.logf("启动连接失败（将继续后台重连）：%v", err)
-		h.scheduleReconnect(false)
+		_ = h.Close()
+		return nil, fmt.Errorf("plugin %q 首次连接失败: %w", cfg.Name, err)
 	}
 	return h, nil
 }

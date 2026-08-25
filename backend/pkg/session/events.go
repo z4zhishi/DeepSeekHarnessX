@@ -12,7 +12,8 @@ import (
 //
 // This is the full vocabulary of `CK/packages/core/session/src/known-event-types.ts`
 // (48 types, generated from SessionEventMap). Persistence read paths refuse to
-// interpret an unknown type unless the envelope carries `ignorable: true`.
+// interpret an unknown type unless the envelope carries `ignorable: true`
+// (see KnownEventTypes / AssertEventsSupported below).
 const (
 	EventAgentPresetSelected     = "agent-preset/selected"
 	EventAgentInboxSpliced       = "agent/inbox/spliced"
@@ -71,6 +72,95 @@ var SurfaceEventTypes = map[string]bool{
 	EventUserMessage:      true,
 	EventAssistantMessage: true,
 	EventToolResult:       true,
+}
+
+// KnownEventTypes is the runtime counterpart of the 48-type vocabulary above
+// (upstream `knownEventTypes`). A reader that encounters an event type outside
+// this set must refuse to interpret the log unless that event carries
+// `ignorable: true` — a newer harness's required events would otherwise be
+// silently skipped and the session rebuilt wrong.
+var KnownEventTypes = map[string]bool{
+	EventAgentPresetSelected:     true,
+	EventAgentInboxSpliced:       true,
+	EventApprovalAsked:           true,
+	EventApprovalDecided:         true,
+	EventApprovalPolicy:          true,
+	EventAssistantChunk:          true,
+	EventAssistantMessage:        true,
+	EventCommandDone:             true,
+	EventCommandRun:              true,
+	EventCompactionEnd:           true,
+	EventCompactionPrune:         true,
+	EventCompactionStart:         true,
+	EventCompactionSummary:       true,
+	EventFeedbackRecord:          true,
+	EventGoalChange:              true,
+	EventHookInvoked:             true,
+	EventHookResult:              true,
+	EventLlmRetry:                true,
+	EventLlmRetryStarted:         true,
+	EventPermissionPreset:        true,
+	EventPlanMode:                true,
+	EventRequestContext:          true,
+	EventRequestHeader:           true,
+	EventSandboxMode:             true,
+	EventScheduleChange:          true,
+	EventSessionEndSeed:          true,
+	EventSessionTitle:            true,
+	EventSessionTitleLLMRequest:  true,
+	EventStepEnd:                 true,
+	EventStepStart:               true,
+	EventSubagentDescriptor:      true,
+	EventTeamMember:              true,
+	EventTeamMessageDelivered:    true,
+	EventTeamMessageQueued:       true,
+	EventTeamTask:                true,
+	EventTodoWrite:               true,
+	EventToolWorkflowAgentEnd:    true,
+	EventToolWorkflowAgentStart:  true,
+	EventToolWorkflowRunEnd:      true,
+	EventToolWorkflowRunStart:    true,
+	EventToolCall:                true,
+	EventToolCodeDispatch:        true,
+	EventToolCodeDispatchStart:   true,
+	EventToolResult:              true,
+	EventTurnEnd:                 true,
+	EventTurnStart:               true,
+	EventUserMessage:             true,
+	EventWebDeepseekSearchLLMReq: true,
+}
+
+// IsKnownEventType reports whether an event type is in the known vocabulary.
+func IsKnownEventType(eventType string) bool { return KnownEventTypes[eventType] }
+
+// AssertEventsSupported refuses to interpret a loaded event stream containing
+// an unknown, non-ignorable type (upstream coordinator assertEventsSupported):
+// a future harness may write required events this build does not know; replay
+// would then silently produce a wrong session.
+func AssertEventsSupported(events []SessionEnvelope) error {
+	for i := range events {
+		if err := assertEventSupported(&events[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AssertEventsSupportedPtrs is the pointer-slice variant of AssertEventsSupported.
+func AssertEventsSupportedPtrs(events []*SessionEnvelope) error {
+	for _, env := range events {
+		if err := assertEventSupported(env); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func assertEventSupported(env *SessionEnvelope) error {
+	if env == nil || IsKnownEventType(env.Type) || env.Ignorable {
+		return nil
+	}
+	return fmt.Errorf("session event %q at seq %d is not supported by this build and is not ignorable", env.Type, env.Seq)
 }
 
 // SurfaceOp describes how a session event entered the ordered surface. Only
@@ -237,6 +327,11 @@ type MessageSource struct {
 	Provider    string          `json:"provider,omitempty"`
 	Model       string          `json:"model,omitempty"`
 	ReplayState json.RawMessage `json:"replayState,omitempty"`
+	// CompactionId correlates a compaction checkpoint message with its
+	// transaction (upstream compactCheckpointSource). Upstream invariants
+	// require it on every replacement checkpoint user message.
+	CompactionId    string `json:"compactionId,omitempty"`
+	SourceCommandId string `json:"sourceCommandId,omitempty"`
 }
 
 // WireMessage is the canonical message representation shared by delivery,
@@ -257,10 +352,28 @@ type TurnStartPayload struct {
 	Turn int `json:"turn"`
 }
 
-// TurnEndReason defines possible turn termination reasons
+// TurnEndReason defines possible turn termination reasons. Kind mirrors the
+// upstream merge-extensible union (types.ts TurnEndReasonMap):
+//   - "completed" — the turn finished normally;
+//   - "aborted" — a cancellation request interrupted the live turn
+//     (CancellationCause names user/parent/hook/disposed/legacy);
+//   - "blocked" — a pre-step rejection refused to run the turn;
+//   - "max-tokens" — at least one step hit its output-token ceiling;
+//   - "refusal" — the model declined the request;
+//   - "interrupted" — a persistence backend closed a crash-orphaned turn;
+//   - "error" — the turn failed; Error carries the structured failure.
 type TurnEndReason struct {
-	Kind    string `json:"kind"` // "completed" | "aborted" | "interrupted" | "error"
+	Kind    string `json:"kind"`
 	Message string `json:"message,omitempty"`
+	// Cause is the structured abort cause for kind="aborted"
+	// (upstream TurnEndCancelCause): "user" | "parent" | "hook" | "disposed"
+	// | "legacy".
+	Cause string `json:"cause,omitempty"`
+	// HookReason carries the reason string when Cause == "hook".
+	HookReason string `json:"hookReason,omitempty"`
+	// Code is the structured failure code for kind="error"
+	// (upstream LlmFailure.code, e.g. "RATE_LIMIT", "UNKNOWN").
+	Code string `json:"code,omitempty"`
 }
 
 // TurnEndPayload defines the payload for turn/end
@@ -366,7 +479,13 @@ type ModelMessage struct {
 // upstream `Session.deriveMessages` over `foldSurface`. Events shadowed by a
 // positional replacement never enter model history; replacement copies stay
 // model-only.
+//
+// Like upstream, the read path refuses to interpret an unknown, non-ignorable
+// event type (see AssertEventsSupported).
 func DeriveMessages(events []SessionEnvelope) ([]ModelMessage, error) {
+	if err := AssertEventsSupported(events); err != nil {
+		return nil, err
+	}
 	pointers := make([]*SessionEnvelope, len(events))
 	for i := range events {
 		pointers[i] = &events[i]
@@ -377,8 +496,7 @@ func DeriveMessages(events []SessionEnvelope) ([]ModelMessage, error) {
 	}
 	var messages []ModelMessage
 	for _, seq := range fold.Nodes {
-		env := pointers[seq]
-		message, err := deriveEventMessage(env)
+		message, err := ProjectEventMessage(pointers[seq])
 		if err != nil {
 			return nil, err
 		}
@@ -389,17 +507,20 @@ func DeriveMessages(events []SessionEnvelope) ([]ModelMessage, error) {
 	return messages, nil
 }
 
-// deriveEventMessage projects one surface event into its LLM message, or
-// returns nil when it produces none — the per-node projection rule mirrored
-// from upstream `deriveEventMessage`.
-func deriveEventMessage(env *SessionEnvelope) (*ModelMessage, error) {
+// ProjectEventMessage projects one surface event into the LLM message it
+// derives to, or returns nil when it produces none — THE per-node projection
+// rule mirrored from upstream `deriveEventMessage`: the event's nested message
+// is passed through verbatim (original role, full content block array, no
+// shape validation). Provider adapters expand tool-result blocks into their
+// native role:"tool" wire messages at request serialization time.
+func ProjectEventMessage(env *SessionEnvelope) (*ModelMessage, error) {
 	switch env.Type {
 	case EventUserMessage:
 		var userMsg UserMessagePayload
 		if err := json.Unmarshal(env.Data, &userMsg); err != nil {
 			return nil, fmt.Errorf("invalid user/message event data at seq %d: %w", env.Seq, err)
 		}
-		return &ModelMessage{Role: "user", Content: userMsg.Content}, nil
+		return &ModelMessage{Role: userMsg.Role, Content: userMsg.Content}, nil
 
 	case EventAssistantMessage:
 		var asstMsg AssistantMessagePayload
@@ -411,19 +532,17 @@ func deriveEventMessage(env *SessionEnvelope) (*ModelMessage, error) {
 		if len(asstMsg.Message.Content) == 0 {
 			return nil, nil
 		}
-		return &ModelMessage{Role: "assistant", Content: asstMsg.Message.Content}, nil
+		return &ModelMessage{Role: asstMsg.Message.Role, Content: asstMsg.Message.Content}, nil
 
 	case EventToolResult:
 		var toolRes ToolResultPayload
 		if err := json.Unmarshal(env.Data, &toolRes); err != nil {
 			return nil, fmt.Errorf("invalid tool/result event data at seq %d: %w", env.Seq, err)
 		}
-		// The tool/result message carries one tool-result block; project it
-		// verbatim (nested content included) for the request serializer.
-		if len(toolRes.Message.Content) != 1 || toolRes.Message.Content[0].Type != "tool-result" {
-			return nil, fmt.Errorf("invalid tool/result event data at seq %d: message.content must be one tool-result block", env.Seq)
-		}
-		return &ModelMessage{Role: "tool", Content: []ContentBlock{toolRes.Message.Content[0]}}, nil
+		// Upstream projects tool/result verbatim: the nested message keeps its
+		// original role (harness results ride in user-role messages) and its
+		// complete content array — no single-block shape check.
+		return &ModelMessage{Role: toolRes.Message.Role, Content: toolRes.Message.Content}, nil
 	}
 	return nil, nil
 }

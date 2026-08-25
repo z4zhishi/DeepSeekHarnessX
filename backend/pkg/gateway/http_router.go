@@ -3,11 +3,15 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dsh-go/pkg/agent"
@@ -140,14 +144,37 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
 
-	// CSRF/Host 信任栅栏：网关只服务 loopback 客户端
-	return s.trustGuard(mux)
+	// CSRF/Host 信任栅栏：网关只服务 loopback 客户端；全路由统一请求体限幅
+	// （/api/* RPC 与 /v1/* 入站共用上限；WS upgrade 空体不受影响）。
+	return s.trustGuard(limitRequestBody(mux))
+}
+
+// maxRequestBodyBytes caps every request body (upstream parity: 300 MiB) so a
+// runaway client cannot exhaust memory on decode. Package-level var only so
+// tests can exercise the limit without allocating 300 MiB.
+var maxRequestBodyBytes int64 = 300 << 20
+
+// limitRequestBody wraps every route with http.MaxBytesReader. Overshoot
+// surfaces as *http.MaxBytesError at read time: handleRPC answers 413, the
+// /v1/* handlers answer their existing 400-on-read-error path.
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "http://127.0.0.1")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// CORS 动态回显（与信任栅栏联动）：能携带 Origin 走到这里说明已通过
+	// ④ 的精确一致栅栏，安全回显；无 Origin 的本地客户端无需该头。
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	}
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -156,9 +183,42 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 
 	method := strings.TrimPrefix(r.URL.Path, "/api/")
 
+	writeRPCError := func(status int, format string, args ...any) {
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":  "server-response",
+			"rpcId": fmt.Sprintf("rpc-%d", time.Now().UnixNano()),
+			"result": map[string]any{
+				"ok":    false,
+				"error": map[string]any{"message": fmt.Sprintf(format, args...)},
+			},
+		})
+	}
+
+	// POST RPC 校验 Content-Type（带参数如 ;charset=utf-8 亦可）；缺失时容忍
+	// Godot/curl 等最小客户端——跨站滥用由信任栅栏拦截，非本校验职责。
+	if r.Method == http.MethodPost {
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			mt, _, err := mime.ParseMediaType(ct)
+			if err != nil || mt != "application/json" {
+				writeRPCError(http.StatusUnsupportedMediaType, "Content-Type must be application/json, got %q", ct)
+				return
+			}
+		}
+	}
+
 	var body map[string]any
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			// Malformed payloads must not silently dispatch as empty requests.
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				writeRPCError(http.StatusRequestEntityTooLarge, "request body exceeds %d bytes", mbe.Limit)
+				return
+			}
+			writeRPCError(http.StatusBadRequest, "invalid JSON body: %v", err)
+			return
+		}
 	}
 
 	rpcID, _ := body["rpcId"].(string)
@@ -536,7 +596,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		}, nil
 
 	case "settings.mutate":
-		// {ns, ops:[{op:"set"|"unset", path, value?}]} -> {revision}
+		// {ns, ops:[{op:"set"|"unset", path, value?}], expectedRevision?} -> {revision}
 		if s.Settings == nil {
 			return nil, fmt.Errorf("settings service unavailable")
 		}
@@ -559,7 +619,19 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			}
 			ops = append(ops, settings.Op{Op: op, Path: path, Value: value})
 		}
-		rev, err := s.Settings.Mutate(ns, ops)
+		// Optional optimistic-concurrency token: the revision the caller last
+		// saw via settings.describe. Forwarded to the Manager; on mismatch the
+		// write is rejected with a conflict error whose message carries both
+		// the expected and the actual revision (upstream SETTINGS_CONFLICT).
+		var expectRevision []int
+		if raw, present := payload["expectedRevision"]; present && raw != nil {
+			num, ok := raw.(float64) // encoding/json decodes JSON numbers as float64
+			if !ok {
+				return nil, fmt.Errorf("settings.mutate expectedRevision must be a number")
+			}
+			expectRevision = append(expectRevision, int(num))
+		}
+		rev, err := s.Settings.Mutate(ns, ops, expectRevision...)
 		if err != nil {
 			return nil, err
 		}
@@ -901,6 +973,8 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		if !ok {
 			return map[string]any{"status": "unknown"}, nil
 		}
+		// 审批已决：撤下重放帧，后续重连的下行不再复活该弹窗。
+		s.Hub.unstageReplay(callID)
 		switch outcome {
 		case "allow_once":
 			ch <- tools.ApprovalAllowOnce
@@ -1441,10 +1515,28 @@ func (s *Server) lookupHeader(id string) (session.SessionHeader, bool) {
 	return session.SessionHeader{}, false
 }
 
+// approvalTimeoutNanos bounds how long one permission request waits on the
+// GUI (default 60s). Atomic because tests shorten it while long-lived agents
+// elsewhere in the suite may still be parked inside askApproval's timer read.
+var approvalTimeoutNanos atomic.Int64
+
+func setApprovalTimeout(d time.Duration) { approvalTimeoutNanos.Store(int64(d)) }
+
+func approvalTimeoutDelay() time.Duration {
+	if n := approvalTimeoutNanos.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	return 60 * time.Second
+}
+
 // askApproval issues one host-level permission request and waits for the GUI's
 // decision (upstream approval/request -> requestPermission bridge, mirrored by
-// the ACP permission-request path). A 60s timeout returns ApprovalCancel so a
+// the ACP permission-request path). The timeout returns ApprovalCancel so a
 // stuck modal cannot deadlock the agent loop.
+//
+// 在途审批随下行重连重放：帧材料（method + payload + 稳定 callId）在广播前
+// 暂存进 hub，任何之后接入的 /api/events/host|mux 连接都会按原 callId 收到
+// 重放；决策或超时后撤下，避免复活已决弹窗。
 func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.ApprovalDecision, error) {
 	callID := fmt.Sprintf("approval-%d", time.Now().UnixNano())
 	ch := make(chan tools.ApprovalDecision, 1)
@@ -1465,20 +1557,29 @@ func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.
 		}
 		optionList = append(optionList, map[string]string{"optionId": opt, "name": label})
 	}
-	s.Hub.BroadcastHostEvent("host/permission-request", map[string]any{
+
+	payload := map[string]any{
 		"callId":    callID,
 		"sessionId": sessionID,
 		"prompt":    prompt,
 		"options":   optionList,
-	})
+	}
+	if frame, err := encodeHostEvent("host/permission-request", payload); err == nil {
+		s.Hub.stageReplay(callID, frame)
+		s.Hub.broadcastHostData(frame)
+	} else {
+		s.Hub.BroadcastHostEvent("host/permission-request", payload)
+	}
 
 	select {
 	case decision := <-ch:
+		s.Hub.unstageReplay(callID)
 		return decision, nil
-	case <-time.After(60 * time.Second):
+	case <-time.After(approvalTimeoutDelay()):
 		s.mu.Lock()
 		delete(s.pendingApprovals, callID)
 		s.mu.Unlock()
+		s.Hub.unstageReplay(callID)
 		return tools.ApprovalCancel, nil
 	}
 }

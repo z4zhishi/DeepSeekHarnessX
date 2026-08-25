@@ -19,6 +19,28 @@ const (
 	ProtocolAnthropicMessages = "anthropic-messages"
 )
 
+// DefaultMaxTokens is the outbound output-token cap (256k) applied when a
+// ModelRequest carries no positive MaxTokens. Every protocol adapter funnels
+// its wire cap through effectiveMaxTokens, so an unset request never leaves
+// the harness unbounded — and never reaches Anthropic Messages, where
+// max_tokens is a REQUIRED field, without one.
+const DefaultMaxTokens = 262144
+
+// DefaultReasoningEffort is the reasoning effort assumed when a request leaves
+// ModelRequest.ReasoningEffort empty (upstream llm-deepseek resolves an
+// omitted effort to "high"): thinking mode is ON by default and an explicit
+// "off" is the only opt-out.
+const DefaultReasoningEffort = "high"
+
+// effectiveMaxTokens resolves the outbound output cap for a request value;
+// zero/negative (unset) falls back to DefaultMaxTokens.
+func effectiveMaxTokens(maxTokens int) int {
+	if maxTokens <= 0 {
+		return DefaultMaxTokens
+	}
+	return maxTokens
+}
+
 // ProviderProfile is the construction-time snapshot of one provider route.
 // Credentials may be supplied inline (APIKey) or resolved per Stream via
 // APIKeyResolver; an empty key at stream time is MISSING_CREDENTIAL.

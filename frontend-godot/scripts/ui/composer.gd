@@ -6,7 +6,6 @@ signal stop_requested
 signal command_submitted(line: String)
 signal model_selected(id: String)
 signal access_mode_requested(preset: String)
-signal queue_removed(text: String)
 
 const ACCESS_PRESETS: PackedStringArray = ["default", "strict", "unrestricted"]
 
@@ -423,10 +422,11 @@ func _access_label(preset: String) -> String:
 			return _t("chat.accessWrite", "Workspace Write")
 
 
+## Queued text is display-only: the message was already steered to the backend,
+## so a "remove" affordance would mislead (nothing can actually be recalled).
 func _add_queue_chip(text: String) -> void:
 	_queue.visible = true
 	var wrap := PanelContainer.new()
-	wrap.set_meta("queued_text", text)
 	wrap.add_theme_stylebox_override("panel", DshTokens.box(
 		DshTokens.bg_layer2(),
 		DshTokens.RADIUS_PILL,
@@ -434,35 +434,15 @@ func _add_queue_chip(text: String) -> void:
 		1,
 		Vector4(8, 2, 8, 2)
 	))
-	var chip := HBoxContainer.new()
-	chip.add_theme_constant_override("separation", 4)
-	wrap.add_child(chip)
 	var lab := Label.new()
 	lab.text = text if text.length() <= 36 else text.substr(0, 33) + "…"
 	lab.tooltip_text = text
+	lab.mouse_filter = Control.MOUSE_FILTER_PASS
 	lab.add_theme_font_size_override("font_size", DshTokens.FONT_CAPTION)
 	lab.add_theme_color_override("font_color", DshTokens.text_secondary())
-	chip.add_child(lab)
-	var rm := Button.new()
-	rm.flat = true
-	rm.focus_mode = Control.FOCUS_NONE
-	rm.custom_minimum_size = Vector2(18, 18)
-	rm.tooltip_text = _t("common.remove", "Remove")
-	var ic := DshIcons.texture("close")
-	if ic:
-		rm.icon = ic
-	else:
-		rm.text = "×"
-	rm.pressed.connect(func() -> void: _remove_queue_chip(wrap))
-	chip.add_child(rm)
+	wrap.add_child(lab)
+	DshTokens.fade_in(wrap, DshTokens.MOTION_QUICK)
 	_queue.add_child(wrap)
-
-
-func _remove_queue_chip(chip: Control) -> void:
-	var text := str(chip.get_meta("queued_text", ""))
-	chip.queue_free()
-	queue_removed.emit(text)
-	call_deferred("_refresh_queue_visible")
 
 
 func _refresh_queue_visible() -> void:

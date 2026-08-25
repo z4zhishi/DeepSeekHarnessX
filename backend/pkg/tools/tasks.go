@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +13,66 @@ import (
 // TodoItem represents a structured task in DSH todo/write.
 type TodoItem struct {
 	Content string `json:"content"`
-	Status  string `json:"status"` // "todo" | "in_progress" | "completed"
+	Status  string `json:"status"` // "pending" | "in_progress" | "completed"
+}
+
+// Todo statuses (upstream tool-todo STATUSES: the model-facing enum starts at
+// "pending"; "todo" is only tolerated when decoding legacy logs).
+const (
+	TodoStatusPending    = "pending"
+	TodoStatusInProgress = "in_progress"
+	TodoStatusCompleted  = "completed"
+)
+
+// todoStatusLegacy maps retired enum spellings onto the canonical ones so old
+// session logs / persisted snapshots replay instead of failing schema decode.
+var todoStatusLegacy = map[string]string{
+	"todo": TodoStatusPending,
+}
+
+// normalizeTodoStatus validates one status and folds legacy spellings.
+func normalizeTodoStatus(status string) (string, error) {
+	if mapped, ok := todoStatusLegacy[status]; ok {
+		return mapped, nil
+	}
+	switch status {
+	case TodoStatusPending, TodoStatusInProgress, TodoStatusCompleted:
+		return status, nil
+	default:
+		return "", fmt.Errorf("invalid todo status %q: must be one of pending|in_progress|completed", status)
+	}
+}
+
+// toTodoList mirrors upstream toTodoList (tool-todo/src/index.ts:91): trimmed
+// non-empty unique content and at most one in_progress item. The registry has
+// already enforced the wire enum; this pass also folds the legacy "todo"
+// spelling to "pending".
+func toTodoList(raw []TodoItem) ([]TodoItem, error) {
+	todos := make([]TodoItem, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	active := 0
+	for _, item := range raw {
+		content := strings.TrimSpace(item.Content)
+		if len(content) == 0 {
+			return nil, fmt.Errorf("invalid todo: `content` must be a non-empty string")
+		}
+		if seen[content] {
+			return nil, fmt.Errorf("invalid todos: duplicate content %q", content)
+		}
+		seen[content] = true
+		status, err := normalizeTodoStatus(item.Status)
+		if err != nil {
+			return nil, err
+		}
+		if status == TodoStatusInProgress {
+			active++
+		}
+		todos = append(todos, TodoItem{Content: content, Status: status})
+	}
+	if active > 1 {
+		return nil, fmt.Errorf("invalid todos: at most one task may be in_progress (got %d)", active)
+	}
+	return todos, nil
 }
 
 // TaskStore holds in-memory structured state for todos, plans, and goals.
@@ -72,7 +132,7 @@ func (r *ToolRegistry) RegisterTaskTools() {
 						"type": "object",
 						"properties": {
 							"content": { "type": "string" },
-							"status": { "type": "string", "enum": ["todo", "in_progress", "completed"] }
+							"status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
 						},
 						"required": ["content", "status"]
 					}
@@ -87,15 +147,21 @@ func (r *ToolRegistry) RegisterTaskTools() {
 			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 				return nil, err
 			}
+			// Canonical list validation (upstream toTodoList): non-empty
+			// unique content, known status, single in_progress.
+			todos, err := toTodoList(args.Todos)
+			if err != nil {
+				return nil, err
+			}
 
 			globalTasks.mu.Lock()
-			globalTasks.todos[ctx.SessionID] = args.Todos
+			globalTasks.todos[ctx.SessionID] = todos
 			globalTasks.mu.Unlock()
 
 			// Durable todo snapshot (upstream todo/write, whole-list replace).
 			if ctx.Emit != nil {
-				items := make([]session.TodoItem, len(args.Todos))
-				for i, it := range args.Todos {
+				items := make([]session.TodoItem, len(todos))
+				for i, it := range todos {
 					items[i] = session.TodoItem{Content: it.Content, Status: it.Status}
 				}
 				ctx.Emit(session.EventTodoWrite, session.TodoWritePayload{Todos: items})

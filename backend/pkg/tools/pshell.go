@@ -193,9 +193,16 @@ func getShell(dialect shellDialect, binary, sessionID string) *PersistentShell {
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
+	// Own the whole descendant tree before Start: the persistent shell runs
+	// arbitrary user commands that may spawn children of their own, and a
+	// bare root kill would orphan those grandchildren with live pipe handles.
+	makeProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil
 	}
+	// Attach the started process to its Job Object (Windows) so descendants
+	// are reaped by killProcessTree; no-op on Unix Setpgid.
+	attachProcessGroup(cmd)
 	go func() {
 		_ = cmd.Wait()
 		_ = pw.Close()
@@ -222,7 +229,10 @@ func closeShellOf(dialect shellDialect, sessionID string) {
 		return
 	}
 	s.closed = true
-	_ = s.cmd.Process.Kill()
+	// Tree kill, not a bare root Kill: on Windows this terminates the shell's
+	// Job Object (every spawned grandchild included); on Unix it SIGKILLs the
+	// whole process group so nothing survives holding the pipes open.
+	_ = killProcessTree(s.cmd)
 	delete(shells, key)
 }
 

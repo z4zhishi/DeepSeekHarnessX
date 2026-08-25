@@ -2,8 +2,10 @@ package settings
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -12,8 +14,15 @@ import (
 // On Load it merges the on-disk document into the manager so registered
 // namespaces resolve through user overrides; on Save it writes the full
 // document back atomically.
+//
+// A document that exists but cannot be parsed poisons the store (upstream
+// boot-fails-loud): Save then refuses to run so a later write can never
+// replace the user's hand-edited file with an empty document.
 type FileStore struct {
 	path string
+
+	mu       sync.Mutex // guards unusable
+	unusable bool       // an on-disk document failed to parse; Save must refuse
 }
 
 // NewFileStore returns a store bound to path (created when absent).
@@ -22,13 +31,15 @@ func NewFileStore(path string) *FileStore {
 }
 
 // Load reads the document file into the manager's in-memory doc. A missing
-// or empty file leaves the document empty. On success it also materializes
-// the file (0600) so describe reports hasDocument.
+// or empty file leaves the document empty. An unparsable file returns the
+// error AND poisons the store: every later Save refuses to overwrite the
+// unreadable document instead of destroying it.
 func (f *FileStore) Load(m *Manager) error {
 	data, err := os.ReadFile(f.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			m.doc = map[string]any{}
+			f.setUnusable(false)
+			m.loadDocument(map[string]any{})
 			return nil
 		}
 		return err
@@ -36,21 +47,37 @@ func (f *FileStore) Load(m *Manager) error {
 	var doc map[string]any
 	if len(data) == 0 {
 		doc = map[string]any{}
-	} else if err := yaml.Unmarshal(data, &doc); err != nil {
-		return err
+	} else if uerr := yaml.Unmarshal(data, &doc); uerr != nil {
+		f.setUnusable(true)
+		log.Printf("settings: %s cannot be parsed (%v); SAVING IS DISABLED to protect your file - "+
+			"fix or remove it, then restart", f.path, uerr)
+		return uerr
 	}
 	if doc == nil {
 		doc = map[string]any{}
 	}
-	m.doc = normalize(doc)
-	m.reload()
+	f.setUnusable(false)
+	m.loadDocument(normalize(doc))
 	return nil
 }
 
-// reload re-resolves every registered namespace against the freshly loaded
-// document, firing onChange when a resolved value actually changed (deep-equal
-// gated). Called after Load swaps the document.
-func (m *Manager) reload() {
+func (f *FileStore) setUnusable(v bool) {
+	f.mu.Lock()
+	f.unusable = v
+	f.mu.Unlock()
+}
+
+func (f *FileStore) isUnusable() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unusable
+}
+
+// reloadLocked re-resolves every registered namespace against the freshly
+// loaded document, firing onChange when a resolved value actually changed
+// (deep-equal gated). Called from loadDocument with m.mu held; revision
+// advancement for changed raw sections also happens there.
+func (m *Manager) reloadLocked() {
 	for _, reg := range m.regs {
 		prev := reg.resolved
 		next := m.resolve(reg)
@@ -63,14 +90,21 @@ func (m *Manager) reload() {
 	}
 }
 
-// Save writes the manager document to disk atomically (0600). A nil document
-// is treated as empty. Absent parent directories are created.
+// Save writes the manager document to disk atomically (0600). It serializes
+// the manager's latest published immutable snapshot, so it is safe to call
+// concurrently with mutations — including from inside the persistence hook,
+// where it observes the candidate being committed. Absent parent directories
+// are created. A poisoned store (unparsable document seen at Load) refuses to
+// write rather than destroy the user's file.
 func (f *FileStore) Save(m *Manager) error {
-	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
+	if f.isUnusable() {
+		return fmt.Errorf("settings: refusing to overwrite %s: the existing file failed to parse earlier; fix or remove it first", f.path)
+	}
+	data, err := yaml.Marshal(m.publishedDocument())
+	if err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(m.doc)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
 		return err
 	}
 	tmp := f.path + ".tmp"

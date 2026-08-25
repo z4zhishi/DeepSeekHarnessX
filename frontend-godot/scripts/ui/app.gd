@@ -91,6 +91,7 @@ func _ready() -> void:
 	)
 	_load_models()
 	_refresh_commands()
+	_restore_language()
 	if _onboarding.has_method("maybe_start"):
 		_onboarding.maybe_start(_client)
 	else:
@@ -287,6 +288,8 @@ func _apply_history(ok: bool, data: Variant) -> void:
 		return
 	_show_empty(false)
 	if _chat.has_method("set_nodes"):
+		# set_nodes adopts the folded nodes and resets ChatList's internal fold,
+		# so live mux events after this point re-fold from a clean baseline.
 		var fold := ConversationFold.new()
 		fold.ingest_history(events)
 		_chat.set_nodes(fold.nodes())
@@ -569,6 +572,28 @@ func _ensure_session(then: Callable) -> void:
 			return
 		_switch(sid, true)
 		then.call(sid)
+	)
+
+
+## Backend is authoritative for general.language (settings.mutate on every
+## locale change); user://locale.txt is only a fast first-paint guess.
+func _restore_language() -> void:
+	if not _client.has_method("settings_describe"):
+		return
+	_client.settings_describe(func(ok: bool, data: Variant) -> void:
+		if not ok or not (data is Dictionary):
+			return
+		var loc := ""
+		for ns_v in (data as Dictionary).get("namespaces", []):
+			if not (ns_v is Dictionary) or str((ns_v as Dictionary).get("ns", "")) != "general":
+				continue
+			var ns: Dictionary = ns_v
+			for src in ["user", "base"]:
+				var m: Variant = ns.get(src, {})
+				if m is Dictionary and str((m as Dictionary).get("language", "")) != "":
+					loc = str((m as Dictionary)["language"])
+		if (loc == "zh" or loc == "en") and loc != DshI18n.get_locale():
+			DshI18n.set_locale(loc)
 	)
 
 

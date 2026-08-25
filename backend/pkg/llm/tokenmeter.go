@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"dsh-go/pkg/session"
@@ -12,10 +13,56 @@ import (
 // and returns a context projection (tokenUsage / contextPressure /
 // projectedTokens / contextBreakdown) that compaction and the UI can share.
 //
-// The pricing here is the single source of truth for the heuristic. The
-// compaction package's HeuristicMeter remains a thin per-node adapter over the
-// same per-block arithmetic (it must keep its local copy to avoid an
-// import cycle; keep the two in sync when the heuristic changes).
+// The arithmetic mirrors upstream `@deepseek-ai/dsh-token-meter/estimate`:
+// text/reasoning price ceil(len/4)+BLOCK_OVERHEAD per block, tool-call adds
+// its name and arguments, tool-result recurses into the nested content array,
+// every message carries ROLE_OVERHEAD. This is the single source of truth for
+// the heuristic; the compaction package delegates here (its HeuristicMeter is
+// a thin per-node adapter).
+
+// Fixed-density heuristic constants (upstream estimate.ts).
+const (
+	// charsPerToken is the fixed text-density estimate used until exact
+	// tokenization is needed.
+	charsPerToken = 4
+	// blockOverhead is the per-block structural overhead for JSON framing and
+	// type tags.
+	blockOverhead = 4
+	// roleOverhead is the role-field framing overhead added to every priced
+	// message (upstream ROLE_OVERHEAD).
+	roleOverhead = 4
+)
+
+func ceilDiv(n int) int { return (n + charsPerToken - 1) / charsPerToken }
+
+// EstimateContentTokens prices content blocks recursively under the fixed
+// density heuristic (upstream estimateContent): tool-result blocks recurse
+// into their nested content so a large tool output is priced by its actual
+// size instead of a fixed constant.
+func EstimateContentTokens(blocks []session.ContentBlock) int {
+	tokens := 0
+	for i := range blocks {
+		block := &blocks[i]
+		switch block.Type {
+		case "text", "reasoning":
+			tokens += ceilDiv(len(block.Text)) + blockOverhead
+		case "tool-call":
+			tokens += ceilDiv(len(block.Name)) + ceilDiv(len(block.Arguments)) + blockOverhead
+		case "tool-result":
+			tokens += EstimateContentTokens(block.Content) + blockOverhead
+		default:
+			// Unknown merge-extensible blocks keep a conservative structural
+			// JSON price under the fixed heuristic (upstream default arm).
+			raw, err := json.Marshal(block)
+			if err != nil {
+				tokens += blockOverhead
+				continue
+			}
+			tokens += blockOverhead + ceilDiv(len(raw))
+		}
+	}
+	return tokens
+}
 
 // Meter is the replay-aware token meter. The zero value is usable; set
 // ContextLimit to have Measure report a normalized pressure ratio.
@@ -79,12 +126,14 @@ func (m Meter) Measure(events []session.SessionEnvelope) (ContextMetrics, error)
 		tokens := EstimateMessageTokens(msg)
 		metrics.ProjectedTokens += tokens
 		metrics.MessageCount++
-		switch msg.Role {
-		case "assistant":
+		switch {
+		case msg.Role == "assistant":
 			breakdown.AssistantTokens += tokens
-		case "tool":
+		case hasToolResultBlock(msg.Content):
+			// Tool results ride in verbatim projected messages; the
+			// breakdown classifies them by block shape, not role.
 			breakdown.ToolTokens += tokens
-		default: // "user" (and any "system" surface node)
+		default: // plain "user" text (and any "system" surface node)
 			breakdown.UserTokens += tokens
 		}
 	}
@@ -104,24 +153,23 @@ func (m Meter) Measure(events []session.SessionEnvelope) (ContextMetrics, error)
 	return metrics, nil
 }
 
-// EstimateMessageTokens prices one projected model message with the fixed
-// heuristic: ~4 chars per token for text, plus fixed per-block structural
-// overhead. This is the same arithmetic compaction's HeuristicMeter uses; keep
-// the two in lockstep.
-func EstimateMessageTokens(message *session.ModelMessage) int {
-	total := 0
-	for _, block := range message.Content {
-		switch block.Type {
-		case "text", "reasoning":
-			total += (len(block.Text) + 3) / 4
-		case "tool-call":
-			total += 8 + (len(block.Arguments)+3)/4
-		case "tool-result":
-			total += 16 + (len(block.Text)+3)/4
-		default:
-			total += 4
+// hasToolResultBlock reports whether any block in the message is a tool
+// result (the shape the tool-token breakdown bucket tracks).
+func hasToolResultBlock(blocks []session.ContentBlock) bool {
+	for i := range blocks {
+		if blocks[i].Type == "tool-result" {
+			return true
 		}
 	}
+	return false
+}
+
+// EstimateMessageTokens prices one projected model message with the fixed
+// heuristic: recursive per-block pricing plus the role-field framing overhead
+// (upstream estimateMessage). This is the shared single-source arithmetic;
+// compaction's HeuristicMeter delegates to it.
+func EstimateMessageTokens(message *session.ModelMessage) int {
+	total := EstimateContentTokens(message.Content) + roleOverhead
 	if total == 0 {
 		total = 1
 	}

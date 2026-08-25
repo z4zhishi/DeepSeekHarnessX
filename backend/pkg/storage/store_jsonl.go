@@ -465,8 +465,8 @@ func (s *JsonlStore) ListSessions() ([]*session.SessionHeader, error) {
 			if err != nil || first == nil {
 				continue
 			}
-			header, ok := parseHeaderBytes(first)
-			if !ok {
+			header, err := parseHeaderBytes(first)
+			if err != nil {
 				continue
 			}
 			if prior, dup := seen[header.ID]; dup {
@@ -499,18 +499,11 @@ func readFirstZstdLine(path string) ([]byte, error) {
 	return plain, nil
 }
 
-// parseHeaderBytes parses a header record back into a SessionHeader.
-func parseHeaderBytes(line []byte) (*session.SessionHeader, bool) {
-	var h jsonlHeaderLine
-	if err := json.Unmarshal(line, &h); err != nil || h.Type != "session" || h.ID == "" {
-		return nil, false
-	}
-	header := &session.SessionHeader{
-		Version: h.Version, ID: h.ID, CreatedAt: h.CreatedAt, DelegationDepth: h.DelegationDepth,
-		Cwd: h.Cwd, ParentSession: h.ParentSession, SeedLength: h.SeedLength,
-		Origin: h.Origin, AgentPreset: h.AgentPreset,
-	}
-	return header, true
+// parseHeaderBytes parses a header record back into a SessionHeader, applying
+// the same validation rules as the reader's parseHeaderLine (version, numeric
+// domains, retired fields). Returns an error for a malformed/foreign header.
+func parseHeaderBytes(line []byte) (*session.SessionHeader, error) {
+	return parseHeaderLine(line)
 }
 
 // newTmpSuffix returns a random hex token for temp-file names.

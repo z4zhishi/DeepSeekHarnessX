@@ -13,8 +13,7 @@ import (
 )
 
 const (
-	anthropicVersion    = "2023-06-01"
-	defaultAnthropicMax = 8192
+	anthropicVersion = "2023-06-01"
 )
 
 // anthropicAdapter implements LlmAdapter against the Anthropic Messages API
@@ -124,10 +123,9 @@ func buildAnthropicRequest(req ModelRequest) anthropicRequest {
 		System:    req.System,
 		Messages:  buildAnthropicMessages(req),
 		Stream:    true,
-		MaxTokens: req.MaxTokens,
-	}
-	if body.MaxTokens <= 0 {
-		body.MaxTokens = defaultAnthropicMax
+		// max_tokens is REQUIRED on the Messages wire: an unset (<=0) request
+		// falls back to DefaultMaxTokens, never leaves the harness unbounded.
+		MaxTokens: effectiveMaxTokens(req.MaxTokens),
 	}
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature
@@ -158,9 +156,7 @@ func buildAnthropicMessages(req ModelRequest) []anthropicMsg {
 			if text != "" {
 				out = append(out, anthropicMsg{Role: "user", Content: text})
 			}
-		case "user":
-			text := flattenTextBlocks(m.Content)
-			out = append(out, anthropicMsg{Role: "user", Content: text})
+			continue
 		case "assistant":
 			blocks := make([]map[string]any, 0, len(m.Content))
 			for _, b := range m.Content {
@@ -189,25 +185,34 @@ func buildAnthropicMessages(req ModelRequest) []anthropicMsg {
 			} else {
 				out = append(out, anthropicMsg{Role: "assistant", Content: blocks})
 			}
-		case "tool":
-			blocks := make([]map[string]any, 0, 1)
-			for _, b := range m.Content {
-				if b.Type != "tool-result" {
-					continue
+			continue
+		}
+		// User-role messages: text blocks come first, then each tool-result
+		// block becomes an Anthropic tool_result riding in the same user
+		// message (results stay verbatim in the projected history).
+		var texts []map[string]any
+		var results []map[string]any
+		for _, b := range m.Content {
+			switch b.Type {
+			case "text":
+				if b.Text != "" {
+					texts = append(texts, map[string]any{"type": "text", "text": b.Text})
 				}
+			case "tool-result":
 				text := flattenTextBlocks(b.Content)
 				if text == "" {
 					text = "(no output)"
 				}
-				blocks = append(blocks, map[string]any{
+				results = append(results, map[string]any{
 					"type":        "tool_result",
 					"tool_use_id": b.ToolCallID,
 					"content":     text,
 				})
 			}
-			if len(blocks) > 0 {
-				out = append(out, anthropicMsg{Role: "user", Content: blocks})
-			}
+		}
+		blocks := append(append([]map[string]any(nil), texts...), results...)
+		if len(blocks) > 0 {
+			out = append(out, anthropicMsg{Role: "user", Content: blocks})
 		}
 	}
 	return mergeAnthropicRoles(out)

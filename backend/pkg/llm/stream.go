@@ -25,6 +25,7 @@ type StreamChunk struct {
 	Type           string                `json:"type"`
 	Index          int                   `json:"index,omitempty"`
 	BlockType      string                `json:"blockType,omitempty"`      // "text" | "reasoning" | "tool-call"
+	BlockID        string                `json:"blockId,omitempty"`        // stable identity of the open block this chunk belongs to (parallel tool calls interleave)
 	Text           string                `json:"text,omitempty"`           // for text-delta / reasoning-delta
 	ID             string                `json:"id,omitempty"`             // for tool-call-delta
 	Name           string                `json:"name,omitempty"`           // for tool-call-delta
@@ -60,62 +61,191 @@ type LlmAdapter interface {
 }
 
 // BlockAssembler incrementally folds StreamChunks into complete ContentBlocks.
+//
+// Chunks carry a stable BlockID, so a stream may keep several blocks open at
+// once (DeepSeek interleaves parallel tool-call deltas by wire index). Blocks
+// commit in open order: block-end commits its own block wherever it sits in
+// that order, and finish flushes every still-open remainder in open order.
 type BlockAssembler struct {
-	activeBlock  *session.ContentBlock
+	openOrder    []string                 // block IDs in first-open order — commit order
+	active       map[string]*activeBlock  // currently open blocks keyed by BlockID
+	legacyActive *activeBlock             // single anonymous block for ID-less legacy streams (anthropic / responses / mock)
 	blocks       []session.ContentBlock
 	usage        *session.TokenUsage
 	finishReason string
 }
 
+// activeBlock is one in-flight block under assembly.
+type activeBlock struct {
+	block session.ContentBlock
+}
+
 // NewBlockAssembler creates a new incremental block aggregator.
 func NewBlockAssembler() *BlockAssembler {
-	return &BlockAssembler{}
+	return &BlockAssembler{
+		active: make(map[string]*activeBlock),
+	}
+}
+
+// target resolves the block a chunk applies to. Keyed chunks address their own
+// open block; unkeyed chunks fall back to the most recent open block and only
+// materialize a legacy singleton when nothing is open at all.
+func (ba *BlockAssembler) target(chunk StreamChunk) *activeBlock {
+	if chunk.BlockID != "" {
+		if ab, ok := ba.active[chunk.BlockID]; ok {
+			return ab
+		}
+		return nil
+	}
+	if len(ba.openOrder) > 0 {
+		return ba.active[ba.openOrder[len(ba.openOrder)-1]]
+	}
+	return ba.legacyActive
+}
+
+// open registers a new block under an explicit or synthesized ID and returns it.
+func (ba *BlockAssembler) open(id string) *activeBlock {
+	if id == "" {
+		id = fmt.Sprintf("block-%d", len(ba.openOrder)+len(ba.blocks))
+	}
+	ab := &activeBlock{block: session.ContentBlock{}}
+	ba.active[id] = ab
+	ba.openOrder = append(ba.openOrder, id)
+	return ab
+}
+
+// commit closes the block registered under id and appends it to the results.
+func (ba *BlockAssembler) commit(id string) {
+	ab, ok := ba.active[id]
+	if !ok {
+		return
+	}
+	delete(ba.active, id)
+	for i, openID := range ba.openOrder {
+		if openID == id {
+			ba.openOrder = append(ba.openOrder[:i], ba.openOrder[i+1:]...)
+			break
+		}
+	}
+	ba.blocks = append(ba.blocks, ab.block)
+}
+
+// commitLegacy closes the anonymous singleton block, if any.
+func (ba *BlockAssembler) commitLegacy() {
+	if ba.legacyActive != nil {
+		ba.blocks = append(ba.blocks, ba.legacyActive.block)
+		ba.legacyActive = nil
+	}
 }
 
 // IngestChunk consumes a chunk and updates assembled content state.
 func (ba *BlockAssembler) IngestChunk(chunk StreamChunk) {
 	switch chunk.Type {
 	case ChunkBlockStart:
-		ba.activeBlock = &session.ContentBlock{
+		if chunk.BlockID != "" {
+			if _, exists := ba.active[chunk.BlockID]; !exists {
+				ab := ba.open(chunk.BlockID)
+				ab.block = session.ContentBlock{
+					Type: chunk.BlockType,
+					ID:   chunk.ID,
+					Name: chunk.Name,
+				}
+			}
+			return
+		}
+		// Legacy ID-less start: exactly one anonymous block may be open;
+		// a second start replaces it (pre-overhaul semantics preserved).
+		if ba.legacyActive != nil {
+			ba.commitLegacy()
+		} else if len(ba.openOrder) > 0 {
+			ba.commit(ba.openOrder[len(ba.openOrder)-1])
+		}
+		ba.legacyActive = &activeBlock{block: session.ContentBlock{
 			Type: chunk.BlockType,
 			ID:   chunk.ID,
 			Name: chunk.Name,
-		}
+		}}
 
 	case ChunkTextDelta:
-		if ba.activeBlock == nil {
-			ba.activeBlock = &session.ContentBlock{Type: "text"}
+		if ab := ba.target(chunk); ab != nil {
+			ab.block.Text += chunk.Text
+			return
 		}
-		ba.activeBlock.Text += chunk.Text
+		if chunk.BlockID != "" {
+			ab := ba.open(chunk.BlockID)
+			ab.block.Type = "text"
+			ab.block.Text += chunk.Text
+			return
+		}
+		if ba.legacyActive == nil {
+			ba.legacyActive = &activeBlock{}
+		}
+		ba.legacyActive.block.Type = "text"
+		ba.legacyActive.block.Text += chunk.Text
 
 	case ChunkReasoningDelta:
-		if ba.activeBlock == nil {
-			ba.activeBlock = &session.ContentBlock{Type: "reasoning"}
+		if ab := ba.target(chunk); ab != nil {
+			ab.block.Text += chunk.Text
+			return
 		}
-		ba.activeBlock.Text += chunk.Text
+		if chunk.BlockID != "" {
+			ab := ba.open(chunk.BlockID)
+			ab.block.Type = "reasoning"
+			ab.block.Text += chunk.Text
+			return
+		}
+		if ba.legacyActive == nil {
+			ba.legacyActive = &activeBlock{}
+		}
+		ba.legacyActive.block.Type = "reasoning"
+		ba.legacyActive.block.Text += chunk.Text
 
 	case ChunkToolCallDelta:
-		if ba.activeBlock == nil {
-			ba.activeBlock = &session.ContentBlock{
-				Type: "tool-call",
-				ID:   chunk.ID,
-				Name: chunk.Name,
+		var ab *activeBlock
+		if chunk.BlockID != "" {
+			if a, ok := ba.active[chunk.BlockID]; ok {
+				ab = a
+			} else {
+				// Delta before its block-start: synthesize the tool-call block
+				// so arguments are never dropped.
+				ab = ba.open(chunk.BlockID)
+				ab.block.Type = "tool-call"
 			}
+		} else if len(ba.openOrder) > 0 {
+			ab = ba.active[ba.openOrder[len(ba.openOrder)-1]]
+		} else {
+			if ba.legacyActive == nil {
+				ba.legacyActive = &activeBlock{block: session.ContentBlock{Type: "tool-call"}}
+			}
+			ab = ba.legacyActive
 		}
-		if chunk.ID != "" && ba.activeBlock.ID == "" {
-			ba.activeBlock.ID = chunk.ID
+		if chunk.ID != "" && ab.block.ID == "" {
+			ab.block.ID = chunk.ID
 		}
-		if chunk.Name != "" && ba.activeBlock.Name == "" {
-			ba.activeBlock.Name = chunk.Name
+		if chunk.Name != "" && ab.block.Name == "" {
+			ab.block.Name = chunk.Name
 		}
-		ba.activeBlock.Arguments += chunk.ArgumentsDelta
+		ab.block.Arguments += chunk.ArgumentsDelta
 
 	case ChunkBlockEnd:
-		if ba.activeBlock != nil {
-			ba.blocks = append(ba.blocks, *ba.activeBlock)
-			ba.activeBlock = nil
-		} else if chunk.Block != nil {
+		switch {
+		case chunk.BlockID != "":
+			// Commit this block only; sibling blocks stay open. An end for an
+			// unknown ID carries a complete fallback block — append it verbatim
+			// (deferred-close adapters ship the finished block this way).
+			if _, ok := ba.active[chunk.BlockID]; !ok && chunk.Block != nil {
+				ba.blocks = append(ba.blocks, *chunk.Block)
+				return
+			}
+			ba.commit(chunk.BlockID)
+		case chunk.Block != nil:
 			ba.blocks = append(ba.blocks, *chunk.Block)
+		default:
+			if len(ba.openOrder) > 0 {
+				ba.commit(ba.openOrder[len(ba.openOrder)-1])
+				return
+			}
+			ba.commitLegacy()
 		}
 
 	case ChunkUsage:
@@ -125,10 +255,11 @@ func (ba *BlockAssembler) IngestChunk(chunk StreamChunk) {
 
 	case ChunkFinish:
 		ba.finishReason = chunk.FinishReason
-		if ba.activeBlock != nil {
-			ba.blocks = append(ba.blocks, *ba.activeBlock)
-			ba.activeBlock = nil
+		// Flush remainders in open order, then any anonymous legacy block.
+		for _, id := range ba.openOrder {
+			ba.commit(id)
 		}
+		ba.commitLegacy()
 	}
 }
 

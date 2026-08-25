@@ -12,6 +12,7 @@ var _asst_i: Dictionary = {} ## turn -> index
 var _reason_i: Dictionary = {} ## turn -> index
 var _tool_i: Dictionary = {} ## callId -> index
 var _cmd_i: Dictionary = {} ## commandId -> index
+var _seen_seq: Dictionary = {} ## seq -> true; mux replay and fetch_history both feed this fold
 
 
 func reset() -> void:
@@ -23,6 +24,7 @@ func reset() -> void:
 	_reason_i.clear()
 	_tool_i.clear()
 	_cmd_i.clear()
+	_seen_seq.clear()
 
 
 func ingest_history(events: Array) -> void:
@@ -37,6 +39,12 @@ func ingest(env: Dictionary) -> void:
 	if typ == "":
 		return
 	var seq := int(env.get("seq", 0))
+	# Idempotent ingest: mux replay and fetch_history both feed the same fold,
+	# and late replay packets must never duplicate already-folded nodes.
+	if seq > 0:
+		if _seen_seq.has(seq):
+			return
+		_seen_seq[seq] = true
 	var data := _as_dict(env.get("data", {}))
 	if data.has("turn"):
 		_turn = int(data["turn"])
@@ -359,18 +367,12 @@ func _ingest_turn_end(seq: int, data: Dictionary) -> void:
 	var kind := str(reason.get("kind", "completed"))
 	if kind == "completed" or kind == "":
 		return
+	# Fallback copy is chosen at bind time by system_row via i18n; the fold only
+	# carries the backend message and the reason marker.
 	var text := str(reason.get("message", "")).strip_edges()
 	var node_kind := "system"
 	if kind == "error":
 		node_kind = "turn-error"
-		if text == "":
-			text = "Error"
-	elif kind == "aborted" or kind == "interrupted":
-		if text == "":
-			text = "Stopped."
-	else:
-		if text == "":
-			text = kind
 	_append("%s:%d" % [node_kind, seq], node_kind, {
 		"text": text,
 		"reason": kind,

@@ -35,7 +35,6 @@ func _ready() -> void:
 	_traj_btn.pressed.connect(func(): _emit_tab("trajectory"))
 	_jobs.pressed.connect(func(): jobs_pressed.emit())
 	_models.item_selected.connect(_on_model_item)
-	_models.visible = false
 	resized.connect(_apply_compact)
 	if DshI18n.has_signal("locale_changed"):
 		DshI18n.locale_changed.connect(func(_loc: String): _apply_strings())
@@ -45,6 +44,7 @@ func _ready() -> void:
 	apply_tokens()
 	_apply_strings()
 	set_plan_active(false)
+	call_deferred("_refresh_model_visibility")
 	call_deferred("_apply_compact")
 
 
@@ -55,7 +55,7 @@ func apply_tokens() -> void:
 	sb.border_width_right = 0
 	add_theme_stylebox_override("panel", sb)
 	_title.add_theme_color_override("font_color", DshTokens.text_primary())
-	_title.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
+	_title.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME_LG)
 	_lineage.add_theme_color_override("font_color", DshTokens.text_tertiary())
 	_lineage.add_theme_font_size_override("font_size", DshTokens.FONT_CAPTION)
 	_ctx_label.add_theme_color_override("font_color", DshTokens.text_tertiary())
@@ -107,6 +107,13 @@ func set_models(models: Array, selected: String) -> void:
 	else:
 		_models.disabled = true
 	_syncing_models = false
+	_refresh_model_visibility()
+
+
+func _refresh_model_visibility() -> void:
+	# §5: the Header "model" surface shows whenever the model list is non-empty;
+	# it only hides when the bar goes compact.
+	_models.visible = _models.item_count > 0 and not is_compact()
 
 
 func set_context(pressure: float, label: String) -> void:
@@ -137,9 +144,13 @@ func _on_model_item(index: int) -> void:
 
 func _apply_compact() -> void:
 	var compact := get_viewport_rect().size.x < HEADER_COMPACT
-	_models.visible = false
 	_ctx.visible = true
 	_lineage.visible = (not compact) and _lineage.text.strip_edges() != ""
+	_refresh_model_visibility()
+
+
+func is_compact() -> bool:
+	return get_viewport_rect().size.x < HEADER_COMPACT
 
 
 func _apply_strings() -> void:

@@ -23,12 +23,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
 	}
-	userText := lastUserTextFromMessages(jsonRaw(body["messages"], raw, "messages"))
+	msgsRaw := jsonRaw(body["messages"], raw, "messages")
+	userText := lastUserTextFromMessages(msgsRaw)
 	if userText == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "messages must include a user text turn"}})
 		return
 	}
-	ag, sessionID, err := s.inboundEnsureSession(inboundSessionID(r, body))
+	ag, sessionID, freshLog, err := s.inboundEnsureSession(inboundSessionID(r, body))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
@@ -39,11 +40,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	stream := boolField(body, "stream")
 
+	// 无状态多轮投影：全新会话把 system + 全部历史轮次拼进本轮驱动文本；
+	// 会话复用（X-Session-Id）保持仅投递最后一条 user 文本的既有行为。
+	driveText := userText
+	if freshLog {
+		if proj := projectInboundConversation(msgsRaw, ""); proj != "" {
+			driveText = proj
+		}
+	}
+
 	if stream {
 		flusher := prepareSSE(w)
 		var text string
 		finish := "stop"
-		_ = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "", map[string]any{
@@ -86,7 +96,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var fromChunks, fromMessage string
-	err = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+	err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 		if t := assistantMessageText(env); t != "" {
 			fromMessage += t
 		}
@@ -137,7 +147,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
 	}
-	userText := responsesInputText(jsonRaw(body["input"], raw, "input"))
+	inputRaw := jsonRaw(body["input"], raw, "input")
+	userText := responsesInputText(inputRaw)
 	if userText == "" {
 		userText = lastUserTextFromMessages(jsonRaw(body["messages"], raw, "messages"))
 	}
@@ -145,7 +156,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "input must include user text"}})
 		return
 	}
-	ag, sessionID, err := s.inboundEnsureSession(inboundSessionID(r, body))
+	ag, sessionID, freshLog, err := s.inboundEnsureSession(inboundSessionID(r, body))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
@@ -156,6 +167,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	stream := boolField(body, "stream")
 
+	// 无状态多轮投影（同 chat/completions）：instructions 视为 system 前置；
+	// input 为纯字符串时无历史概念，保持原样投递。
+	sysExtra := contentToText(body["instructions"])
+	driveText := userText
+	if freshLog {
+		proj := projectInboundConversation(inputRaw, sysExtra)
+		if proj == "" {
+			proj = projectInboundConversation(jsonRaw(body["messages"], raw, "messages"), sysExtra)
+		}
+		if proj != "" {
+			driveText = proj
+		}
+	}
+
 	if stream {
 		flusher := prepareSSE(w)
 		_ = writeSSEData(w, flusher, "response.created", map[string]any{
@@ -163,7 +188,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"response": map[string]any{"id": respID, "object": "response", "status": "in_progress", "model": model},
 		})
 		var text string
-		_ = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "response.output_text.delta", map[string]any{
@@ -194,7 +219,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var fromChunks, fromMessage string
-	err = s.inboundTurn(r.Context(), ag, userText, func(env *session.SessionEnvelope) {
+	err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 		if t := assistantMessageText(env); t != "" {
 			fromMessage += t
 		}

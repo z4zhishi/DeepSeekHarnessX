@@ -1,80 +1,83 @@
 extends Node
-class_name DshTokens
 
 ## Semantic tokens ported from CK ui-theme aliases. Feature scripts must
 ## read these (or the built Theme) — never Color("#…") literals.
+## Autoload identity is DshTokens (spec §7) — no class_name, it would collide
+## with the autoload singleton. Access everything through the autoload.
 
 enum Mode { DARK, LIGHT }
 
 static var mode: Mode = Mode.DARK
 
-static func is_dark() -> bool:
+
+func is_dark() -> bool:
 	return mode == Mode.DARK
 
-static func bg_base() -> Color:
+
+func bg_base() -> Color:
 	return Color("151517") if is_dark() else Color("ffffff")
 
-static func bg_sidebar() -> Color:
+func bg_sidebar() -> Color:
 	return Color("1b1b1c") if is_dark() else Color("f9fafb")
 
-static func bg_layer1() -> Color:
+func bg_layer1() -> Color:
 	return Color("232324") if is_dark() else Color("f9fafb")
 
-static func bg_layer2() -> Color:
+func bg_layer2() -> Color:
 	return Color("2c2c2e") if is_dark() else Color("f1f3f5")
 
-static func bg_layer3() -> Color:
+func bg_layer3() -> Color:
 	return Color("353638") if is_dark() else Color("e5e7eb")
 
-static func bg_input() -> Color:
+func bg_input() -> Color:
 	return Color("1e1e20") if is_dark() else Color("ffffff")
 
-static func bg_code() -> Color:
+func bg_code() -> Color:
 	return Color("18181a") if is_dark() else Color("f5f6f8")
 
-static func bg_bubble() -> Color:
+func bg_bubble() -> Color:
 	return Color("2c2c2e") if is_dark() else Color("edf3fe")
 
-static func text_primary() -> Color:
+func text_primary() -> Color:
 	return Color("f9fafb") if is_dark() else Color("0f1115")
 
-static func text_secondary() -> Color:
+func text_secondary() -> Color:
 	return Color("cfd3d6") if is_dark() else Color("4b5563")
 
-static func text_tertiary() -> Color:
+func text_tertiary() -> Color:
 	return Color("81858c") if is_dark() else Color("6b7280")
 
-static func text_muted() -> Color:
+func text_muted() -> Color:
 	return Color("55585e") if is_dark() else Color("9ca3af")
 
-static func border_l1() -> Color:
+func border_l1() -> Color:
 	return Color(1, 1, 1, 0.06) if is_dark() else Color(0, 0, 0, 0.04)
 
-static func border_l2() -> Color:
+func border_l2() -> Color:
 	return Color(1, 1, 1, 0.12) if is_dark() else Color(0, 0, 0, 0.10)
 
-static func border_l3() -> Color:
+func border_l3() -> Color:
 	return Color(1, 1, 1, 0.16) if is_dark() else Color(0, 0, 0, 0.12)
 
-static func border_l4() -> Color:
+func border_l4() -> Color:
 	return Color(1, 1, 1, 0.20) if is_dark() else Color(0, 0, 0, 0.16)
 
-static func accent() -> Color:
+func accent() -> Color:
 	return Color("4176e6")
 
-static func accent_hover() -> Color:
+func accent_hover() -> Color:
 	return Color("679efe")
 
-static func success() -> Color:
+func success() -> Color:
 	return Color("22c55e")
 
-static func danger() -> Color:
+func danger() -> Color:
 	return Color("ef4444")
 
-static func warn() -> Color:
+func warn() -> Color:
 	return Color("f59e0b")
 
-static func brand_button() -> Color:
+func brand_button() -> Color:
 	return text_primary()
 
 const RADIUS_SM := 4
@@ -99,6 +102,8 @@ const FONT_UI := 14
 const FONT_UI_LH := 22
 const FONT_BODY := 16
 const FONT_BODY_LH := 28
+const FONT_CHROME_LG := 16
+const FONT_CHROME_LG_LH := 24
 const FONT_CHROME := 13
 const FONT_CHROME_LH := 20
 const FONT_CAPTION := 12
@@ -108,11 +113,44 @@ const FONT_MICRO_LH := 14
 const FONT_CODE := 13
 const FONT_CODE_LH := 22
 
-static func to_html(c: Color, with_alpha: bool = false) -> String:
+## Motion windows (frontend-rebuild-spec §4). Only opacity/modulate is animated.
+## Godot exposes no OS reduce-motion probe; flip motion_enabled to honor it.
+const MOTION_QUICK := 0.1
+const MOTION_BASE := 0.2
+const MOTION_SLOW := 0.3
+
+var motion_enabled := true
+
+
+func fade_in(node: CanvasItem, dur: float = MOTION_BASE) -> void:
+	if node == null or not motion_enabled:
+		return
+	node.modulate.a = 0.0
+	var tw := node.create_tween()
+	tw.tween_property(node, "modulate:a", 1.0, dur)
+
+
+## Fades node out then invokes finished (deferred when motion is disabled).
+func fade_out(node: CanvasItem, dur: float, finished: Callable) -> void:
+	if node == null:
+		return
+	if not motion_enabled:
+		if finished.is_valid():
+			finished.call_deferred()
+		return
+	node.modulate.a = 1.0
+	var tw := node.create_tween()
+	tw.tween_property(node, "modulate:a", 0.0, dur)
+	if finished.is_valid():
+		tw.finished.connect(finished)
+	else:
+		tw.finished.connect(func() -> void: node.visible = false)
+
+func to_html(c: Color, with_alpha: bool = false) -> String:
 	return "#" + c.to_html(with_alpha)
 
 
-static func box(bg: Color, radius: int = RADIUS_MD, border: Color = Color.TRANSPARENT, bw: int = 0, pad := Vector4(8, 6, 8, 6)) -> StyleBoxFlat:
+func box(bg: Color, radius: int = RADIUS_MD, border: Color = Color.TRANSPARENT, bw: int = 0, pad := Vector4(8, 6, 8, 6)) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = bg
 	if radius > 64:

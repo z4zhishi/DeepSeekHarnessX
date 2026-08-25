@@ -26,6 +26,12 @@ var _host_alive: bool = false
 
 
 func _ready() -> void:
+	# Gateway endpoint injection: the Go host (embedgui) sets DSHX_GATEWAY_URL
+	# when launching this window, so --host/--port take effect. Empty env keeps
+	# the default (standalone/dev runs against a 3080 gateway).
+	var env_url := OS.get_environment("DSHX_GATEWAY_URL").strip_edges()
+	if env_url != "":
+		base_url = env_url.trim_suffix("/")
 	_reconnect_timer = Timer.new()
 	_reconnect_timer.one_shot = true
 	_reconnect_timer.timeout.connect(_on_reconnect_timeout)
@@ -315,10 +321,8 @@ func list_workspaces(callback: Callable) -> void:
 	_rpc("workspace.list", {}, callback)
 
 
-func create_workspace(path: String, callback: Callable) -> void:
-	_rpc("workspace.create", {"path": path}, callback)
-
-
+## Full settings mirror read; consumers derive per-namespace values from
+## `namespaces[].user` / `base` (see app.gd `_restore_language`).
 func settings_describe(callback: Callable) -> void:
 	_rpc("settings.describe", {}, callback)
 
@@ -382,20 +386,12 @@ func provider_models(profile_id: String = "", callback: Callable = Callable()) -
 	_rpc("provider.models", payload, callback)
 
 
-func settings_credentials_set(ref: String, value: String, callback: Callable = Callable()) -> void:
-	_rpc("settings.credentials.set", {"ref": ref, "value": value}, callback)
-
-
 func settings_credentials_describe(ref: String, callback: Callable = Callable()) -> void:
 	_rpc("settings.credentials.describe", {"ref": ref}, callback)
 
 
 func session_context(session_id: String, callback: Callable) -> void:
 	_rpc("session.context", {"sessionId": session_id}, callback)
-
-
-func feedback_list(session_id: String, callback: Callable) -> void:
-	_rpc("feedback.list", {"sessionId": session_id}, callback)
 
 
 func feedback_put(session_id: String, message_id: String, rating: String, note: String = "", version: String = "", callback: Callable = Callable()) -> void:
@@ -405,13 +401,6 @@ func feedback_put(session_id: String, message_id: String, rating: String, note: 
 	if version != "":
 		payload["version"] = version
 	_rpc("feedback.put", payload, callback)
-
-
-func feedback_delete(session_id: String, message_id: String, version: String = "", callback: Callable = Callable()) -> void:
-	var payload := {"sessionId": session_id, "messageId": message_id}
-	if version != "":
-		payload["version"] = version
-	_rpc("feedback.delete", payload, callback)
 
 
 func plugin_list(callback: Callable) -> void:

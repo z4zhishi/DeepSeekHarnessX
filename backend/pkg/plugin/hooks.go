@@ -6,7 +6,8 @@ package plugin
 // 本文件是文件所有者：实现
 //   - ParseHooks / LoadHooks：解析 CC 风格 hooks.json（事件 → matcher 组 → command 钩子）；
 //   - ${CLAUDE_PLUGIN_ROOT} / ${CLAUDE_PROJECT_DIR} 变量替换（parse 期）；
-//   - CommandHook 执行：shell 命令 + 每钩子超时 + 错误隔离（单个钩子失败不阻断主流程）；
+//   - CommandHook 执行：shell 命令 + CC 方言 stdin JSON 载荷 + 每钩子超时 +
+//     退出码三分（0=pass / 2=block / 其余=非阻断错误）+ 错误隔离；
 //   - Hooks.Dispatch：在某拦截点对 subject 运行匹配钩子，回调上报 invoked/result 载荷。
 //
 // hook/invoked + hook/result 事件（session/events.go:32-33 已预埋）由本包以相同字符串
@@ -270,15 +271,16 @@ func matches(m, subject string) bool {
 
 // --- 结果类型 ---
 
-// HookOutcome 是单次钩子运行的解码结果（对齐 HookOutput 的决策语义）。任一钩子失败
-// 仅记录（Err 非空 / exit 2），不阻断后续钩子与主流程。
+// HookOutcome 是单次钩子运行的解码结果（对齐 codec.ts parseHookOutput 的
+// 退出码三分语义）。任一钩子失败仅记录，不阻断后续钩子与主流程。
 type HookOutcome struct {
-	ExitCode   int
-	Decision   string // "block"(exit2) / "pass"(干净退出) / 无；Err 非空时恒 "pass"
+	ExitCode   int    // 进程退出码；进程未能启动时为 0（以 Err 非 nil 区分）
+	Decision   string // "block"(exit 2) / "pass"（干净退出与非阻断失败）
+	Reason     string // 阻断原因：exit 2 时取 stderr（对齐 codec 的 stderr→reason）
 	Stdout     string
 	Stderr     string
 	DurationMs int64
-	Err        error // 命令无法运行（缺 shell 等基础设施错误）时非 nil
+	Err        error // 非零退出/超时/命令无法运行（缺 shell 等基础设施错误）时非 nil
 }
 
 // HookInvokedPayload 是 hook/invoked 载荷。
@@ -306,11 +308,93 @@ type HookResultPayload struct {
 // onResult，让宿主持序发出 hook/invoked + hook/result 事件（按 handlerId 配对）。
 //
 // point 不受支持（非 7 个 CC 拦截点）时不运行（返回空）。UserPromptSubmit/Stop
-// 忽略 subject（其 matcher 为空，恒命中）。
+// 忽略 subject（其 matcher 为空，恒命中）。stdin 载荷由 (point, subject) 与零值
+// HookInvocation 构造——DSHX 现有分发点只提供这些信息；需要携带 prompt/
+// tool_input 等扩展字段的调用方使用 DispatchInvocation。
 func (h *Hooks) Dispatch(ctx context.Context, point, subject string, turn int,
+	onInvoked func(HookInvokedPayload), onResult func(HookResultPayload)) []HookOutcome {
+	return h.DispatchInvocation(ctx, point, subject, HookInvocation{}, turn, onInvoked, onResult)
+}
+
+// HookInvocation 聚合一次分发可得的 CC 方言 stdin 载荷字段。DSHX 分发点尚未
+// 提供的字段如实缺省（序列化时整体省略，不编造空值）——这是 CC 输入契约的
+// 当前可用子集。
+type HookInvocation struct {
+	// SessionID 是宿主会话 id（分发点未提供时为空，字段整体省略）。
+	SessionID string
+	// ToolName 是 PreToolUse/PostToolUse 的 tool_name；空时从 subject 推导
+	// （DSHX 分发点以工具名为这两个点的 matcher subject）。
+	ToolName string
+	// ToolInput 是工具实参 JSON，原样透传给钩子 stdin。
+	ToolInput json.RawMessage
+	// Prompt 是 UserPromptSubmit 的 prompt 文本。
+	Prompt string
+	// Source 是 SessionStart 的来源描述；空时从 subject 推导。
+	Source string
+	// Cwd 是钩子视角的工作区目录；空时回退解析期 ProjectDir。
+	Cwd string
+}
+
+// buildPayload 按 CC 方言构造钩子 stdin 载荷（字段名对齐 hooks-claude-code
+// 的 per-event payload 构造器：hook_event_name/cwd/session_id/tool_name/
+// tool_input/prompt/source/stop_hook_active）。
+func (h *Hooks) buildPayload(point, subject string, inv HookInvocation) map[string]any {
+	payload := map[string]any{"hook_event_name": point}
+	cwd := inv.Cwd
+	if cwd == "" {
+		cwd = h.projectDir
+	}
+	if cwd != "" {
+		payload["cwd"] = cwd
+	}
+	if inv.SessionID != "" {
+		payload["session_id"] = inv.SessionID
+	}
+	switch point {
+	case HookPointPreToolUse, HookPointPostToolUse:
+		name := inv.ToolName
+		if name == "" {
+			name = subject
+		}
+		if name != "" {
+			payload["tool_name"] = name
+		}
+		if len(inv.ToolInput) > 0 {
+			payload["tool_input"] = inv.ToolInput
+		}
+	case HookPointUserPromptSubmit:
+		if inv.Prompt != "" {
+			payload["prompt"] = inv.Prompt
+		}
+	case HookPointSessionStart:
+		src := inv.Source
+		if src == "" {
+			src = subject
+		}
+		if src != "" {
+			payload["source"] = src
+		}
+	case HookPointStop:
+		payload["stop_hook_active"] = false
+	default:
+		// SubagentStart/SubagentStop：CC 携带 agent_id/agent_type，DSHX 分发点
+		// 尚未提供——如实省略。
+	}
+	return payload
+}
+
+// DispatchInvocation 是 Dispatch 的载荷完整版：inv 中的非零字段进入钩子进程
+// 的 stdin JSON（尾随换行，对齐 runner.ts）。其余语义与 Dispatch 一致。
+func (h *Hooks) DispatchInvocation(ctx context.Context, point, subject string, inv HookInvocation, turn int,
 	onInvoked func(HookInvokedPayload), onResult func(HookResultPayload)) []HookOutcome {
 	if h == nil || !dispatchedHookPoints[point] {
 		return nil
+	}
+	stdinBody, err := json.Marshal(h.buildPayload(point, subject, inv))
+	if err != nil {
+		stdinBody = nil // 载荷序列化失败退化为空 stdin（不应发生：值为 JSON 安全类型）
+	} else {
+		stdinBody = append(stdinBody, '\n') // CC 尾随换行
 	}
 	var outcomes []HookOutcome
 	for _, g := range h.groups[point] {
@@ -319,17 +403,17 @@ func (h *Hooks) Dispatch(ctx context.Context, point, subject string, turn int,
 		}
 		for _, hook := range g.Hooks {
 			handlerID := fmt.Sprintf("%s-%d", point, h.seq.Add(1))
-			inv := HookInvokedPayload{
+			invoked := HookInvokedPayload{
 				Turn: turn, Point: point, Dialect: HookDialectClaudeCode,
 				HandlerID: handlerID,
 			}
 			if !isMatchAll(g.Pattern) {
-				inv.Matcher = g.Pattern
+				invoked.Matcher = g.Pattern
 			}
 			if onInvoked != nil {
-				onInvoked(inv)
+				onInvoked(invoked)
 			}
-			out := h.runOne(ctx, hook)
+			out := h.runOne(ctx, hook, stdinBody)
 			res := HookResultPayload{
 				Turn: turn, Point: point, HandlerID: handlerID,
 				Decision:   summarizeDecision(out),
@@ -348,8 +432,10 @@ func (h *Hooks) Dispatch(ctx context.Context, point, subject string, turn int,
 	return outcomes
 }
 
-// runOne 执行单个钩子命令（超时 + 错误隔离）。
-func (h *Hooks) runOne(ctx context.Context, hook CommandHook) HookOutcome {
+// runOne 执行单个钩子命令（超时 + 错误隔离），payload 写入其 stdin。退出码
+// 三分（对齐 codec.ts BLOCKING_EXIT_CODE）：0=pass、2=block（stderr 为 reason）、
+// 其余非零/基础设施故障=非阻断错误。
+func (h *Hooks) runOne(ctx context.Context, hook CommandHook, payload []byte) HookOutcome {
 	timeout := defaultHookTimeout
 	if hook.TimeoutSec > 0 {
 		timeout = time.Duration(hook.TimeoutSec) * time.Second
@@ -361,6 +447,9 @@ func (h *Hooks) runOne(ctx context.Context, hook CommandHook) HookOutcome {
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, shell, "-c", hook.Command)
 	cmd.Env = h.hookEnv()
+	if len(payload) > 0 {
+		cmd.Stdin = bytes.NewReader(payload)
+	}
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -372,25 +461,28 @@ func (h *Hooks) runOne(ctx context.Context, hook CommandHook) HookOutcome {
 		Stderr:     strings.TrimSpace(errBuf.String()),
 		DurationMs: dur.Milliseconds(),
 	}
-	if err != nil {
-		// 命令无法运行 / 非零退出 / 超时——非阻断，记录即可。
-		outcome.Err = err
-		outcome.Decision = "pass"
-		return outcome
-	}
-	outcome.Decision = "pass"
-	if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 2 {
-		outcome.Decision = "block"
-	}
-	outcome.ExitCode = 0
 	if cmd.ProcessState != nil {
 		outcome.ExitCode = cmd.ProcessState.ExitCode()
+	}
+	switch {
+	case err == nil:
+		outcome.Decision = "pass"
+	case outcome.ExitCode == 2:
+		// CC 阻断语义：exit 2 → block，stderr 即 reason（交由既有拦截点的
+		// hook/result 载荷与返回的 []HookOutcome 消费）。
+		outcome.Err = err
+		outcome.Decision = "block"
+		outcome.Reason = outcome.Stderr
+	default:
+		// 非阻断错误（其他退出码/超时/无法启动）：记录后放行。
+		outcome.Err = err
+		outcome.Decision = "pass"
 	}
 	return outcome
 }
 
 // summarizeDecision 把一次运行折叠为 durable decision（对齐 appendHookResult）：
-// 干净退出默认 "pass"，阻塞（退出码 2）为 "block"；基础设施错误恒 "pass"。
+// 干净退出 "pass"，exit 2 阻断为 "block"，非阻断失败亦 "pass"。
 func summarizeDecision(out HookOutcome) string { return out.Decision }
 
 // summarizeStderr 裁剪 stderr 用于 hook/result（对齐 summarizeStderr，500 字符上限）。

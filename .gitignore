@@ -5,7 +5,10 @@
 .tools/
 .idea/
 .vscode/
+.commandcode/
+.claude/
 *.iml
+%SNAP%/
 
 # 上游克隆与开发杂项（各自独立，不入库）
 /CK/

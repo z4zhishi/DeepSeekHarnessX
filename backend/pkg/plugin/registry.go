@@ -40,8 +40,8 @@ type Registry struct {
 	external  map[string]External
 	mounted   map[string]Disposer
 	hosts     map[string]*Host
-	pluginDir string            // ScanDir/Install 的插件根；.disabled 持久化于此
-	disabled  map[string]bool   // 停用名；Reconcile 跳过拉起
+	pluginDir string          // ScanDir/Install 的插件根；.disabled 持久化于此
+	disabled  map[string]bool // 停用名；Reconcile 跳过拉起
 	installed map[string][]string
 	lastErr   map[string]string
 }
@@ -49,10 +49,10 @@ type Registry struct {
 // NewRegistry 构造空注册表，注入共享的单例句柄。
 func NewRegistry(toolReg *tools.ToolRegistry, cmds *tools.CommandRegistry, bus *EventBus, logger interface{ Printf(string, ...any) }) *Registry {
 	return &Registry{
-		tools:    toolReg,
-		cmds:     cmds,
-		bus:      bus,
-		logger:   logger,
+		tools:     toolReg,
+		cmds:      cmds,
+		bus:       bus,
+		logger:    logger,
 		builtins:  map[string]Capability{},
 		external:  map[string]External{},
 		mounted:   map[string]Disposer{},
@@ -383,7 +383,10 @@ func (r *Registry) Reload(ctx context.Context, name string) {
 	if cap, ok := r.builtins[name]; ok {
 		if err := r.mountBuiltin(cap); err != nil {
 			r.logf("plugin(%s): 重载内置失败：%v", name, err)
+			r.lastErr[name] = err.Error()
+			return
 		}
+		delete(r.lastErr, name)
 		return
 	}
 	if ext, ok := r.external[name]; ok {
@@ -399,8 +402,10 @@ func (r *Registry) Reload(ctx context.Context, name string) {
 		}, r.tools, r.cmds, r.bus)
 		if err != nil {
 			r.logf("plugin(%s): reload 失败：%v", name, err)
+			r.lastErr[name] = err.Error()
 			return
 		}
+		delete(r.lastErr, name)
 		r.hosts[name] = h
 		r.mounted[name] = func() { _ = h.Close() }
 	}

@@ -28,17 +28,37 @@ type PersistSink interface {
 	GetEvents(sessionID string, fromSeq int) ([]session.SessionEnvelope, error)
 }
 
-// seedSeqFrom resumes the agent sequence counter at the stored next seq so a
-// re-opened session keeps appending contiguously (appendBatch contract).
-func seedSeqFrom(store PersistSink, id string) int64 {
+// seedSeqFrom resumes the agent counters at the stored tail so a re-opened
+// session keeps appending contiguously (appendBatch contract). Beyond the
+// next free seq it recovers the last turn number found among turn/start |
+// turn/end payloads — the restart-monotonicity seed for turnNumber, since a
+// rebuilt actor must number its first turn past everything already in the
+// durable log — and returns the scanned events so NewAgent can warm the
+// incremental log cache from this same single full read.
+func seedSeqFrom(store PersistSink, id string) (int64, int32, []session.SessionEnvelope) {
 	if store == nil {
-		return 0
+		return 0, 0, nil
 	}
 	events, err := store.GetEvents(id, 0)
 	if err != nil || len(events) == 0 {
-		return 0
+		return 0, 0, nil
 	}
-	return int64(events[len(events)-1].Seq) + 1
+	// Turn numbers are assigned monotonically, so the maximum seen equals the
+	// last boundary marker's value; scanning both marker kinds also covers
+	// logs whose tail ends mid-turn (crash-orphaned open turn).
+	var lastTurn int32
+	for i := range events {
+		switch events[i].Type {
+		case session.EventTurnStart, session.EventTurnEnd:
+			var p struct {
+				Turn int `json:"turn"`
+			}
+			if json.Unmarshal(events[i].Data, &p) == nil && p.Turn > int(lastTurn) {
+				lastTurn = int32(p.Turn)
+			}
+		}
+	}
+	return int64(events[len(events)-1].Seq) + 1, lastTurn, events
 }
 
 // Agent runs a dedicated event-driven Actor loop for a single conversation session.
@@ -97,6 +117,15 @@ type Agent struct {
 	// first eligible user message (upstream session-title first-prompt mode).
 	titleDone atomic.Bool
 
+	// Incremental session-log cache: one full durable read at construction,
+	// then fromSeq top-ups per access; invalidated after compaction rewrites
+	// the log. evMu guards it because EmitEvent appends also arrive from
+	// non-actor goroutines (schedule dispatcher, gateway/TUI command surfaces).
+	evMu       sync.Mutex
+	logCache   []session.SessionEnvelope // read-only mirror of the durable log tail
+	cacheWarm  bool                      // false until first full load / after invalidation
+	lastCached int                       // highest seq present in logCache (-1 when empty)
+
 	// Turn/step lifecycle state machine (upstream loop contract):
 	// turn/start -> step/start -> step/end -> ... -> turn/end. Illegal jumps
 	// (step events outside a turn, turn/start inside a live turn, turn/end
@@ -135,7 +164,19 @@ func NewAgent(
 		ctx:          ctx,
 		cancelFunc:   cancel,
 	}
-	a.seqCounter.Store(seedSeqFrom(store, header.ID))
+	seqSeed, lastTurn, warmEvents := seedSeqFrom(store, header.ID)
+	a.seqCounter.Store(seqSeed)
+	// Restart monotonicity: the rebuilt actor continues past every turn the
+	// durable log already contains. stepNumber intentionally restarts at 0 —
+	// each turn re-zeroes it when the turn begins.
+	a.turnNumber.Store(lastTurn)
+	if len(warmEvents) > 0 {
+		a.evMu.Lock()
+		a.logCache = warmEvents
+		a.lastCached = warmEvents[len(warmEvents)-1].Seq
+		a.cacheWarm = true
+		a.evMu.Unlock()
+	}
 	// Session-local reminder dispatcher: due schedules wake the agent with a
 	// framed follow-up message and append the dispatch events through the
 	// machine (upstream ScheduleRuntime composition).
@@ -196,12 +237,14 @@ func (a *Agent) EmitEvent(eventType string, payload any, surfaceOp ...*session.S
 	}
 	// Boundary events carry the state machine's assigned numbers; the caller
 	// passes zero-valued placeholders so the machine stays the single source
-	// of turn/step identity.
+	// of turn/step identity. Start events read POST-transition values (the
+	// numbers validateTransition just assigned — pre-values are always 0 for
+	// them); end events keep their pre-transition identity.
 	switch eventType {
 	case session.EventTurnStart:
-		payload = session.TurnStartPayload{Turn: preTurn}
+		payload = session.TurnStartPayload{Turn: a.activeTurn}
 	case session.EventStepStart:
-		payload = session.StepStartPayload{Turn: preTurn, Step: preStep}
+		payload = session.StepStartPayload{Turn: a.activeTurn, Step: a.activeStep}
 	case session.EventStepEnd:
 		payload = session.StepEndPayload{Turn: preTurn, Step: preStep}
 	case session.EventTurnEnd:
@@ -251,6 +294,12 @@ func (a *Agent) EmitEvent(eventType string, payload any, surfaceOp ...*session.S
 	}
 	a.subMu.RUnlock()
 
+	// Mirror the persisted envelope into the incremental session-log cache
+	// (best-effort continuity for derivation/compaction/title reads; a
+	// late append behind a concurrent store top-up is dropped by the seq
+	// guard in cacheAppend).
+	a.cacheAppend(env)
+
 	return env, nil
 }
 
@@ -265,29 +314,29 @@ func (a *Agent) validateTransition(eventType string) error {
 	switch eventType {
 	case session.EventTurnStart:
 		if a.activeTurn != 0 {
-			return fmt.Errorf("invalid transition: turn/start while turn %d is active", a.activeTurn)
+			return fmt.Errorf("%w: turn/start while turn %d is active", errInvalidTransition, a.activeTurn)
 		}
 		a.activeTurn = int(a.turnNumber.Add(1))
 		a.activeStep = 0
 	case session.EventTurnEnd:
 		if a.activeTurn == 0 {
-			return fmt.Errorf("invalid transition: turn/end with no active turn")
+			return fmt.Errorf("%w: turn/end with no active turn", errInvalidTransition)
 		}
 		if a.activeStep != 0 {
-			return fmt.Errorf("invalid transition: turn/end while step %d is open", a.activeStep)
+			return fmt.Errorf("%w: turn/end while step %d is open", errInvalidTransition, a.activeStep)
 		}
 		a.activeTurn = 0
 	case session.EventStepStart:
 		if a.activeTurn == 0 {
-			return fmt.Errorf("invalid transition: step/start with no active turn")
+			return fmt.Errorf("%w: step/start with no active turn", errInvalidTransition)
 		}
 		if a.activeStep != 0 {
-			return fmt.Errorf("invalid transition: step/start while step %d is open", a.activeStep)
+			return fmt.Errorf("%w: step/start while step %d is open", errInvalidTransition, a.activeStep)
 		}
 		a.activeStep = int(a.stepNumber.Add(1))
 	case session.EventStepEnd:
 		if a.activeStep == 0 {
-			return fmt.Errorf("invalid transition: step/end with no active step")
+			return fmt.Errorf("%w: step/end with no active step", errInvalidTransition)
 		}
 		a.activeStep = 0
 	}
@@ -336,6 +385,132 @@ func (a *Agent) emitRaw(env *session.SessionEnvelope) error {
 	return nil
 }
 
+// errInvalidTransition marks a lifecycle state-machine rejection raised by
+// validateTransition: the event was refused BEFORE any machine mutation or
+// durable append, so tolerating it carries no ghost-state risk (the pre-step
+// interrupt drain relies on this when no step is open). Persistence failures
+// carry no such marker and drive boundary-event escalation instead.
+var errInvalidTransition = errors.New("invalid transition")
+
+// emitBoundary appends a turn/step lifecycle boundary event (turn/start,
+// step/end, turn/end). The transition machine mutates before AppendEvents, so
+// a persistence failure would leave later events referencing a turn/step the
+// log never admitted; on such a failure this converges the open turn with an
+// error reason (finishTurnReason) and reports false so the caller stops
+// deriving follow-up events for the round. State-machine rejections are
+// tolerated (reports true) to preserve the historical swallow semantics —
+// nothing was mutated or written when they fire.
+func (a *Agent) emitBoundary(eventType string, payload any) bool {
+	_, err := a.EmitEvent(eventType, payload)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, errInvalidTransition) {
+		return true
+	}
+	a.finishTurnReason("error", fmt.Sprintf("boundary %s persist failed: %v", eventType, err))
+	return false
+}
+
+// cacheAppend mirrors one successfully persisted envelope into the
+// incremental session-log cache. A cold cache skips the append (its next
+// reader full-loads anyway); an append that arrives behind a concurrent
+// reader which already topped up past this seq from the store is dropped by
+// the seq guard.
+func (a *Agent) cacheAppend(env *session.SessionEnvelope) {
+	if env == nil {
+		return
+	}
+	a.evMu.Lock()
+	defer a.evMu.Unlock()
+	if !a.cacheWarm || env.Seq <= a.lastCached {
+		return
+	}
+	a.logCache = append(a.logCache, *env)
+	a.lastCached = env.Seq
+}
+
+// invalidateLogCache drops the incremental session-log cache: compaction
+// rewrites (shadowed source rows + replacement events) make every mirrored
+// entry suspect the moment the transaction attempts its first bracket, so
+// the next reader pays one full reload of the rewritten log.
+func (a *Agent) invalidateLogCache() {
+	a.evMu.Lock()
+	a.logCache = nil
+	a.lastCached = -1
+	a.cacheWarm = false
+	a.evMu.Unlock()
+}
+
+// cachedSessionEvents returns the durable session log through the incremental
+// cache: one full load when cold, otherwise a fromSeq top-up past the last
+// mirrored seq (PersistSink.GetEvents is fromSeq-inclusive). A failed top-up
+// falls back to one full reload before serving the possibly-stale snapshot.
+// Callers must treat the returned slice as read-only.
+func (a *Agent) cachedSessionEvents() []session.SessionEnvelope {
+	a.evMu.Lock()
+	defer a.evMu.Unlock()
+	if !a.cacheWarm {
+		events, err := a.persist.GetEvents(a.Header.ID, 0)
+		if err != nil {
+			return nil
+		}
+		a.logCache = events
+		a.lastCached = -1
+		if len(events) > 0 {
+			a.lastCached = events[len(events)-1].Seq
+		}
+		a.cacheWarm = true
+		return a.logCache
+	}
+	events, err := a.persist.GetEvents(a.Header.ID, a.lastCached+1)
+	if err != nil {
+		if events, err = a.persist.GetEvents(a.Header.ID, 0); err != nil {
+			return a.logCache
+		}
+		a.logCache = events
+		a.lastCached = -1
+		if len(events) > 0 {
+			a.lastCached = events[len(events)-1].Seq
+		}
+		return a.logCache
+	}
+	for i := range events {
+		if events[i].Seq <= a.lastCached {
+			continue // late/duplicated EmitEvent append already covered by the store read
+		}
+		a.logCache = append(a.logCache, events[i])
+		a.lastCached = events[i].Seq
+	}
+	return a.logCache
+}
+
+// loadSessionLog returns the full session log for derivation-style consumers,
+// preserving the historical source precedence: the durable store (via the
+// incremental cache) when a persist sink exists, else the ring window, else
+// the legacy segment log. Callers must treat the result as read-only.
+func (a *Agent) loadSessionLog() []session.SessionEnvelope {
+	if a.persist != nil {
+		if evs := a.cachedSessionEvents(); len(evs) > 0 {
+			return evs
+		}
+	}
+	if a.RingBuf != nil {
+		if ptrs := a.RingBuf.GetSince(0); len(ptrs) > 0 {
+			out := make([]session.SessionEnvelope, len(ptrs))
+			for i, p := range ptrs {
+				out[i] = *p
+			}
+			return out
+		}
+	}
+	if a.SegmentLog != nil {
+		_, evs, _ := a.SegmentLog.ReadAll()
+		return evs
+	}
+	return nil
+}
+
 // maybeCompact runs the idle-session compaction pressure check after a
 // completed turn: it selects a head-anchored balanced range and runs the
 // durable compaction transaction through emitRaw (brackets are log-only).
@@ -344,13 +519,12 @@ func (a *Agent) maybeCompact() {
 		return
 	}
 	var log []session.SessionEnvelope
-	var err error
 	if a.persist != nil {
-		log, err = a.persist.GetEvents(a.Header.ID, 0)
+		log = a.cachedSessionEvents()
 	} else if a.SegmentLog != nil {
 		_, log, _ = a.SegmentLog.ReadAll()
 	}
-	if err != nil || len(log) == 0 {
+	if len(log) == 0 {
 		return
 	}
 	fold, err := session.FoldSurface(eventPointers(log), 0)
@@ -369,6 +543,10 @@ func (a *Agent) maybeCompact() {
 		func(env *session.SessionEnvelope) error { return a.emitRaw(env) },
 		compaction.CompactTransactionOptions{Start: span.Start, End: span.End},
 	)
+	// The transaction rewrites/shadows the durable log, so the incremental
+	// cache is stale regardless of the outcome — invalidate unconditionally;
+	// the next reader full-reloads the rewritten log.
+	a.invalidateLogCache()
 }
 
 // eventPointers converts a value slice to pointers for FoldSurface.
@@ -514,8 +692,15 @@ turns:
 			a.stepNumber.Store(0)
 			turnCtx := a.deriveTurnCtx()
 
-			// 1. turn/start — the transition machine assigns the turn number
-			_, _ = a.EmitEvent(session.EventTurnStart, session.TurnStartPayload{})
+			// 1. turn/start — the transition machine assigns the turn number.
+			// A persistence failure here leaves the machine advanced past a
+			// start that never reached the log; converge the turn instead of
+			// deriving user/message and steps against a ghost turn.
+			if !a.emitBoundary(session.EventTurnStart, session.TurnStartPayload{}) {
+				a.isRunning.Store(false)
+				a.clearTurnCtx()
+				continue turns
+			}
 			a.stateMu.Lock()
 			turn := a.activeTurn
 			a.stateMu.Unlock()
@@ -529,13 +714,24 @@ turns:
 			// Step loop
 			turnFinished := false
 			turnClosed := false
+			// stickyMaxTokens latches a max-tokens finish seen in any step of
+			// this turn: later steps still run normally, but the turn closes
+			// as max-tokens instead of a misleading completed.
+			stickyMaxTokens := false
 			for !turnFinished {
 				// next-step priority interruption: a queued user block aborts
 				// the current step (closing it) and immediately starts a new
 				// step driven by that prompt.
 				select {
 				case nextBlock := <-a.nextStepChan:
-					_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{})
+					// Boundary check: escalate only persistence failures — a
+					// transition rejection here (interrupt drained between
+					// steps, no open step) is tolerated as before.
+					if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{}) {
+						a.isRunning.Store(false)
+						a.clearTurnCtx()
+						continue turns
+					}
 					_, _ = a.EmitEvent(session.EventUserMessage, session.UserMessagePayload{
 						ID:      fmt.Sprintf("step-%d", time.Now().UnixNano()),
 						Role:    "user",
@@ -567,25 +763,12 @@ turns:
 				// Derive messages from the full session history: the durable
 				// store is authoritative (all hosts persist), the ring is the
 				// fallback for in-memory sessions (ACP), and the segment log
-				// remains the legacy path. Without this, real sessions would
-				// send an empty history to the model on every step.
-				var events []session.SessionEnvelope
-				if a.persist != nil {
-					if evs, err := a.persist.GetEvents(a.Header.ID, 0); err == nil && len(evs) > 0 {
-						events = evs
-					}
-				}
-				if len(events) == 0 && a.RingBuf != nil {
-					if ptrs := a.RingBuf.GetSince(0); len(ptrs) > 0 {
-						events = make([]session.SessionEnvelope, len(ptrs))
-						for i, p := range ptrs {
-							events[i] = *p
-						}
-					}
-				}
-				if len(events) == 0 && a.SegmentLog != nil {
-					_, events, _ = a.SegmentLog.ReadAll()
-				}
+				// remains the legacy path. The store leg goes through the
+				// incremental cache (one construction-time full load, then
+				// fromSeq top-ups) instead of a full scan per step. Without
+				// this, real sessions would send an empty history to the
+				// model on every step.
+				events := a.loadSessionLog()
 				derivedMsgs, _ := session.DeriveMessages(events)
 
 				// Tool declarations
@@ -684,8 +867,12 @@ turns:
 								streamDone = true
 								break
 							}
-							_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step})
-							_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
+							if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step}) {
+								llmFailed = true
+								streamDone = true
+								break
+							}
+							_ = a.emitBoundary(session.EventTurnEnd, session.TurnEndPayload{
 								Turn:   turn,
 								Reason: session.TurnEndReason{Kind: "error", Message: err.Error()},
 							})
@@ -726,9 +913,34 @@ turns:
 				}
 
 				// Assembled assistant message
-				blocks, usage, _ := assembler.Result()
+				blocks, usage, finishReason := assembler.Result()
 				if interruptedByNextStep {
-					_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step})
+					// Persist the truncated reply before closing the step so
+					// the log carries a terminal assistant/message for the
+					// abandoned chunk sequence instead of orphan chunks and a
+					// lost token-usage record. An interruption during an
+					// uncommitted (still-open) block leaves no committed
+					// blocks; then nothing is emitted, as before.
+					if len(blocks) > 0 {
+						_, _ = a.EmitEvent(session.EventAssistantMessage, session.AssistantMessagePayload{
+							Turn: turn,
+							Step: step,
+							Message: session.WireMessage{
+								ID:      fmt.Sprintf("asst-%d-%d", turn, step),
+								Role:    "assistant",
+								Content: blocks,
+								Source:  session.MessageSource{Kind: "model", Provider: a.ModelName, Model: a.ModelName},
+							},
+							Usage:       usage,
+							Interrupted: true,
+						}, &session.AppendSurfaceOp)
+					}
+					if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step}) {
+						a.isRunning.Store(false)
+						a.clearTurnCtx()
+						turnClosed = true
+						break
+					}
 					if pendingNextStep != nil {
 						_, _ = a.EmitEvent(session.EventUserMessage, session.UserMessagePayload{
 							ID:      fmt.Sprintf("step-%d", time.Now().UnixNano()),
@@ -738,6 +950,37 @@ turns:
 						}, &session.AppendSurfaceOp)
 					}
 					continue
+				}
+				// Provider finish routing (upstream maps wire finish reasons
+				// onto this vocabulary):
+				//   max-tokens — sticky: this round still executes normally
+				//     (assistant message, tools), but the turn ends as
+				//     max-tokens instead of completed;
+				//   error — the provider terminated abnormally (empty
+				//     response, content filter): converge the turn now rather
+				//     than reporting completed.
+				if finishReason == "max-tokens" {
+					stickyMaxTokens = true
+				}
+				if finishReason == "error" {
+					if len(blocks) > 0 {
+						_, _ = a.EmitEvent(session.EventAssistantMessage, session.AssistantMessagePayload{
+							Turn: turn,
+							Step: step,
+							Message: session.WireMessage{
+								ID:      fmt.Sprintf("asst-%d-%d", turn, step),
+								Role:    "assistant",
+								Content: blocks,
+								Source:  session.MessageSource{Kind: "model", Provider: a.ModelName, Model: a.ModelName},
+							},
+							Usage: usage,
+						}, &session.AppendSurfaceOp)
+					}
+					a.finishTurnReason("error", fmt.Sprintf("model finished step %d with reason %q", step, finishReason))
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					turnClosed = true
+					break
 				}
 				asstPayload := session.AssistantMessagePayload{
 					Turn: turn,
@@ -839,26 +1082,37 @@ turns:
 					turnFinished = true
 				}
 
-				_, _ = a.EmitEvent(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step})
+				if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step}) {
+					a.isRunning.Store(false)
+					a.clearTurnCtx()
+					turnClosed = true
+				}
 			}
 
 			if !turnClosed {
-				// turn/end
-				_, _ = a.EmitEvent(session.EventTurnEnd, session.TurnEndPayload{
+				// turn/end — the reason reflects a sticky max-tokens ceiling
+				// hit in any step of this turn (merge-extensible kind).
+				endKind := "completed"
+				if stickyMaxTokens {
+					endKind = "max-tokens"
+				}
+				turnEndOK := a.emitBoundary(session.EventTurnEnd, session.TurnEndPayload{
 					Turn:   turn,
-					Reason: session.TurnEndReason{Kind: "completed"},
+					Reason: session.TurnEndReason{Kind: endKind},
 				})
 				a.isRunning.Store(false)
-				// One-shot automatic session title on the first completed turn.
-				// Best-effort and never load-bearing: GenerateTitle already degrades
-				// any LLM failure to the deterministic fallback (or "" when there is
-				// no eligible user text), so a failed title never surfaces as an
-				// error here. nil adapter / empty log both emit a no-op title event.
-				if a.AutoTitle && a.titleDone.CompareAndSwap(false, true) {
-					a.generateSessionTitle()
+				if turnEndOK {
+					// One-shot automatic session title on the first completed turn.
+					// Best-effort and never load-bearing: GenerateTitle already degrades
+					// any LLM failure to the deterministic fallback (or "" when there is
+					// no eligible user text), so a failed title never surfaces as an
+					// error here. nil adapter / empty log both emit a no-op title event.
+					if a.AutoTitle && a.titleDone.CompareAndSwap(false, true) {
+						a.generateSessionTitle()
+					}
+					// Idle-session compaction pressure check (log-only brackets).
+					a.maybeCompact()
 				}
-				// Idle-session compaction pressure check (log-only brackets).
-				a.maybeCompact()
 			}
 			a.clearTurnCtx()
 		}
@@ -870,23 +1124,7 @@ turns:
 // from the caller's perspective; a nil adapter or empty log simply yields an
 // empty-title no-op event, matching upstream's silent title service.
 func (a *Agent) generateSessionTitle() {
-	var events []session.SessionEnvelope
-	if a.persist != nil {
-		if evs, err := a.persist.GetEvents(a.Header.ID, 0); err == nil && len(evs) > 0 {
-			events = evs
-		}
-	}
-	if len(events) == 0 && a.RingBuf != nil {
-		if ptrs := a.RingBuf.GetSince(0); len(ptrs) > 0 {
-			events = make([]session.SessionEnvelope, len(ptrs))
-			for i, p := range ptrs {
-				events[i] = *p
-			}
-		}
-	}
-	if len(events) == 0 && a.SegmentLog != nil {
-		_, events, _ = a.SegmentLog.ReadAll()
-	}
+	events := a.loadSessionLog()
 	// Eligible human messages that are durable at this point.
 	messages := CollectTitleMessages(events, -1)
 	seqs := make([]int, 0, len(messages))
@@ -944,6 +1182,13 @@ var retryableCodes = map[string]bool{
 	"SERVER":     true,
 	"TIMEOUT":    true,
 	"TRANSPORT":  true,
+	// EMPTY_RESPONSE is admitted by policy for upstream parity, but no llm
+	// adapter currently produces an empty-response ERROR SENTINEL: the
+	// deepseek adapter maps stop-with-no-blocks onto a ChunkFinish reason
+	// "error" on the chunk channel, which the loop's finish routing above
+	// converges as an error turn — so this code stays unreachable until
+	// pkg/llm grows the sentinel (classifyLlmError can then map it).
+	"EMPTY_RESPONSE": true,
 }
 
 // isRetryableCode reports whether a failure code qualifies for a normal retry.

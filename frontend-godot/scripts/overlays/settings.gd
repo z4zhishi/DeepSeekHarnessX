@@ -64,6 +64,7 @@ func setup(client: DshClient) -> void:
 
 func open() -> void:
 	visible = true
+	_fade_open()
 	_apply_style()
 	_apply_strings()
 	_sync_appearance()
@@ -73,8 +74,20 @@ func open() -> void:
 
 
 func close() -> void:
-	visible = false
+	_fade_close()
 	closed.emit()
+
+
+## §4 minimal motion: quick opacity fade on open/close, layout never animated.
+func _fade_open() -> void:
+	DshTokens.fade_in(_backdrop, DshTokens.MOTION_BASE)
+	DshTokens.fade_in(_card, DshTokens.MOTION_BASE)
+
+
+func _fade_close() -> void:
+	DshTokens.fade_out(_card, DshTokens.MOTION_QUICK, func() -> void: visible = false)
+	if _backdrop != null:
+		DshTokens.fade_out(_backdrop, DshTokens.MOTION_QUICK, Callable())
 
 
 func _build() -> void:

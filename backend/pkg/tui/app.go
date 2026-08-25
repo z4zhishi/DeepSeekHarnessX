@@ -83,7 +83,7 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 			return
 		case req := <-approvalCh:
 			ui.write(formatApproval(req))
-			if !readApproval(inputCh, ui, req) {
+			if !readApproval(inputCh, interrupt, ui, req) {
 				return
 			}
 		case line, ok := <-inputCh:
@@ -153,19 +153,29 @@ func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm
 	}
 }
 
-func readApproval(inputCh <-chan string, ui *UI, req approvalRequest) bool {
+// readApproval waits for an approval decision line. It also listens on the
+// interrupt channel so Ctrl+C during the approval wait maps to ApprovalCancel
+// instead of deadlocking the user (who would otherwise have to type 'c').
+// Returning false tells the main loop to exit the TUI.
+func readApproval(inputCh <-chan string, interrupt <-chan os.Signal, ui *UI, req approvalRequest) bool {
 	for {
-		line, ok := <-inputCh
-		if !ok {
+		select {
+		case <-interrupt:
 			req.decision <- tools.ApprovalCancel
+			ui.write("\n(Cancelled by Ctrl+C — exiting DSHX TUI.)\n")
 			return false
+		case line, ok := <-inputCh:
+			if !ok {
+				req.decision <- tools.ApprovalCancel
+				return false
+			}
+			ui.consumed()
+			if d, ok := parseApproval(line, req.options); ok {
+				req.decision <- d
+				return true
+			}
+			ui.write("  无效选择，请输入 y / n / c 或选项编号/id\n" + ColorBold + "? " + ColorReset)
 		}
-		ui.consumed()
-		if d, ok := parseApproval(line, req.options); ok {
-			req.decision <- d
-			return true
-		}
-		ui.write("  无效选择，请输入 y / n / c 或选项编号/id\n" + ColorBold + "? " + ColorReset)
 	}
 }
 
