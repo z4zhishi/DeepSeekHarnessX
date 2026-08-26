@@ -6,6 +6,7 @@ class_name PlanCard
 @onready var icon_rect: TextureRect = %Icon
 
 var _data: Dictionary = {}
+var _applying_style: bool = false
 
 
 func _ready() -> void:
@@ -15,7 +16,7 @@ func _ready() -> void:
 
 
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_THEME_CHANGED:
+	if what == NOTIFICATION_THEME_CHANGED and not _applying_style:
 		_apply_style()
 		_refresh()
 
@@ -31,6 +32,9 @@ func setup(data: Dictionary) -> void:
 
 
 func _apply_style() -> void:
+	if _applying_style:
+		return
+	_applying_style = true
 	add_theme_stylebox_override("panel", DshTokens.box(
 		DshTokens.bg_layer2(),
 		DshTokens.RADIUS_MD,
@@ -38,15 +42,20 @@ func _apply_style() -> void:
 		1,
 		Vector4(12, 8, 12, 8)
 	))
-	header_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
-	body_label.bbcode_enabled = true
-	body_label.fit_content = true
-	body_label.scroll_active = false
-	body_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	body_label.add_theme_font_size_override("normal_font_size", DshTokens.FONT_CAPTION)
+	if header_label != null:
+		header_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
+	if body_label != null:
+		body_label.bbcode_enabled = true
+		body_label.fit_content = true
+		body_label.scroll_active = false
+		body_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		body_label.add_theme_font_size_override("normal_font_size", DshTokens.FONT_CAPTION)
+	_applying_style = false
 
 
 func _refresh() -> void:
+	if header_label == null or body_label == null:
+		return
 	var active := bool(_data.get("active", false))
 	if icon_rect:
 		icon_rect.modulate = DshTokens.success() if active else DshTokens.text_tertiary()

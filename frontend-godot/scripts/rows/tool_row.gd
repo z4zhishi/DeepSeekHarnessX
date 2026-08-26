@@ -24,6 +24,8 @@ var _view: Dictionary = {}
 var _status: String = "running"
 var _expanded: bool = false
 
+const OUT_CAP := 24000
+
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_THEME_CHANGED:
@@ -92,8 +94,8 @@ func bind(node: Dictionary) -> void:
 	var p: Dictionary = node.get("payload", {}) if node.get("payload") is Dictionary else {}
 	_call_id = str(p.get("callId", ""))
 	_name = str(p.get("name", ""))
-	_arguments = str(p.get("arguments", ""))
-	_output = str(p.get("output", ""))
+	_arguments = _cap_text(str(p.get("arguments", "")), OUT_CAP)
+	_output = _cap_text(str(p.get("output", "")), OUT_CAP)
 	_view = p.get("view", {}) if p.get("view") is Dictionary else {}
 	_status = str(p.get("status", "running"))
 	_expanded = bool(p.get("expanded", false))
@@ -178,31 +180,53 @@ func _fill_expand() -> void:
 	var pretty := _pretty(_arguments)
 	in_body.text = "[code]%s[/code]" % DshMarkdown.escape(pretty)
 	in_body.add_theme_color_override("default_color", DshTokens.text_secondary())
-	for c in out_host.get_children():
-		out_host.remove_child(c)
-		c.queue_free()
+	in_body.fit_content = false
+	in_body.scroll_active = true
+	in_body.custom_minimum_size.y = 88.0
 	var kind := str(_view.get("kind", ""))
 	if kind == "diff":
-		var card: DiffBlock = SCENE_DIFF.instantiate()
-		out_host.add_child(card)
+		var card: DiffBlock
+		if out_host.get_child_count() == 1 and out_host.get_child(0) is DiffBlock:
+			card = out_host.get_child(0) as DiffBlock
+		else:
+			_clear_out()
+			card = SCENE_DIFF.instantiate()
+			out_host.add_child(card)
 		card.setup_from_view(_view)
 	elif kind == "terminal":
-		var card: TerminalBlock = SCENE_TERM.instantiate()
-		out_host.add_child(card)
+		var card: TerminalBlock
+		if out_host.get_child_count() == 1 and out_host.get_child(0) is TerminalBlock:
+			card = out_host.get_child(0) as TerminalBlock
+		else:
+			_clear_out()
+			card = SCENE_TERM.instantiate()
+			out_host.add_child(card)
 		card.setup_from_view(_view)
 	else:
-		var rtl := RichTextLabel.new()
-		rtl.bbcode_enabled = true
-		rtl.fit_content = true
-		rtl.scroll_active = false
-		rtl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		rtl.selection_enabled = true
-		rtl.add_theme_font_override("mono_font", DshThemeBuilder.code_font())
-		rtl.add_theme_font_size_override("normal_font_size", DshTokens.FONT_CODE)
+		var rtl: RichTextLabel
+		if out_host.get_child_count() == 1 and out_host.get_child(0) is RichTextLabel:
+			rtl = out_host.get_child(0) as RichTextLabel
+		else:
+			_clear_out()
+			rtl = RichTextLabel.new()
+			rtl.bbcode_enabled = true
+			rtl.fit_content = false
+			rtl.scroll_active = true
+			rtl.custom_minimum_size.y = 160.0
+			rtl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			rtl.selection_enabled = true
+			rtl.add_theme_font_override("mono_font", DshThemeBuilder.code_font())
+			rtl.add_theme_font_size_override("normal_font_size", DshTokens.FONT_CODE)
+			out_host.add_child(rtl)
 		var out := _output if _output != "" else str(_view.get("text", ""))
 		rtl.text = "[code]%s[/code]" % DshMarkdown.escape(out)
 		rtl.add_theme_color_override("default_color", DshTokens.text_secondary())
-		out_host.add_child(rtl)
+
+
+func _clear_out() -> void:
+	for c in out_host.get_children():
+		out_host.remove_child(c)
+		c.queue_free()
 
 
 func _pretty(json_str: String) -> String:
@@ -227,6 +251,13 @@ func _view_text() -> String:
 	if kind == "diff":
 		return str(_view.get("text", ""))
 	return str(_view.get("text", _output))
+
+
+func _cap_text(s: String, cap: int) -> String:
+	if s.length() <= cap:
+		return s
+	var keep := cap / 2
+	return s.substr(0, keep) + "\n…\n" + s.substr(s.length() - keep)
 
 
 func _t(key: String, fallback: String) -> String:

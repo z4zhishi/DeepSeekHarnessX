@@ -290,6 +290,30 @@ func (s *JsonlStore) PutSession(meta *session.SessionHeader) error {
 	return s.materialize(meta, nil)
 }
 
+func (s *JsonlStore) DeleteSession(sessionID string) error {
+	// Best-effort: remove any matching jsonl file across workspace dirs.
+	if s == nil || sessionID == "" {
+		return nil
+	}
+	var firstErr error
+	_ = filepath.Walk(s.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".jsonl") && !strings.HasSuffix(path, ".jsonl.zstd") {
+			return nil
+		}
+		if !strings.Contains(filepath.Base(path), sessionID) {
+			return nil
+		}
+		if rmErr := os.Remove(path); rmErr != nil && firstErr == nil {
+			firstErr = rmErr
+		}
+		return nil
+	})
+	return firstErr
+}
+
 // materialize atomically writes the header + first batch: temp-write, fsync,
 // then publish to the final path. Refuses to publish over an existing log.
 func (s *JsonlStore) materialize(meta *session.SessionHeader, events []*session.SessionEnvelope) error {

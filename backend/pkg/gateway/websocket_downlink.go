@@ -23,12 +23,16 @@ var upgrader = websocket.Upgrader{
 // downlinkSendBuffer is the per-connection outbound frame backlog. Beyond this
 // depth a slow consumer starts shedding frames instead of stalling every agent
 // pump broadcasting through the hub (mux streams have store replay for
-// catch-up; host frames are transient lifecycle notices).
-const downlinkSendBuffer = 512
+// catch-up; host frames are transient lifecycle notices). 4096 (raised from
+// 512) absorbs a tool-result burst that the GUI drains across several frames,
+// so a slow main thread no longer sheds mid-stream host frames.
+const downlinkSendBuffer = 4096
 
 // downlinkWriteTimeout bounds each frame write so a dead TCP peer cannot pin
-// the per-connection writer goroutine forever.
-const downlinkWriteTimeout = 10 * time.Second
+// the per-connection writer goroutine forever. 30s (raised from 10s) tolerates
+// a GUI main-thread stall (JSON.parse + chat rebind) without force-closing the
+// socket and forcing a reconnect churn.
+const downlinkWriteTimeout = 30 * time.Second
 
 // downlinkConn couples one WebSocket with a single-writer outbound queue.
 // gorilla/websocket forbids concurrent WriteMessage on one conn; serializing

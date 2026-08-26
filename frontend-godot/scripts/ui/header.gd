@@ -4,6 +4,7 @@ class_name HeaderBar
 signal tab_changed(name: String)
 signal jobs_pressed
 signal model_selected(id: String)
+signal param_effort_changed(effort: String)
 
 const HEADER_COMPACT := 1180.0
 
@@ -23,6 +24,10 @@ const HEADER_COMPACT := 1180.0
 
 var _syncing_models := false
 var _tab := "chat"
+var _param_btn: MenuButton = null
+var _param_popup: PopupMenu = null
+var _effort_opt: OptionButton = null
+var _effort := "high"
 
 func _ready() -> void:
 	var group := ButtonGroup.new()
@@ -44,6 +49,7 @@ func _ready() -> void:
 	apply_tokens()
 	_apply_strings()
 	set_plan_active(false)
+	_build_param_popup()
 	call_deferred("_refresh_model_visibility")
 	call_deferred("_apply_compact")
 
@@ -62,11 +68,17 @@ func apply_tokens() -> void:
 	_ctx_label.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
 	DshIcons.apply(_plan_icon, "plan", 14.0)
 	DshIcons.apply(_jobs_icon, "jobs", 14.0)
-	_plan.add_theme_stylebox_override("panel", DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, DshTokens.success(), 1, Vector4(8, 2, 8, 2)))
+	var plan_bg := DshTokens.bg_layer2()
+	plan_bg.a = 0.88
+	var plan_box := DshTokens.box(plan_bg, DshTokens.RADIUS_PILL, DshTokens.success(), 1, Vector4(10, 3, 10, 3))
+	plan_box.shadow_color = DshTokens.shadow_tinted()
+	plan_box.shadow_size = 6
+	_plan.add_theme_stylebox_override("panel", plan_box)
 	_plan_label.add_theme_color_override("font_color", DshTokens.success())
 	_plan_label.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
 	_apply_strings()
 	_apply_compact()
+	_paint_tabs()
 
 
 func set_title(text: String) -> void:
@@ -108,17 +120,41 @@ func set_models(models: Array, selected: String) -> void:
 		_models.disabled = true
 	_syncing_models = false
 	_refresh_model_visibility()
+	_refresh_param_popup()
 
 
 func _refresh_model_visibility() -> void:
-	# §5: the Header "model" surface shows whenever the model list is non-empty;
-	# it only hides when the bar goes compact.
-	_models.visible = _models.item_count > 0 and not is_compact()
+	# §5: the Header "model" surface shows whenever the model list is non-empty.
+	# Compact 态不再整体隐藏：保留缩写（取 id 末段，如 deepseek-v4-flash →
+	# v4-flash），模型身份在任何宽度下都可达。
+	_models.visible = _models.item_count > 0
+	if _models.visible and is_compact():
+		var id := str(_models.get_item_metadata(_models.selected))
+		if id == "":
+			id = _models.text
+		_models.text = _compact_model_text(id)
+		_models.tooltip_text = id
+	elif _models.visible:
+		var full := ""
+		if _models.selected >= 0 and _models.selected < _models.item_count:
+			full = str(_models.get_item_metadata(_models.selected))
+		if full == "":
+			full = _models.text
+		_models.tooltip_text = full if full != "" else _t("common.model", "Model")
 
 
-func set_context(pressure: float, label: String) -> void:
-	_ctx_bar.value = clampf(pressure, 0.0, 1.0)
-	_ctx_label.text = label if label != "" else ("%d%%" % int(round(clampf(pressure, 0.0, 1.0) * 100.0)))
+func set_context(pressure: float, label: String, detail: String = "") -> void:
+	pressure = clampf(pressure, 0.0, 1.0)
+	_ctx_bar.value = pressure
+	_ctx_label.text = label if label != "" else ("%d%%" % int(round(pressure * 100.0)))
+	_ctx_label.tooltip_text = detail
+	var fill := DshTokens.accent() if pressure < 0.8 else (DshTokens.warn() if pressure < 0.95 else DshTokens.danger())
+	var bg := DshTokens.bg_layer2()
+	var fill_box := DshTokens.box(fill, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(0, 0, 0, 0))
+	fill_box.shadow_color = fill
+	fill_box.shadow_size = 0 if pressure < 0.7 else 6
+	_ctx_bar.add_theme_stylebox_override("fill", fill_box)
+	_ctx_bar.add_theme_stylebox_override("background", DshTokens.box(bg, DshTokens.RADIUS_PILL, DshTokens.border_l1(), 1, Vector4(0, 0, 0, 0)))
 
 
 func set_plan_active(active: bool) -> void:
@@ -131,7 +167,116 @@ func _emit_tab(name: String) -> void:
 	_tab = name
 	_chat_btn.button_pressed = name == "chat"
 	_traj_btn.button_pressed = name == "trajectory"
+	_paint_tabs()
 	tab_changed.emit(name)
+
+
+func _paint_tabs() -> void:
+	var active_bg := DshTokens.accent()
+	var active_fg := Color(1, 1, 1, 1)
+	var idle_bg := DshTokens.bg_layer2()
+	var idle_fg := DshTokens.text_secondary()
+	for pair in [[_chat_btn, _tab == "chat"], [_traj_btn, _tab == "trajectory"]]:
+		var btn: Button = pair[0]
+		var active: bool = pair[1]
+		if btn == null:
+			continue
+		var bg := active_bg if active else idle_bg
+		var fg := active_fg if active else idle_fg
+		btn.add_theme_stylebox_override("normal", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
+		btn.add_theme_stylebox_override("hover", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
+		btn.add_theme_stylebox_override("pressed", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
+		btn.add_theme_color_override("font_color", fg)
+		btn.add_theme_color_override("font_hover_color", fg)
+		btn.add_theme_color_override("font_pressed_color", fg)
+		btn.add_theme_color_override("font_focus_color", fg)
+
+
+## _build_param_popup adds the "⚙" collapse button that opens a single
+## model/engine parameters overlay (effort + model + context). This is the
+## "收纳进触手可及处，点开再弹出" principle: the header stays uncluttered, and
+## secondary knobs live in one popup instead of a row of always-on controls.
+func _build_param_popup() -> void:
+	if _param_btn != null:
+		return
+	_param_btn = MenuButton.new()
+	_param_btn.text = "⚙"
+	_param_btn.tooltip_text = _t("app.params", "模型 / 工程参数")
+	_param_btn.flat = true
+	_param_btn.custom_minimum_size = Vector2(30, 0)
+	# Place at the far right of the header HBox, after Jobs.
+	var hbox := _jobs.get_parent() as HBoxContainer
+	if hbox:
+		hbox.add_child(_param_btn)
+		hbox.move_child(_param_btn, hbox.get_child_count() - 1)
+	_param_popup = _param_btn.get_popup()
+	_param_popup.id_pressed.connect(_on_param_action)
+	_refresh_param_popup()
+
+
+## Refresh the parameter popup contents (effort modes + models).
+## Called on locale change and after models load.
+func _refresh_param_popup() -> void:
+	if _param_popup == null:
+		return
+	_param_popup.clear()
+	var efforts := [
+		["high", _t("app.effortHigh", "Effort: high")],
+		["low", _t("app.effortLow", "Effort: low")],
+		["max", _t("app.effortMax", "Effort: max")],
+		["off", _t("app.effortOff", "Effort: off")],
+	]
+	for i in efforts.size():
+		_param_popup.add_radio_check_item(efforts[i][1], 100 + i)
+		_param_popup.set_item_checked(i, efforts[i][0] == _effort)
+	_param_popup.add_separator()
+	# Model entries mirror the OptionButton so both surfaces stay in sync.
+	if _models.item_count > 0:
+		for i in _models.item_count:
+			var id := str(_models.get_item_metadata(i))
+			var lbl := _models.get_item_text(i)
+			if id == "":
+				continue
+			_param_popup.add_radio_check_item(lbl, 1000 + i)
+			_param_popup.set_item_metadata(_param_popup.item_count - 1, id)
+		_param_popup.add_separator()
+
+
+func _effort_idx() -> int:
+	match _effort:
+		"low":
+			return 1
+		"max":
+			return 2
+		"off":
+			return 3
+		_:
+			return 0
+
+
+
+func _on_param_action(id: int) -> void:
+	if id >= 100 and id <= 103:
+		var e: String = str(["high", "low", "max", "off"][id - 100])
+		_effort = e
+		param_effort_changed.emit(e)
+		_refresh_param_popup()
+	elif id >= 1000:
+		var idx := id - 1000
+		if idx >= 0 and idx < _models.item_count:
+			var mid := str(_models.get_item_metadata(idx))
+			if mid != "":
+				model_selected.emit(mid)
+
+
+## set_effort syncs the header's effort display from the backend (a resumed
+## session's real value, never the default "high").
+func set_effort(effort: String) -> void:
+	if effort == "":
+		return
+	_effort = effort
+	if _param_popup != null:
+		_refresh_param_popup()
 
 
 func _on_model_item(index: int) -> void:
@@ -140,6 +285,16 @@ func _on_model_item(index: int) -> void:
 	var id := str(_models.get_item_metadata(index))
 	if id != "":
 		model_selected.emit(id)
+
+
+# compact 态的模型缩写：取 id 末段（deepseek-v4-flash → v4-flash）。
+func _compact_model_text(id: String) -> String:
+	if id == "":
+		return id
+	var parts := id.split("-")
+	if parts.size() >= 2:
+		return "-".join(parts.slice(parts.size() - 2))
+	return id
 
 
 func _apply_compact() -> void:
@@ -158,9 +313,13 @@ func _apply_strings() -> void:
 	_traj_btn.text = _t("app.trajectoryTab", "Trajectory")
 	_plan_label.text = _t("app.planMode", "Plan")
 	_jobs.text = _t("app.jobs", "Jobs")
-	_models.tooltip_text = _t("common.model", "Model")
+	_jobs.tooltip_text = "%s (Ctrl+J)" % _t("app.jobs", "Jobs")
+	# _models tooltip is managed by _refresh_model_visibility (full id when compact).
+	if _models.item_count == 0:
+		_models.tooltip_text = _t("common.model", "Model")
 	if _title.text == "":
 		set_title("")
+	_refresh_param_popup()
 
 
 func _t(key: String, fallback: String) -> String:

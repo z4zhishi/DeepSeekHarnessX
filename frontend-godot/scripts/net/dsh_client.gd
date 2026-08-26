@@ -51,7 +51,13 @@ func _ws_origin() -> String:
 
 
 func _connect_mux() -> void:
-	var url := _ws_origin() + "/api/events/mux?sessionId=" + active_session_id.uri_encode()
+	# fromSeq=2147483647 skips the gateway's historical replay on connect.
+	# History is loaded exclusively via fetch_history RPC to avoid triple-delivery:
+	#   path A: _switch → fetch_history
+	#   path B: WS replay (eliminated by large fromSeq)
+	#   path C: mux_ready → fetch_history
+	# Only live events produced AFTER this connection should arrive via WS.
+	var url := _ws_origin() + "/api/events/mux?sessionId=" + active_session_id.uri_encode() + "&fromSeq=2147483647"
 	ws_mux.connect_to_url(url)
 
 
@@ -118,7 +124,15 @@ func _poll_socket(socket: WebSocketPeer, is_mux: bool) -> void:
 			_reconnect_scheduled = false
 			if _reconnect_timer != null:
 				_reconnect_timer.stop()
-		while socket.get_available_packet_count() > 0:
+		# Bound the drain so a tool-result burst (or mux replay) cannot
+		# spend the whole frame inside JSON.parse + chat rebind. 48 (raised
+		# from 12) lets a mid-turn host burst (approval request + subagent
+		# lifecycle) flush in one frame instead of dribbling across ~4 frames,
+		# which previously stalled the agent against the 10s server write
+		# deadline and forced reconnect churn.
+		var n := 0
+		while socket.get_available_packet_count() > 0 and n < 48:
+			n += 1
 			var packet := socket.get_packet()
 			_handle_downlink_message(packet.get_string_from_utf8(), is_mux)
 		return
@@ -137,6 +151,10 @@ func _poll_socket(socket: WebSocketPeer, is_mux: bool) -> void:
 		_host_alive = false
 		if is_host_connected:
 			is_host_connected = false
+			# Host downlink loss is a real outage (subagent events, approval
+			# prompts, settings updates all ride it). Surface it to the sidebar
+			# so the UI never shows "Connected" while the host stream is dead.
+			connection_state_changed.emit(false)
 		if drop:
 			_schedule_reconnect()
 
@@ -394,6 +412,14 @@ func session_context(session_id: String, callback: Callable) -> void:
 	_rpc("session.context", {"sessionId": session_id}, callback)
 
 
+func session_policy(session_id: String, callback: Callable) -> void:
+	_rpc("session.policy", {"sessionId": session_id}, callback)
+
+
+func session_effort(session_id: String, effort: String, callback: Callable = Callable()) -> void:
+	_rpc("session.effort", {"sessionId": session_id, "effort": effort}, callback)
+
+
 func feedback_put(session_id: String, message_id: String, rating: String, note: String = "", version: String = "", callback: Callable = Callable()) -> void:
 	var payload := {"sessionId": session_id, "messageId": message_id, "rating": rating}
 	if note != "":
@@ -417,3 +443,11 @@ func plugin_uninstall(name: String, callback: Callable = Callable()) -> void:
 
 func plugin_enable(name: String, enabled: bool, callback: Callable = Callable()) -> void:
 	_rpc("plugin.enable", {"name": name, "enabled": enabled}, callback)
+
+
+func session_rename(session_id: String, title: String, callback: Callable = Callable()) -> void:
+	_rpc("session.rename", {"sessionId": session_id, "title": title}, callback)
+
+
+func session_delete(session_id: String, callback: Callable = Callable()) -> void:
+	_rpc("session.delete", {"sessionId": session_id}, callback)

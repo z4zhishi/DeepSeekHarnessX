@@ -7,7 +7,7 @@ signal command_submitted(line: String)
 signal model_selected(id: String)
 signal access_mode_requested(preset: String)
 
-const ACCESS_PRESETS: PackedStringArray = ["default", "strict", "unrestricted"]
+const ACCESS_PRESETS: PackedStringArray = ["default", "accept-edits", "plan", "auto", "allow-all"]
 
 @onready var _gen: Label = %GenStatus
 @onready var _queue: HBoxContainer = %QueueRail
@@ -24,11 +24,14 @@ const ACCESS_PRESETS: PackedStringArray = ["default", "strict", "unrestricted"]
 var _generating := false
 var _enabled := true
 var _attachments: Array[String] = []
-var _file_dialog: FileDialog = null
+var _file_dialog: DshFilePicker = null
 var _commands: Array = []
 var _cmd_list: ItemList = null
 var _syncing_models := false
 var _access_i := 0
+# access mode 显式菜单：三档并列可见可选（替代原「点击循环切换」——
+# 用户无法预知下一档是什么，违反可触达原则）。
+var _access_menu: PopupMenu = null
 
 func _ready() -> void:
 	size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -49,6 +52,13 @@ func _ready() -> void:
 	if DshI18n.has_signal("locale_changed"):
 		DshI18n.locale_changed.connect(func(_loc: String): _apply_strings())
 	get_viewport().files_dropped.connect(_on_files_dropped)
+	# 应用内附件选择器：常驻预实例化（非原生对话框），首点零冷启动；
+	# 最近记录记入 "attachments" bucket，下次打开自动回到上次目录。
+	_file_dialog = DshFilePicker.new()
+	_file_dialog.bucket = "attachments"
+	_file_dialog.files_selected.connect(_on_files_picked)
+	_file_dialog.file_selected.connect(func(p: String): _on_files_picked(PackedStringArray([p])))
+	add_child(_file_dialog)
 	apply_tokens()
 	_apply_strings()
 	_grow()
@@ -56,7 +66,17 @@ func _ready() -> void:
 	call_deferred("_cap_width")
 
 
+func _modal_blocks_keys() -> bool:
+	var tree := get_tree()
+	if tree == null:
+		return false
+	var n := tree.get_first_node_in_group("dsh_approval")
+	return n != null and bool(n.get("visible"))
+
+
 func _input(event: InputEvent) -> void:
+	if _modal_blocks_keys():
+		return
 	if event is InputEventKey and event.pressed and not event.echo:
 		var k := event as InputEventKey
 		if k.keycode == KEY_ESCAPE:
@@ -81,6 +101,8 @@ func _input(event: InputEvent) -> void:
 		if k.keycode == KEY_ENTER or k.keycode == KEY_KP_ENTER:
 			if k.shift_pressed and not k.ctrl_pressed and not k.meta_pressed:
 				return
+			if str(DisplayServer.ime_get_text()) != "":
+				return
 			get_viewport().set_input_as_handled()
 			if _cmd_popup_visible() and _cmd_list.get_selected_items().size() > 0:
 				_apply_selected_cmd()
@@ -89,13 +111,12 @@ func _input(event: InputEvent) -> void:
 
 
 func apply_tokens() -> void:
-	add_theme_stylebox_override("panel", DshTokens.box(
-		DshTokens.bg_input(),
-		DshTokens.RADIUS_COMPOSER,
-		DshTokens.border_l2(),
-		1,
-		Vector4(12, 10, 12, 8)
-	))
+	var bg := DshTokens.bg_input()
+	var outer := DshTokens.box(bg, DshTokens.RADIUS_COMPOSER, DshTokens.border_l2(), 1, Vector4(14, 10, 14, 8))
+	outer.shadow_color = DshTokens.shadow_tinted()
+	outer.shadow_size = 16
+	outer.shadow_offset = Vector2(0, 6)
+	add_theme_stylebox_override("panel", outer)
 	_prompt.add_theme_color_override("font_color", DshTokens.text_primary())
 	_prompt.add_theme_color_override("font_placeholder_color", DshTokens.text_tertiary())
 	_gen.add_theme_color_override("font_color", DshTokens.text_tertiary())
@@ -217,9 +238,43 @@ func _on_cmd_pressed() -> void:
 
 
 func _on_access_pressed() -> void:
-	_access_i = (_access_i + 1) % ACCESS_PRESETS.size()
-	_access.text = _access_label(ACCESS_PRESETS[_access_i])
-	access_mode_requested.emit(ACCESS_PRESETS[_access_i])
+	if _access_menu == null:
+		_access_menu = PopupMenu.new()
+		_access_menu.add_theme_font_size_override("font_size", DshTokens.FONT_CAPTION)
+		for i in ACCESS_PRESETS.size():
+			_access_menu.add_check_item(_access_label(ACCESS_PRESETS[i]), i)
+		_access_menu.index_pressed.connect(func(idx: int) -> void:
+			if idx < 0 or idx >= ACCESS_PRESETS.size():
+				return
+			_set_access(idx, true)
+			_access_menu.hide()
+		)
+		add_child(_access_menu)
+	for i in ACCESS_PRESETS.size():
+		_access_menu.set_item_checked(i, i == _access_i)
+	_access_menu.popup(Rect2i(_access.get_screen_position() - Vector2(0, _access_menu.get_contents_height() - 4), Vector2i(int(_access.size.x), int(_access_menu.get_contents_height()))))
+
+
+func _set_access(idx: int, emit_signal: bool) -> void:
+	if idx < 0 or idx >= ACCESS_PRESETS.size():
+		return
+	_access_i = idx
+	_access.text = _access_label(ACCESS_PRESETS[idx])
+	if emit_signal:
+		access_mode_requested.emit(ACCESS_PRESETS[idx])
+
+
+## set_access_mode syncs the dropdown to a preset returned by session.policy (or
+## a /permission command), so a resumed session shows its true mode instead of
+## resetting to "default" on every launch.
+func set_access_mode(preset: String) -> void:
+	var idx := ACCESS_PRESETS.find(preset)
+	if idx < 0:
+		return
+	if _access_i == idx:
+		_access.text = _access_label(preset)
+		return
+	_set_access(idx, false)
 
 
 func _on_model_item(index: int) -> void:
@@ -414,10 +469,14 @@ func _refresh_model_tooltip() -> void:
 
 func _access_label(preset: String) -> String:
 	match preset:
-		"strict":
-			return _t("chat.accessRead", "Read only")
-		"unrestricted":
-			return _t("chat.accessFull", "Full access")
+		"accept-edits":
+			return _t("chat.accessAcceptEdits", "允许编辑")
+		"plan":
+			return _t("chat.accessPlan", "Plan")
+		"auto":
+			return _t("chat.accessAuto", "Auto(小模型审核)")
+		"allow-all":
+			return _t("chat.accessFull", "全部放行")
 		_:
 			return _t("chat.accessWrite", "Workspace Write")
 
@@ -460,16 +519,11 @@ func _clear_queue() -> void:
 
 
 func _open_picker() -> void:
-	if _file_dialog == null:
-		_file_dialog = FileDialog.new()
-		_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILES
-		_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
-		_file_dialog.use_native_dialog = true
-		_file_dialog.title = _t("chat.attach", "Attach files")
-		_file_dialog.files_selected.connect(_on_files_picked)
-		_file_dialog.file_selected.connect(func(p: String): _on_files_picked(PackedStringArray([p])))
-		add_child(_file_dialog)
-	_file_dialog.popup_centered_ratio(0.6)
+	_file_dialog.open({
+		"mode": "files",
+		"title": _t("chat.attach", "Attach files"),
+		"ratio": 0.6,
+	})
 
 
 func _on_files_picked(paths: PackedStringArray) -> void:
@@ -520,7 +574,10 @@ func _clear_attachments() -> void:
 func _paint_round(btn: Button) -> void:
 	var pad := Vector4(6, 6, 6, 6)
 	btn.add_theme_stylebox_override("normal", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, pad))
-	btn.add_theme_stylebox_override("hover", DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, pad))
+	var hover_box := DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, pad)
+	hover_box.shadow_color = DshTokens.shadow_tinted()
+	hover_box.shadow_size = 4
+	btn.add_theme_stylebox_override("hover", hover_box)
 	btn.add_theme_stylebox_override("pressed", DshTokens.box(DshTokens.bg_layer3(), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, pad))
 	btn.add_theme_stylebox_override("focus", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_PILL, DshTokens.accent(), 1, pad))
 	btn.flat = true

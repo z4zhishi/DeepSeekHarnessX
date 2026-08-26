@@ -1,3 +1,5 @@
+//go:build !tui_only
+
 package embedgui
 
 import (
@@ -13,9 +15,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 
 	"dsh-go/pkg/gateway"
@@ -366,12 +369,18 @@ func LaunchAllInOneGUIWithServer(host string, port int, srv *gateway.Server) err
 	}
 
 	// 3. Launch Godot GUI Window
+	// 渲染 API 选择：DSHX_RENDER_API=vulkan|opengl|auto（缺省 auto）。
+	// Vulkan 是现代路径且多 GPU 机器上通常选中 NVIDIA 独显（本机实测默认
+	// 落在 Tesla M40）；老驱动/无 Vulkan 环境由 auto 在启动早期失败时回退
+	// OpenGL。CUDA 不是图形渲染 API，不适用。
+	renderAPI := normalizeRenderAPI(os.Getenv("DSHX_RENDER_API"))
+
 	var cmd *exec.Cmd
 	if fileExists(pckPath) {
-		cmd = exec.Command(runnerPath, "--main-pack", pckPath)
+		cmd = exec.Command(runnerPath, append(renderArgs(renderAPI), "--main-pack", pckPath)...)
 	} else {
 		log.Printf("[DSHX] warning: dsh.pck missing at %s; launching bare runner (project manager will open)", pckPath)
-		cmd = exec.Command(runnerPath)
+		cmd = exec.Command(runnerPath, renderArgs(renderAPI)...)
 	}
 
 	cmd.Stdout = os.Stdout
@@ -390,7 +399,66 @@ func LaunchAllInOneGUIWithServer(host string, port int, srv *gateway.Server) err
 		return fmt.Errorf("failed to launch GUI window (%s): %w", runnerPath, err)
 	}
 
-	fmt.Printf("[DSHX] Godot 4 GUI window launched successfully (PID: %d).\n", cmd.Process.Pid)
+	fmt.Printf("[DSHX] Godot 4 GUI window launched successfully (PID: %d, render API: %s).\n", cmd.Process.Pid, renderAPI)
+
+	if renderAPI == "auto" {
+		// auto：Vulkan 先行。若进程在早期（渲染器初始化窗口内）异常退出，
+		// 判定为 Vulkan 不可用，自动回退 OpenGL 再拉一次。
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				return nil // 正常退出（用户关窗）
+			}
+			log.Printf("[DSHX] Vulkan renderer exited early (%v); retrying with OpenGL (gl_compatibility)...", err)
+			return launchGUIOnce(runnerPath, pckPath, gatewayURL, "opengl")
+		case <-time.After(6 * time.Second):
+			// 存活超过初始化窗口：Vulkan 会话正常，等待其退出。
+			return <-done
+		}
+	}
+	return cmd.Wait()
+}
+
+// renderArgs 把渲染 API 名映射为 Godot 引擎参数。空串（auto）默认 Vulkan。
+func renderArgs(api string) []string {
+	switch api {
+	case "opengl":
+		return []string{"--rendering-method", "gl_compatibility", "--rendering-driver", "opengl3"}
+	default:
+		return []string{"--rendering-method", "forward_plus", "--rendering-driver", "vulkan"}
+	}
+}
+
+// normalizeRenderAPI 归一 DSHX_RENDER_API 取值；未知值按 auto 处理。
+func normalizeRenderAPI(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "vulkan":
+		return "vulkan"
+	case "opengl", "gl", "opengl3":
+		return "opengl"
+	default:
+		return "auto"
+	}
+}
+
+// launchGUIOnce 以指定渲染 API 拉起一次 GUI 并等待退出（auto 回退路径用）。
+func launchGUIOnce(runnerPath, pckPath, gatewayURL, api string) error {
+	var cmd *exec.Cmd
+	args := append(renderArgs(api), "--main-pack", pckPath)
+	if fileExists(pckPath) {
+		cmd = exec.Command(runnerPath, args...)
+	} else {
+		cmd = exec.Command(runnerPath)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "DSHX_GATEWAY_URL="+gatewayURL)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to launch GUI window with %s: %w", api, err)
+	}
+	fmt.Printf("[DSHX] Godot 4 GUI window relaunched (PID: %d, render API: %s).\n", cmd.Process.Pid, api)
 	return cmd.Wait()
 }
 

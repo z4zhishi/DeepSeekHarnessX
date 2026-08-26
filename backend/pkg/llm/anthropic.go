@@ -124,8 +124,8 @@ func buildAnthropicRequest(req ModelRequest) anthropicRequest {
 		Messages:  buildAnthropicMessages(req),
 		Stream:    true,
 		// max_tokens is REQUIRED on the Messages wire: an unset (<=0) request
-		// falls back to DefaultMaxTokens, never leaves the harness unbounded.
-		MaxTokens: effectiveMaxTokens(req.MaxTokens),
+		// falls back to DefaultMaxTokens via the requireField=true branch.
+		MaxTokens: effectiveMaxTokensFor(req.MaxTokens, true),
 	}
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature

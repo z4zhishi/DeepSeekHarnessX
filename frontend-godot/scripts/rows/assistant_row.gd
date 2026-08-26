@@ -53,8 +53,11 @@ func bind(node: Dictionary) -> void:
 	var p: Dictionary = node.get("payload", {}) if node.get("payload") is Dictionary else {}
 	_message_id = str(p.get("messageId", node.get("id", "")))
 	_rating = str(p.get("rating", ""))
-	_plain = str(p.get("text", ""))
-	_rebuild(_plain)
+	var next := str(p.get("text", ""))
+	var same := next == _plain and stack.get_child_count() > 0
+	_plain = next
+	if not same:
+		_rebuild(_plain)
 	_paint_rating()
 	var show_actions := _plain.strip_edges() != "" and not bool(p.get("streaming", false))
 	actions.visible = show_actions
@@ -112,19 +115,24 @@ func _md_label(bb: String) -> RichTextLabel:
 	rtl.add_theme_font_override("mono_font", DshThemeBuilder.code_font())
 	rtl.add_theme_constant_override("line_separation", DshTokens.FONT_BODY_LH - DshTokens.FONT_BODY)
 	rtl.meta_underlined = false
+	rtl.meta_clicked.connect(func(meta: Variant) -> void:
+		var url := str(meta)
+		if url.begins_with("http://") or url.begins_with("https://"):
+			OS.shell_open(url)
+	)
 	rtl.text = bb
 	return rtl
 
 
 func _code_panel(lang: String, code: String) -> PanelContainer:
 	var panel := PanelContainer.new()
-	panel.add_theme_stylebox_override("panel", DshTokens.box(
-		DshTokens.bg_code(),
-		DshTokens.RADIUS_MD,
-		DshTokens.border_l2(),
-		1,
-		Vector4(10, 8, 10, 8)
-	))
+	var code_box := DshTokens.shadow_box(DshTokens.bg_code(), DshTokens.RADIUS_MD, Vector4(12, 8, 12, 8))
+	code_box.border_color = DshTokens.border_l2()
+	code_box.border_width_left = 1
+	code_box.border_width_top = 1
+	code_box.border_width_right = 1
+	code_box.border_width_bottom = 1
+	panel.add_theme_stylebox_override("panel", code_box)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 6)
 	panel.add_child(col)
@@ -195,8 +203,13 @@ func _apply_usage(p: Dictionary) -> void:
 func _format_usage(usage: Dictionary) -> String:
 	var inn := _token_count(usage, ["inputTokens", "InputTokens", "input_tokens", "prompt_tokens"])
 	var out := _token_count(usage, ["outputTokens", "OutputTokens", "output_tokens", "completion_tokens"])
+	var cache := _token_count(usage, ["cacheReadTokens", "CacheReadTokens", "cache_read_tokens", "cache_read_input_tokens"])
 	if inn <= 0 and out <= 0:
 		return ""
+	# 缓存命中率段：口径 cacheRead/(input+cacheRead)；首轮无命中（cache==0）
+	# 时整段隐藏——显示 0% 会把正常的冷启动误读成缓存失效。
+	if cache > 0 and (inn + cache) > 0:
+		return "↑%d · ↓%d · cache %d%%" % [inn, out, int(round(float(cache) / float(inn + cache) * 100.0))]
 	return "↑%d · ↓%d" % [inn, out]
 
 

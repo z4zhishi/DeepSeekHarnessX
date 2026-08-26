@@ -19,6 +19,8 @@ var _bg: String = ""
 var _bold: bool = false
 var _italic: bool = false
 var _underline: bool = false
+var _defer_paint: bool = false
+var _applying_style: bool = false
 
 
 func _ready() -> void:
@@ -40,7 +42,7 @@ func _ready() -> void:
 
 
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_THEME_CHANGED:
+	if what == NOTIFICATION_THEME_CHANGED and not _applying_style:
 		_apply_style()
 
 
@@ -69,10 +71,20 @@ func setup_from_view(view: Variant) -> void:
 
 func setup(title: String, lines: Array, exit_code: int = -1) -> void:
 	begin(title)
-	for ln in lines:
+	var use: Array = lines
+	if lines.size() > 400:
+		use = []
+		for i in 200:
+			use.append(lines[i])
+		use.append("… %d lines omitted …" % (lines.size() - 400))
+		for i in range(lines.size() - 200, lines.size()):
+			use.append(lines[i])
+	_defer_paint = true
+	for ln in use:
 		append_raw_ansi(str(ln))
 		if not str(ln).ends_with("\n"):
 			_finish_plain_line()
+	_defer_paint = false
 	finish(exit_code)
 
 
@@ -89,7 +101,8 @@ func begin(title: String) -> void:
 
 func append_raw_ansi(raw: String) -> void:
 	_parse_ansi(raw)
-	_paint()
+	if not _defer_paint:
+		_paint()
 
 
 func finish(exit_code: int = -1) -> void:
@@ -104,6 +117,9 @@ func _toggle_cap() -> void:
 
 
 func _apply_style() -> void:
+	if _applying_style:
+		return
+	_applying_style = true
 	add_theme_stylebox_override("panel", DshTokens.box(
 		DshTokens.bg_code(),
 		DshTokens.RADIUS_MD,
@@ -111,10 +127,12 @@ func _apply_style() -> void:
 		1,
 		Vector4(12, 8, 12, 8)
 	))
-	title_label.add_theme_color_override("font_color", DshTokens.success())
-	title_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
-	if icon_rect:
+	if title_label != null:
+		title_label.add_theme_color_override("font_color", DshTokens.success())
+		title_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
+	if icon_rect != null:
 		icon_rect.modulate = DshTokens.success()
+	_applying_style = false
 
 
 func _parse_ansi(raw: String) -> void:

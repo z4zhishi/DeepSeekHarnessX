@@ -35,7 +35,7 @@ func formatApproval(req approvalRequest) string {
 	b.WriteString("[Permission Required]")
 	b.WriteString(ColorReset)
 	b.WriteString(" ")
-	b.WriteString(req.prompt)
+	b.WriteString(truncateRunes(req.prompt, 600))
 	b.WriteString("\n")
 	if isStandardApproval(req.options) {
 		b.WriteString("  ")
@@ -48,9 +48,13 @@ func formatApproval(req approvalRequest) string {
 		b.WriteString(ColorReset)
 		b.WriteString(" = deny   ")
 		b.WriteString(ColorMagenta)
+		b.WriteString("a")
+		b.WriteString(ColorReset)
+		b.WriteString(" = always   ")
+		b.WriteString(ColorCyan)
 		b.WriteString("c")
 		b.WriteString(ColorReset)
-		b.WriteString(" = cancel\n")
+		b.WriteString(" = cancel  (keys apply immediately, no Enter)\n")
 		for _, opt := range req.options {
 			b.WriteString("  optionId: ")
 			b.WriteString(opt)
@@ -62,9 +66,8 @@ func formatApproval(req approvalRequest) string {
 		}
 		b.WriteString("  enter 1..n, the option id, or y/n/c\n")
 	}
-	b.WriteString(ColorBold)
-	b.WriteString("? ")
-	b.WriteString(ColorReset)
+	// No trailing "? " prompt: the raw-mode editor renders its own live
+	// prompt, and the legacy path appends one explicitly.
 	return b.String()
 }
 
@@ -117,4 +120,19 @@ func decisionFromOption(opt string, index int) tools.ApprovalDecision {
 
 func normOption(s string) string {
 	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "-", "_"))
+}
+
+// truncateRunes keeps a head+tail of s so a huge tool-args prompt cannot
+// flood the TUI. n is the max rune count of the result (ellipsis included).
+func truncateRunes(s string, n int) string {
+	if n <= 8 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	head := (n - 1) / 2
+	tail := n - 1 - head
+	return string(r[:head]) + "…" + string(r[len(r)-tail:])
 }

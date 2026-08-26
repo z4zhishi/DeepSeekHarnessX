@@ -42,11 +42,11 @@ func (r *ToolRegistry) RegisterPolicyTools() {
 
 	r.Register(ToolDefinition{
 		Name:        "set_approval_policy",
-		Description: "Switch the session's approval policy: ask (prompt the user) | never (reject every approval-required action deterministically).",
+		Description: "Switch the session's approval policy: ask | never | accept-edits (auto-allow edits, commute asks) | review (small-model reviews destructive tools) | allow-all (auto-allow everything).",
 		ParametersJSON: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"policy": { "type": "string", "enum": ["ask", "never"] }
+				"policy": { "type": "string", "enum": ["ask", "never", "accept-edits", "review", "allow-all"] }
 			},
 			"required": ["policy"]
 		}`),
@@ -73,7 +73,7 @@ func (r *ToolRegistry) RegisterPolicyTools() {
 		ParametersJSON: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"preset": { "type": "string", "description": "Preset name such as default | strict | unrestricted" }
+				"preset": { "type": "string", "description": "Preset name such as default | accept-edits | plan | auto | allow-all" }
 			},
 			"required": ["preset"]
 		}`),

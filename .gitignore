@@ -47,5 +47,8 @@ backend/.dsh-data/
 
 # 本地临时文件（不入库）
 .tmp-*
+*.tmp
+# 参考项目克隆目录（ClaudecodeBestV5 / GrokBuild 等 TUI 交互参照，只读参考）
+/tempck/
 
 

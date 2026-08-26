@@ -109,10 +109,32 @@ func _ensure_child(parent_id: String, child_id: String) -> TreeItem:
 
 
 func _decorate(item: TreeItem, session_id: String, status: String) -> void:
-	item.set_text(0, _short_id(session_id))
+	item.set_text(0, _display_name(session_id))
 	item.set_metadata(0, session_id)
 	item.set_text(2, _short_id(session_id))
 	_apply_status(item, status, "")
+
+
+# 节点名优先用会话标题（store.sessions 镜像里已有），缺失才回退短 id——
+# 裸短 id 对用户毫无语义。
+func _display_name(session_id: String) -> String:
+	var store := _find_store()
+	if store != null and store.has_method("get_session"):
+		var s: Dictionary = store.get_session(session_id)
+		var title := str(s.get("title", ""))
+		if title != "":
+			return title
+	return _short_id(session_id)
+
+
+func _find_store() -> Node:
+	var root := get_tree().get_root()
+	if root == null:
+		return null
+	for child in root.get_children():
+		if child.has_method("get_session") and child.has_method("get_sessions"):
+			return child
+	return null
 
 
 func _set_status(session_id: String, status: String, stop_reason: String = "") -> void:

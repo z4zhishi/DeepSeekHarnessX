@@ -107,11 +107,22 @@ func is_generating() -> bool:
 	return _generating
 
 
-func adopt(nodes: Array) -> void:
+func seen_seq() -> Dictionary:
+	return _seen_seq
+
+
+func merge_seen_seq(seen: Dictionary) -> void:
+	for k in seen.keys():
+		_seen_seq[k] = seen[k]
+
+
+func adopt(nodes: Array, seen: Dictionary = {}) -> void:
 	reset()
 	for n in nodes:
 		if n is Dictionary:
 			_nodes.append((n as Dictionary).duplicate(true))
+	if not seen.is_empty():
+		_seen_seq = seen.duplicate()
 	_reindex()
 
 
@@ -300,13 +311,15 @@ func _ingest_tool_call(seq: int, data: Dictionary) -> void:
 	var payload := {
 		"callId": call_id,
 		"name": str(data.get("name", "")),
-		"arguments": _args_string(data.get("arguments", "")),
-		"view": _as_dict(data.get("view", {})),
+		"arguments": _cap_text(_args_string(data.get("arguments", "")), 24000),
+		"view": _cap_view(_as_dict(data.get("view", {}))),
 		"status": "running",
 		"output": "",
 	}
 	if _tool_i.has(call_id):
 		var node: Dictionary = _nodes[int(_tool_i[call_id])]
+		var prev: Dictionary = node.get("payload", {}) if node.get("payload") is Dictionary else {}
+		payload["expanded"] = bool(prev.get("expanded", false))
 		node["payload"] = payload
 		node["turn"] = _turn
 		node["step"] = _step
@@ -344,8 +357,8 @@ func _ingest_tool_result(seq: int, data: Dictionary) -> void:
 		var p: Dictionary = node["payload"]
 		p["status"] = status
 		if not view.is_empty():
-			p["view"] = view
-		p["output"] = output
+			p["view"] = _cap_view(view)
+		p["output"] = _cap_text(output, 24000)
 		if data.get("error") is Dictionary:
 			p["error"] = data["error"]
 		node["payload"] = p
@@ -354,10 +367,10 @@ func _ingest_tool_result(seq: int, data: Dictionary) -> void:
 		_append("tool:%s" % call_id, "tool", {
 			"callId": call_id,
 			"name": str(data.get("name", "")),
-			"arguments": _args_string(data.get("arguments", "")),
-			"view": view,
+			"arguments": _cap_text(_args_string(data.get("arguments", "")), 24000),
+			"view": _cap_view(view),
 			"status": status,
-			"output": output,
+			"output": _cap_text(output, 24000),
 		})
 		_tool_i[call_id] = _nodes.size() - 1
 
@@ -512,3 +525,32 @@ func _as_dict(v: Variant) -> Dictionary:
 		if parsed is Dictionary:
 			return parsed
 	return {}
+
+
+func _cap_text(s: String, cap: int) -> String:
+	if s.length() <= cap:
+		return s
+	var keep := cap / 2
+	return s.substr(0, keep) + "\n…\n" + s.substr(s.length() - keep)
+
+
+func _cap_view(view: Dictionary) -> Dictionary:
+	if view.is_empty():
+		return view
+	var out := view.duplicate(true)
+	if str(out.get("kind", "")) == "terminal":
+		var term: Dictionary = _as_dict(out.get("terminal", {}))
+		var lines: Variant = term.get("lines", [])
+		if lines is Array and (lines as Array).size() > 240:
+			var arr: Array = lines
+			var kept: Array = []
+			for i in 120:
+				kept.append(arr[i])
+			kept.append("… %d lines omitted …" % (arr.size() - 240))
+			for i in range(arr.size() - 120, arr.size()):
+				kept.append(arr[i])
+			term["lines"] = kept
+			out["terminal"] = term
+	if str(out.get("text", "")).length() > 24000:
+		out["text"] = _cap_text(str(out.get("text", "")), 24000)
+	return out

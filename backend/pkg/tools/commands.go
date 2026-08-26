@@ -194,35 +194,35 @@ func (cr *CommandRegistry) RegisterBuiltinCommands() {
 
 	cr.Register(CommandDefinition{
 		Name:        "permission",
-		Description: "Apply a permission preset: default (workspace-write + ask) | strict (read-only + never) | unrestricted (danger-full-access + ask).",
+		Description: "Apply a permission mode: default | accept-edits | strict(plan) | auto | allow-all (unrestricted).",
 		Handler: func(inv CommandInvocation) CommandResult {
 			preset := strings.TrimSpace(inv.RawInput)
 			if inv.Policy == nil {
 				return CommandResult{Kind: "error", Text: "/permission: policy store unavailable"}
 			}
+			mode := ""
 			switch preset {
 			case "default":
-				_ = inv.Policy.SetPreset(inv.SessionID, preset, inv.Emit)
-				if err := inv.Policy.SetSandboxMode(inv.SessionID, session.SandboxWorkspaceWrite, "", inv.Emit); err != nil {
-					return CommandResult{Kind: "error", Text: err.Error()}
-				}
-				_ = inv.Policy.SetApprovalPolicy(inv.SessionID, session.ApprovalPolicyAsk, "", inv.Emit)
-			case "strict":
-				_ = inv.Policy.SetPreset(inv.SessionID, preset, inv.Emit)
-				if err := inv.Policy.SetSandboxMode(inv.SessionID, session.SandboxReadOnly, "", inv.Emit); err != nil {
-					return CommandResult{Kind: "error", Text: err.Error()}
-				}
-				_ = inv.Policy.SetApprovalPolicy(inv.SessionID, session.ApprovalPolicyNever, "", inv.Emit)
-			case "unrestricted":
-				_ = inv.Policy.SetPreset(inv.SessionID, preset, inv.Emit)
-				if err := inv.Policy.SetSandboxMode(inv.SessionID, session.SandboxDangerFullAccess, "", inv.Emit); err != nil {
-					return CommandResult{Kind: "error", Text: err.Error()}
-				}
-				_ = inv.Policy.SetApprovalPolicy(inv.SessionID, session.ApprovalPolicyAsk, "", inv.Emit)
+				mode = string(session.PermissionModeDefault)
+			case "accept-edits":
+				mode = string(session.PermissionModeAcceptEdits)
+			case "strict", "plan":
+				mode = string(session.PermissionModePlan)
+			case "auto":
+				mode = string(session.PermissionModeAutoReview)
+			case "allow-all", "unrestricted":
+				mode = string(session.PermissionModeAllowAll)
 			default:
-				return CommandResult{Kind: "error", Text: "unknown preset; use /permission default | strict | unrestricted"}
+				return CommandResult{Kind: "error", Text: "unknown preset; use /permission default | accept-edits | plan | auto | allow-all"}
 			}
-			return CommandResult{Kind: "success", Text: fmt.Sprintf("Permission preset %s applied.", preset)}
+			// Set the resolved knobs, then stamp the LITERAL preset name the
+			// user typed (strict vs plan, unrestricted vs allow-all) so the
+			// session.policy read-back and GUI dropdown match user intent.
+			if err := inv.Policy.SetMode(inv.SessionID, session.PermissionMode(mode), inv.Emit); err != nil {
+				return CommandResult{Kind: "error", Text: err.Error()}
+			}
+			_ = inv.Policy.SetPreset(inv.SessionID, preset, inv.Emit)
+			return CommandResult{Kind: "success", Text: fmt.Sprintf("Permission mode %s applied.", preset)}
 		},
 	})
 

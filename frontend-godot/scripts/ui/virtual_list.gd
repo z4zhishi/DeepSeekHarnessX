@@ -28,11 +28,15 @@ var _hero: Control
 var _hero_wanted: bool = true
 var _pool: Dictionary = {}
 var _live: Dictionary = {}
-var _sync_pending: bool = false
-var _measuring: bool = false
-var _measure_q: Array[int] = []
+# 同步调度走单发 Timer（在下一帧的 _process 阶段触发），绝不走 call_deferred：
+# 布局变化会经滚动条信号再次请求同步，若在同一轮 MessageQueue flush 内续链，
+# 会形成「sync→布局→滚动事件→sync」的自馈循环，把主循环饿死在 flush 里
+# （历史事故：加载会话后整帧冻结 15s+，协程全部 starvation）。
+var _sync_timer: Timer
+var _scroll_programmatic := false
 var _stick_bottom: bool = true
 var _built: bool = false
+var _heights_dirty: bool = false
 
 
 func _notification(what: int) -> void:
@@ -57,6 +61,11 @@ func _ready() -> void:
 	_content.mouse_filter = Control.MOUSE_FILTER_PASS
 	add_child(_content)
 	_build_hero()
+	_sync_timer = Timer.new()
+	_sync_timer.one_shot = true
+	_sync_timer.wait_time = 0.02
+	_sync_timer.timeout.connect(_sync)
+	add_child(_sync_timer)
 	get_v_scroll_bar().value_changed.connect(_on_scroll)
 	resized.connect(func(): _request_sync())
 	_built = true
@@ -64,31 +73,56 @@ func _ready() -> void:
 	_request_sync()
 
 
-func set_nodes(nodes: Array) -> void:
+func set_nodes(nodes: Array, seen_seq: Dictionary = {}) -> void:
+	_dbg("set_nodes enter n=%d frame=%d" % [nodes.size(), Engine.get_process_frames()])
+	if _is_same_nodes(nodes):
+		if not seen_seq.is_empty() and _fold.has_method("merge_seen_seq"):
+			_fold.merge_seen_seq(seen_seq)
+		_dbg("set_nodes skipped identical nodes")
+		return
 	_unmount_all()
-	_fold.adopt(nodes)
+	_fold.adopt(nodes, seen_seq)
 	_nodes = _fold.nodes()
 	_rebuild_heights()
 	_stick_bottom = true
 	_update_hero()
-	_request_sync()
+	_sync()
 	call_deferred("_scroll_bottom")
+	_dbg("set_nodes exit")
+
+
+func _is_same_nodes(new_nodes: Array) -> bool:
+	if new_nodes.size() != _nodes.size():
+		return false
+	for i in _nodes.size():
+		var a: Dictionary = _nodes[i] if _nodes[i] is Dictionary else {}
+		var b: Dictionary = new_nodes[i] if new_nodes[i] is Dictionary else {}
+		if str(a.get("id", "")) != str(b.get("id", "")) or str(a.get("kind", "")) != str(b.get("kind", "")):
+			return false
+		var pa: Dictionary = a.get("payload", {}) if a.get("payload") is Dictionary else {}
+		var pb: Dictionary = b.get("payload", {}) if b.get("payload") is Dictionary else {}
+		if pa != pb:
+			return false
+	return true
 
 
 func apply_event(env: Dictionary) -> void:
 	var typ := str(env.get("type", ""))
+	var before := _nodes.size()
 	_fold.ingest(env)
 	_nodes = _fold.nodes()
 	_ensure_height_len()
 	_update_hero()
 	if typ == "assistant/chunk":
 		_patch_stream()
+	elif typ == "tool/call" or typ == "tool/result":
+		_patch_tool(env)
+		if _nodes.size() != before:
+			_request_sync()
+	elif typ == "assistant/message" or typ == "assistant/reasoning":
+		_patch_stream()
+		_request_sync()
 	else:
-		for idx in _live.keys():
-			var i := int(idx)
-			if i >= 0 and i < _nodes.size():
-				_bind_row(_live[idx], i)
-				_queue_measure(i)
 		_request_sync()
 	if _stick_bottom:
 		call_deferred("_scroll_bottom")
@@ -99,7 +133,6 @@ func clear() -> void:
 	_fold.reset()
 	_nodes = _fold.nodes()
 	_heights = PackedFloat32Array()
-	_measure_q.clear()
 	_stick_bottom = true
 	_update_hero()
 	if _content:
@@ -117,27 +150,29 @@ func show_hero(visible: bool) -> void:
 
 
 func _on_scroll(_v: float) -> void:
+	if _scroll_programmatic:
+		return
 	var bar := get_v_scroll_bar()
 	_stick_bottom = bar.value + size.y >= bar.max_value - 64.0
 	_request_sync()
 
 
 func _request_sync() -> void:
-	if _sync_pending:
+	if not _sync_timer.is_stopped():
 		return
-	_sync_pending = true
-	call_deferred("_sync")
+	_sync_timer.start()
 
 
 func _sync() -> void:
-	_sync_pending = false
 	if not _built:
 		return
+	var ts := Time.get_ticks_msec()
+	_dbg("sync enter live=%d nodes=%d" % [_live.size(), _nodes.size()])
 	_layout_hero()
 	if _nodes.is_empty():
 		_unmount_all()
 		if _hero_wanted and _hero:
-			_content.custom_minimum_size = Vector2(size.x, maxf(size.y, 1.0))
+			_content.custom_minimum_size = Vector2(0.0, maxf(size.y, 1.0))
 		return
 	var col := _column()
 	var prefix := PackedFloat32Array()
@@ -146,7 +181,8 @@ func _sync() -> void:
 	for i in _nodes.size():
 		prefix[i + 1] = prefix[i] + _heights[i] + GAP
 	var total := prefix[_nodes.size()] - GAP + PAD_Y
-	_content.custom_minimum_size = Vector2(size.x, maxf(total, 1.0))
+	# 只设高度：宽度回写会改变自身最小尺寸，经 resized 信号再次触发同步。
+	_content.custom_minimum_size = Vector2(0.0, maxf(total, 1.0))
 	var scroll_y := float(scroll_vertical)
 	var view_h := size.y
 	var lo := scroll_y - OVERSCAN
@@ -170,10 +206,10 @@ func _sync() -> void:
 			_live[i] = row
 			_content.add_child(row)
 			_bind_row(row, i)
-			_queue_measure(i)
 		row.position = Vector2(col.x, prefix[i])
 		row.custom_minimum_size = Vector2(col.y, 0)
 		row.size = Vector2(col.y, maxf(_heights[i], 1.0))
+	_dbg("sync exit: %d ms" % (Time.get_ticks_msec() - ts))
 
 
 func _patch_stream() -> void:
@@ -191,7 +227,7 @@ func _patch_stream() -> void:
 				row.call("set_stream_text", text)
 			else:
 				_bind_row(row, i)
-			_queue_measure(i)
+	_heights_dirty = true
 	if not any_live:
 		_request_sync()
 	else:
@@ -210,7 +246,7 @@ func _layout_positions() -> void:
 			row.custom_minimum_size = Vector2(col.y, 0)
 			row.size = Vector2(col.y, maxf(_heights[i], 1.0))
 		y += _heights[i] + GAP
-	_content.custom_minimum_size = Vector2(size.x, maxf(y - GAP + PAD_Y, 1.0))
+	_content.custom_minimum_size = Vector2(0.0, maxf(y - GAP + PAD_Y, 1.0))
 
 
 func _bind_row(row: Control, index: int) -> void:
@@ -220,6 +256,40 @@ func _bind_row(row: Control, index: int) -> void:
 	if row.has_method("bind"):
 		row.call("bind", node)
 	_wire(row, index)
+	_heights_dirty = true
+
+
+func _patch_tool(env: Dictionary) -> void:
+	var call_id := _tool_call_id(env)
+	if call_id == "":
+		_request_sync()
+		return
+	for i in _nodes.size():
+		if str(_nodes[i].get("kind", "")) != "tool":
+			continue
+		var p: Dictionary = _nodes[i].get("payload", {}) if _nodes[i].get("payload") is Dictionary else {}
+		if str(p.get("callId", "")) != call_id:
+			continue
+		if _live.has(i):
+			_bind_row(_live[i], i)
+		else:
+			_request_sync()
+		return
+	_request_sync()
+
+
+func _tool_call_id(env: Dictionary) -> String:
+	var data: Dictionary = env.get("data", {}) if env.get("data") is Dictionary else {}
+	var id := str(data.get("callId", data.get("id", "")))
+	if id != "":
+		return id
+	var msg: Dictionary = data.get("message", {}) if data.get("message") is Dictionary else {}
+	var content: Variant = msg.get("content", [])
+	if content is Array:
+		for block in content:
+			if block is Dictionary and str((block as Dictionary).get("type", "")) == "tool-result":
+				return str((block as Dictionary).get("toolCallId", (block as Dictionary).get("id", "")))
+	return ""
 
 
 func _wire(row: Control, index: int) -> void:
@@ -242,6 +312,7 @@ func _rewire(row: Control, sig: String, meta: String, cb: Callable) -> void:
 
 
 func _on_row_height(index: int) -> void:
+	_heights_dirty = true
 	if index >= 0 and index < _nodes.size():
 		var row: Control = _live.get(index, null)
 		if row != null and row.has_method("is_expanded"):
@@ -249,7 +320,6 @@ func _on_row_height(index: int) -> void:
 			if p is Dictionary:
 				p["expanded"] = bool(row.call("is_expanded"))
 				_nodes[index]["payload"] = p
-	_queue_measure(index)
 
 
 func _on_tool_selected(call_id: String, name: String, input: String, output: String) -> void:
@@ -265,51 +335,54 @@ func _on_feedback(message_id: String, rating: String, index: int) -> void:
 	feedback_rating.emit(message_id, rating)
 
 
-func _queue_measure(index: int) -> void:
-	if index < 0 or index >= _nodes.size():
+# 高度对账在 _process 里做有界收敛（只读缓存的最小尺寸 + 0.5px 迟滞），
+# 不再用跨帧 await 协程：协程在 deferred 风暴下会被饿死，且每行一帧的
+# 测量节奏让长列表首屏高度长时间停留在估算值。
+func _process(_delta: float) -> void:
+	if not _built or _live.is_empty() or not _heights_dirty:
 		return
-	if _measure_q.has(index):
-		return
-	_measure_q.append(index)
-	if not _measuring:
-		_run_measure()
-
-
-func _run_measure() -> void:
-	_measuring = true
-	while _measure_q.size() > 0:
-		var i: int = _measure_q.pop_front()
-		if not is_inside_tree() or not _live.has(i) or i < 0 or i >= _nodes.size():
+	var changed := false
+	for idx in _live.keys():
+		var i := int(idx)
+		if i < 0 or i >= _heights.size():
 			continue
 		var row: Control = _live[i]
-		if not is_instance_valid(row) or not row.is_inside_tree():
-			continue
-		var col := _column()
-		row.custom_minimum_size = Vector2(col.y, 0)
-		row.size.x = col.y
-		await get_tree().process_frame
-		if not is_inside_tree() or not _live.has(i) or i < 0 or i >= _nodes.size() or i >= _heights.size():
-			continue
-		row = _live[i]
-		if not is_instance_valid(row) or not row.is_inside_tree():
+		if row == null or not is_instance_valid(row) or not row.is_inside_tree():
 			continue
 		var h := row.get_combined_minimum_size().y
 		if h < 1.0:
 			h = row.size.y
-		if h >= 1.0 and not is_equal_approx(h, _heights[i]):
+		if h >= 1.0 and absf(h - _heights[i]) > 0.5:
 			_heights[i] = h
-			_layout_positions()
-	_measuring = false
-	if _measure_q.size() > 0:
-		_run_measure()
+			changed = true
+	if changed:
+		_layout_positions()
+	else:
+		_heights_dirty = false
 
 
 func _acquire(kind: String) -> Control:
 	var pool: Array = _pool.get(kind, [])
 	if pool.size() > 0:
 		return pool.pop_back()
+	var t := Time.get_ticks_msec()
 	var scene := _scene_for(kind)
-	return scene.instantiate()
+	var row := scene.instantiate()
+	_dbg("instantiate %s: %d ms" % [kind, Time.get_ticks_msec() - t])
+	return row
+
+
+func _dbg(m: String) -> void:
+	if OS.get_environment("DSHX_UI_DEBUG") != "":
+		var line := "[%9.3f f=%d] %s" % [Time.get_ticks_msec() / 1000.0, Engine.get_process_frames(), m]
+		print(line)
+		var f := FileAccess.open("user://chatlist_log.txt", FileAccess.READ_WRITE)
+		if f == null:
+			f = FileAccess.open("user://chatlist_log.txt", FileAccess.WRITE)
+		if f:
+			f.seek_end()
+			f.store_line(line)
+			f.close()
 
 
 func _release(index: int) -> void:
@@ -424,8 +497,10 @@ func _column() -> Vector2:
 
 
 func _scroll_bottom() -> void:
-	await get_tree().process_frame
+	# 程序化滚动：护栏期内忽略 value_changed，防止「设值→事件→再同步」回环。
+	_scroll_programmatic = true
 	scroll_vertical = int(_content.custom_minimum_size.y)
+	_scroll_programmatic = false
 
 
 func _update_hero() -> void:
@@ -450,9 +525,18 @@ func _build_hero() -> void:
 	_hero = VBoxContainer.new()
 	_hero.name = "Hero"
 	_hero.alignment = BoxContainer.ALIGNMENT_CENTER
-	_hero.add_theme_constant_override("separation", 14)
+	_hero.add_theme_constant_override("separation", 16)
 	_hero.mouse_filter = Control.MOUSE_FILTER_STOP
 	_content.add_child(_hero)
+
+	var badge := PanelContainer.new()
+	badge.add_theme_stylebox_override("panel", DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, DshTokens.border_l1(), 1, Vector4(12, 4, 12, 4)))
+	var badge_lbl := Label.new()
+	badge_lbl.text = "AGENT WORKBENCH  •  LOCAL-FIRST"
+	badge_lbl.add_theme_font_size_override("font_size", 9)
+	badge_lbl.add_theme_color_override("font_color", DshTokens.text_tertiary())
+	badge.add_child(badge_lbl)
+	_hero.add_child(badge)
 
 	var mark := TextureRect.new()
 	mark.texture = load("res://assets/brand/dshx_mark.svg") as Texture2D
@@ -466,12 +550,12 @@ func _build_hero() -> void:
 	var title := Label.new()
 	title.text = _t("chat.heroTitle", "DSHX")
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.add_theme_font_size_override("font_size", 24)
+	title.add_theme_font_size_override("font_size", 28)
 	title.add_theme_color_override("font_color", DshTokens.text_primary())
 	_hero.add_child(title)
 
 	var sub := Label.new()
-	sub.text = _t("chat.heroSubtitle", "High-performance agent workbench")
+	sub.text = _t("chat.heroSubtitle", "High-performance agent workbench — code, inspect, refactor, orchestrate.")
 	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	sub.add_theme_font_size_override("font_size", DshTokens.FONT_UI)
@@ -481,8 +565,8 @@ func _build_hero() -> void:
 	var grid := GridContainer.new()
 	grid.columns = 2
 	grid.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	grid.add_theme_constant_override("h_separation", 12)
-	grid.add_theme_constant_override("v_separation", 12)
+	grid.add_theme_constant_override("h_separation", 14)
+	grid.add_theme_constant_override("v_separation", 14)
 	_hero.add_child(grid)
 
 	var suggestions := [
@@ -516,19 +600,34 @@ func _build_hero() -> void:
 
 
 func _suggest_card(s: Dictionary) -> Control:
+	var is_featured: bool = str(s.get("featured", false)) == "true" or (s.has("w") and int(s["w"]) == 2)
+	var card_w := 580 if is_featured else 280
 	var wrap := PanelContainer.new()
-	wrap.custom_minimum_size = Vector2(280, 72)
-	var box_n := DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_MD, DshTokens.border_l2(), 1, Vector4(14, 10, 14, 10))
-	var box_h := DshTokens.box(DshTokens.bg_layer3(), DshTokens.RADIUS_MD, DshTokens.border_l3(), 1, Vector4(14, 10, 14, 10))
+	wrap.custom_minimum_size = Vector2(card_w, 96 if is_featured else 88)
+	var box_n: StyleBoxFlat = DshTokens.shadow_box(DshTokens.bg_layer2(), DshTokens.RADIUS_LG, Vector4(16, 12, 16, 12))
+	var box_h: StyleBoxFlat = DshTokens.shadow_box(DshTokens.bg_layer3(), DshTokens.RADIUS_LG, Vector4(16, 12, 16, 12))
+	box_h.shadow_size = 20
 	wrap.add_theme_stylebox_override("panel", box_n)
+	wrap.mouse_filter = Control.MOUSE_FILTER_STOP
 	var vbox := VBoxContainer.new()
 	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_theme_constant_override("separation", 2)
+	vbox.add_theme_constant_override("separation", 4)
 	wrap.add_child(vbox)
+	var eyebrow := Label.new()
+	eyebrow.text = str(s.get("eyebrow", "")).to_upper()
+	eyebrow.visible = str(s.get("eyebrow", "")) != ""
+	eyebrow.add_theme_font_size_override("font_size", 9)
+	eyebrow.add_theme_color_override("font_color", DshTokens.accent())
+	eyebrow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vbox.add_child(eyebrow)
 	var head := HBoxContainer.new()
 	head.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	head.add_theme_constant_override("separation", 6)
+	head.add_theme_constant_override("separation", 8)
 	vbox.add_child(head)
+	var icon_wrap := PanelContainer.new()
+	icon_wrap.custom_minimum_size = Vector2(28, 28)
+	icon_wrap.add_theme_stylebox_override("panel", DshTokens.box(DshTokens.bg_layer3(), 8, DshTokens.border_l1(), 1, Vector4(6, 6, 6, 6)))
+	icon_wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var ic := TextureRect.new()
 	ic.texture = load("res://assets/icons/%s" % str(s["icon"])) as Texture2D
 	ic.custom_minimum_size = Vector2(16, 16)
@@ -536,18 +635,27 @@ func _suggest_card(s: Dictionary) -> Control:
 	ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	ic.modulate = DshTokens.text_secondary()
 	ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	head.add_child(ic)
+	icon_wrap.add_child(ic)
+	head.add_child(icon_wrap)
 	var tl := Label.new()
 	tl.text = str(s["title"])
 	tl.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
 	tl.add_theme_color_override("font_color", DshTokens.text_primary())
 	tl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	head.add_child(tl)
+	var arrow := Label.new()
+	arrow.text = "↗"
+	arrow.add_theme_font_size_override("font_size", 12)
+	arrow.add_theme_color_override("font_color", DshTokens.text_tertiary())
+	arrow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	head.add_child(arrow)
 	var dl := Label.new()
 	dl.text = str(s["desc"])
 	dl.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
 	dl.add_theme_color_override("font_color", DshTokens.text_tertiary())
 	dl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vbox.add_child(dl)
 	var btn := Button.new()
 	btn.flat = true
@@ -556,10 +664,15 @@ func _suggest_card(s: Dictionary) -> Control:
 	btn.add_theme_stylebox_override("hover", empty)
 	btn.add_theme_stylebox_override("pressed", empty)
 	btn.add_theme_stylebox_override("focus", empty)
+	btn.mouse_filter = Control.MOUSE_FILTER_STOP
 	var prompt := str(s["prompt"])
 	btn.pressed.connect(func(): suggestion_clicked.emit(prompt))
-	btn.mouse_entered.connect(func(): wrap.add_theme_stylebox_override("panel", box_h))
-	btn.mouse_exited.connect(func(): wrap.add_theme_stylebox_override("panel", box_n))
+	var hover_in := func(): wrap.add_theme_stylebox_override("panel", box_h); wrap.position.y -= 2
+	var hover_out := func(): wrap.add_theme_stylebox_override("panel", box_n); wrap.position.y += 2
+	btn.mouse_entered.connect(hover_in)
+	wrap.mouse_entered.connect(hover_in)
+	btn.mouse_exited.connect(hover_out)
+	wrap.mouse_exited.connect(hover_out)
 	wrap.add_child(btn)
 	return wrap
 

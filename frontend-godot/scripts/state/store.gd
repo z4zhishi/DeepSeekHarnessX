@@ -73,6 +73,25 @@ func get_session(session_id: String) -> Dictionary:
 	return {}
 
 
+func remove_session(session_id: String) -> void:
+	for i in sessions.size():
+		if _header_id(sessions[i]) == session_id:
+			sessions.remove_at(i)
+			break
+	_parent.erase(session_id)
+	for k in _parent.keys():
+		if str(_parent[k]) == session_id:
+			_parent.erase(k)
+	sessions_changed.emit()
+	if active_id == session_id:
+		active_id = ""
+		active_session_changed.emit("")
+		if not sessions.is_empty():
+			lineage_changed.emit(_lineage_parts(active_id))
+		else:
+			lineage_changed.emit([])
+
+
 func set_parent(child_id: String, parent_id: String) -> void:
 	if child_id == "" or parent_id == "" or child_id == parent_id:
 		return

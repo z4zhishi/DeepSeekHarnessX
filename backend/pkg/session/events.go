@@ -629,12 +629,35 @@ type SandboxModePayload struct {
 }
 
 // ApprovalPolicy is the session approval-policy override (upstream
-// user-approval: ask | never). never rejects every ask deterministically.
+// user-approval: ask | never) extended with the first-class interaction modes.
+// - ask:          prompt the user for every approval-required tool.
+// - never:        reject every approval-required tool deterministically.
+// - accept-edits: auto-allow edit/write tools; commands/pwsh/MCP still ask.
+// - review:       auto-allow safe tools; destructive tools go to the small
+//                 review model, which may allow / deny / escalate to the user.
+// - allow-all:    auto-allow every approval-required tool (YOLO / full access).
 type ApprovalPolicy string
 
 const (
-	ApprovalPolicyAsk   ApprovalPolicy = "ask"
-	ApprovalPolicyNever ApprovalPolicy = "never"
+	ApprovalPolicyAsk         ApprovalPolicy = "ask"
+	ApprovalPolicyNever       ApprovalPolicy = "never"
+	ApprovalPolicyAcceptEdits ApprovalPolicy = "accept-edits"
+	ApprovalPolicyReview      ApprovalPolicy = "review"
+	ApprovalPolicyAllowAll    ApprovalPolicy = "allow-all"
+)
+
+// PermissionMode is the high-level user-facing permission preset (upstream
+// permission-presets): a named bundle that maps to a (sandbox, approval) pair.
+// It is the durable user intent; the sandbox/mode + approval/policy events
+// record the resolved knobs in the same turn.
+type PermissionMode string
+
+const (
+	PermissionModeDefault     PermissionMode = "default"      // ask every time
+	PermissionModeAcceptEdits PermissionMode = "accept-edits" // edits auto, commands ask
+	PermissionModePlan        PermissionMode = "plan"         // read-only, writes/commands denied
+	PermissionModeAutoReview  PermissionMode = "auto"         // small-model reviews destructive tools
+	PermissionModeAllowAll    PermissionMode = "allow-all"    // everything auto-allowed
 )
 
 // ApprovalPolicyPayload is the durable `approval/policy` switch (upstream
@@ -647,8 +670,10 @@ type ApprovalPolicyPayload struct {
 // PermissionPresetPayload is the durable `permission/preset` selection
 // (upstream permission-presets): log-only user intent; the knob events
 // (sandbox/mode, approval/policy) follow in the same turn.
+// ReviewModel records the small-model reviewer id for the auto (review) mode.
 type PermissionPresetPayload struct {
-	Preset string `json:"preset"`
+	Preset      string `json:"preset"`
+	ReviewModel string `json:"reviewModel,omitempty"`
 }
 
 // CommandSource is who issued a slash command line (upstream CommandSourceMap:

@@ -16,7 +16,7 @@ var _empty: Label
 var _install_btn: Button
 var _enable_btn: Button
 var _uninstall_btn: Button
-var _dialog: FileDialog = null
+var _dialog: DshFilePicker = null
 
 
 func _ready() -> void:
@@ -108,6 +108,12 @@ func _build() -> void:
 
 	_apply_style()
 	_apply_strings()
+	# 应用内插件包选择器：常驻预实例化（非原生对话框），首点零冷启动。
+	_dialog = DshFilePicker.new()
+	_dialog.bucket = "plugin_install"
+	_dialog.file_selected.connect(_install_path)
+	_dialog.dir_selected.connect(_install_path)
+	add_child(_dialog)
 
 
 func _apply_style() -> void:
@@ -243,16 +249,12 @@ func _uninstall_selected() -> void:
 
 func _pick_install() -> void:
 	if _dialog == null:
-		_dialog = FileDialog.new()
-		_dialog.file_mode = FileDialog.FILE_MODE_OPEN_ANY
-		_dialog.access = FileDialog.ACCESS_FILESYSTEM
-		_dialog.use_native_dialog = true
-		_dialog.filters = PackedStringArray(["*.zip ; Zip", "*.json ; Manifest"])
-		_dialog.file_selected.connect(_install_path)
-		_dialog.dir_selected.connect(_install_path)
-		add_child(_dialog)
-	_dialog.title = _t("plugins.install", "Install plugin")
-	_dialog.popup_centered_ratio(0.7)
+		return
+	_dialog.open({
+		"mode": "any",
+		"title": _t("plugins.install", "Install plugin"),
+		"filters": PackedStringArray(["*.zip ; Zip", "*.json ; Manifest"]),
+	})
 
 
 func _install_path(path: String) -> void:

@@ -19,27 +19,36 @@ const (
 	ProtocolAnthropicMessages = "anthropic-messages"
 )
 
-// DefaultMaxTokens is the outbound output-token cap (256k) applied when a
-// ModelRequest carries no positive MaxTokens. Every protocol adapter funnels
-// its wire cap through effectiveMaxTokens, so an unset request never leaves
-// the harness unbounded — and never reaches Anthropic Messages, where
-// max_tokens is a REQUIRED field, without one.
+// DefaultMaxTokens is the output-token cap used only when a route explicitly
+// requests a fallback AND the selected protocol requires max_tokens on the
+// wire (Anthropic Messages mandates it). OpenAI-family protocols omit the
+// field entirely when unset, so the provider applies the model's real bound
+// — this is the upstream wire contract (options.maxTokens === undefined ⇒
+// the field is absent). The previous "hard default 262144 on every request"
+// caused 400s on channels/models whose max output is below 262144
+// (e.g. deepseek-v4-flash capped at 65536).
 const DefaultMaxTokens = 262144
+
+// effectiveMaxTokensFor resolves the outbound max_tokens for a wire
+// protocol. Pass hasCap=true for protocols that REQUIRE the field
+// (Anthropic); pass false for protocols that tolerate omission
+// (OpenAI-family), in which case an unset request returns 0 so the
+// adapter omits the JSON key entirely.
+func effectiveMaxTokensFor(maxTokens int, requireField bool) int {
+	if maxTokens > 0 {
+		return maxTokens
+	}
+	if requireField {
+		return DefaultMaxTokens
+	}
+	return 0
+}
 
 // DefaultReasoningEffort is the reasoning effort assumed when a request leaves
 // ModelRequest.ReasoningEffort empty (upstream llm-deepseek resolves an
 // omitted effort to "high"): thinking mode is ON by default and an explicit
 // "off" is the only opt-out.
 const DefaultReasoningEffort = "high"
-
-// effectiveMaxTokens resolves the outbound output cap for a request value;
-// zero/negative (unset) falls back to DefaultMaxTokens.
-func effectiveMaxTokens(maxTokens int) int {
-	if maxTokens <= 0 {
-		return DefaultMaxTokens
-	}
-	return maxTokens
-}
 
 // ProviderProfile is the construction-time snapshot of one provider route.
 // Credentials may be supplied inline (APIKey) or resolved per Stream via

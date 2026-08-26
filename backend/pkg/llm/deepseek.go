@@ -47,7 +47,7 @@ type ModelInfo struct {
 // provider listings are merged in front of these entries; unknown selected
 // ids are kept as-is (ContextLimitForModel still uses the first window).
 var DefaultModels = []ModelInfo{
-	{ID: "deepseek-v4-flash", Name: "DeepSeek-V4-Flash", ContextWindow: 131072, Modalities: []string{"text"}},
+	{ID: "deepseek-v4-flash", Name: "DeepSeek-V4-Flash", ContextWindow: 1048576, Modalities: []string{"text"}},
 	{ID: "deepseek-v4-pro", Name: "DeepSeek-V4-Pro", ContextWindow: 131072, Modalities: []string{"text", "reasoning"}},
 	{ID: "deepseek-chat", Name: "DeepSeek Chat", ContextWindow: 131072, Modalities: []string{"text"}},
 	{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner", ContextWindow: 131072, Modalities: []string{"text", "reasoning"}},

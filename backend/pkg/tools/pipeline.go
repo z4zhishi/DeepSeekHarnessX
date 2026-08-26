@@ -142,7 +142,72 @@ type ToolRegistry struct {
 	// (TUI, gateway RPC, Godot) resolves /lines through it so the
 	// command/run -> command/done lifecycle lands in the session log once.
 	Commands *CommandRegistry
+	// ReviewTool is the small-model review seam for the "auto" (review)
+	// approval policy. It is injected by the host (gateway/TUI/headless) with
+	// a call into the shared LLM adapter; when nil, review mode falls back to
+	// asking the user for destructive tools (fail-closed, never auto-allow).
+	ReviewTool func(sessionID, reviewModel, toolName, argsJSON string, timeout time.Duration) ReviewVerdict
 }
+
+// ReviewVerdict is the small-model safety verdict for a destructive tool.
+type ReviewVerdict int
+
+const (
+	ReviewUncertain ReviewVerdict = iota // escalate to the user
+	ReviewAllow                          // safe enough to auto-run
+	ReviewDeny                           // refuse
+)
+
+func (r ReviewVerdict) String() string {
+	switch r {
+	case ReviewAllow:
+		return "allow"
+	case ReviewDeny:
+		return "deny"
+	default:
+		return "uncertain"
+	}
+}
+
+// isEditTool reports whether a tool is a file-edit/write tool — the family the
+// accept-edits policy auto-approves without asking.
+func isEditTool(name string) bool {
+	switch name {
+	case "write_file", "replace_file_content":
+		return true
+	}
+	return false
+}
+
+// isDestructiveTool reports whether a tool can mutate state outside the
+// workspace (shell, persistent shells, deletions, destructive git subcommands,
+// MCP writes) — the family the auto/review policy routes to the small model.
+func isDestructiveTool(name string) bool {
+	switch name {
+	case "run_command", "bash", "pwsh", "bash_persistent", "pwsh_persistent",
+		"delete_file", "delete_dir", "remove", "rm",
+		"run_shell", "terminal_send", "shell", "git_commit", "git_discard",
+		"git_stage", "git_unstage", "git_restore", "jobs_kill", "schedule_create",
+		"schedule_enable", "schedule_disable", "schedule_delete":
+		return true
+	}
+	return false
+}
+
+// reviewToolCall resolves the small-model verdict for one destructive tool
+// call. A nil ReviewTool or empty reviewModel always escalates to uncertain
+// (the user is asked), never silently auto-allows.
+func (r *ToolRegistry) reviewToolCall(ctx ToolExecutionContext, name, argsJSON string, pol SessionPolicy) ReviewVerdict {
+	if r.ReviewTool == nil {
+		return ReviewUncertain
+	}
+	if pol.ReviewModel == "" {
+		return ReviewUncertain
+	}
+	return r.ReviewTool(ctx.SessionID, pol.ReviewModel, name, argsJSON, reviewTimeout)
+}
+
+const reviewTimeout = 3 * time.Second
 
 // NewToolRegistry initializes a tool registry with standard builtin tools.
 func NewToolRegistry() *ToolRegistry {
@@ -208,15 +273,26 @@ func (r *ToolRegistry) ExecutePipeline(ctx ToolExecutionContext, name string, ar
 		return fmt.Sprintf("Error: unknown tool '%s'", name), true, nil
 	}
 
-	// 1. Permission / Approval Stage (session approval-policy knob:
-	// upstream effectiveApprovalPolicy 鈥?"never" rejects deterministically
-	// without asking, "ask" delegates to the answerer chain).
+	// 1. Permission / Approval Stage. The session's resolved approval policy
+	// decides whether this RequiresPerm tool runs without asking:
+	//   - never:         deterministic reject (read-only / plan)
+	//   - allow-all:     auto-allow everything (YOLO / full access)
+	//   - accept-edits:  auto-allow edit/write tools; commands still ask
+	//   - review:        auto-allow safe tools; destructive tools go to the
+	//                    small review model (allow / deny / uncertain -> ask)
+	//   - ask:           delegate to the answerer chain (default)
+	//   - (per-tool allow_all whitelist): skip the ask for a previously
+	//     "always allow" tool regardless of the policy above.
+	pol := SessionPolicy{Sandbox: DefaultSandboxMode, Approval: DefaultApprovalPolicy}
+	if r.Policy != nil {
+		pol = r.Policy.Get(ctx.SessionID)
+	}
 	if tool.RequiresPerm {
-		approvalPolicy := DefaultApprovalPolicy
-		if r.Policy != nil {
-			approvalPolicy = r.Policy.Get(ctx.SessionID).Approval
-		}
-		if approvalPolicy == session.ApprovalPolicyNever {
+		approvalPolicy := pol.Approval
+		remembered := r.Policy != nil && r.Policy.PolicyAllowed(ctx.SessionID, name)
+		var ask bool
+		switch approvalPolicy {
+		case session.ApprovalPolicyNever:
 			approvalID := fmt.Sprintf("approval-%d", time.Now().UnixNano())
 			if ctx.Emit != nil {
 				ctx.Emit("approval/asked", session.ApprovalAskedPayload{
@@ -225,9 +301,49 @@ func (r *ToolRegistry) ExecutePipeline(ctx ToolExecutionContext, name string, ar
 				ctx.Emit("approval/decided", session.ApprovalDecidedPayload{ID: approvalID, Outcome: "rejected"})
 			}
 			return "Permission denied by approval policy (never).", true, nil
+		case session.ApprovalPolicyAllowAll:
+			ask = false // full access: no prompt
+		case session.ApprovalPolicyAcceptEdits:
+			if isEditTool(name) {
+				ask = false // edit/write tools auto-allowed
+			} else {
+				ask = !remembered
+			}
+		case session.ApprovalPolicyReview:
+			switch {
+			case remembered:
+				ask = false
+			case !isDestructiveTool(name):
+				ask = false // safe tools auto-allowed
+			default:
+				// Destructive tool: ask the small review model first.
+				review := r.reviewToolCall(ctx, name, argsJSON, pol)
+				switch review {
+				case ReviewAllow:
+					ask = false
+				case ReviewDeny:
+					approvalID := fmt.Sprintf("approval-%d", time.Now().UnixNano())
+					if ctx.Emit != nil {
+						ctx.Emit("approval/asked", session.ApprovalAskedPayload{
+							ID: approvalID, ToolName: name, CallID: ctx.CallID, Reason: "approval-policy: review(deny)",
+						})
+						ctx.Emit("approval/decided", session.ApprovalDecidedPayload{ID: approvalID, Outcome: "rejected"})
+					}
+					return "Permission denied by auto-review model.", true, nil
+				default: // uncertain -> escalate to the user
+					ask = true
+				}
+			}
+		default: // ask
+			ask = !remembered
 		}
-	}
-	if tool.RequiresPerm && ctx.RequestUser != nil {
+		if !ask {
+			goto execution
+		}
+		// 无 answerer 时不拦：保持既有语义（headless/无审批宿主仍可跑工具）。
+		if ctx.RequestUser == nil {
+			goto execution
+		}
 		// Log-only audit pair (upstream approval/asked -> approval/decided).
 		approvalID := fmt.Sprintf("approval-%d", time.Now().UnixNano())
 		if ctx.Emit != nil {
@@ -238,11 +354,20 @@ func (r *ToolRegistry) ExecutePipeline(ctx ToolExecutionContext, name string, ar
 				Reason:   "user-approval waterfall",
 			})
 		}
-		decision, err := ctx.RequestUser(fmt.Sprintf("Allow tool '%s' with args: %s?", name, argsJSON), []string{"allow_once", "deny", "cancel"})
+		promptArgs := argsJSON
+		if len(promptArgs) > 4000 {
+			promptArgs = promptArgs[:1800] + "…" + promptArgs[len(promptArgs)-1800:]
+		}
+		decision, err := ctx.RequestUser(fmt.Sprintf("Allow tool '%s' with args: %s?", name, promptArgs), []string{"allow_once", "allow_all", "deny", "cancel"})
 		outcome := "cancelled"
 		switch decision {
 		case ApprovalAllowOnce:
 			outcome = "allowed-once"
+		case ApprovalAllowAll:
+			outcome = "allowed-always"
+			if r.Policy != nil {
+				r.Policy.RememberApproval(ctx.SessionID, name)
+			}
 		case ApprovalDeny:
 			outcome = "rejected"
 		case ApprovalCancel:
@@ -254,7 +379,9 @@ func (r *ToolRegistry) ExecutePipeline(ctx ToolExecutionContext, name string, ar
 		if err != nil || decision == ApprovalDeny || decision == ApprovalCancel {
 			return "Permission denied by user.", true, nil
 		}
-	} // 2. Execution Stage with timeout
+	}
+execution:
+
 	// Per-tool budget: a declared TimeoutMs (or an explicit NoTimeout opt-out)
 	// wins over the shared default, so tools whose internal design budgets
 	// exceed 60s (terminal_send 120s, job_output waits up to 600s) are never

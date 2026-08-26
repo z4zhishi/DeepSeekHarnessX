@@ -330,9 +330,11 @@ func buildDeepSeekRequest(req ModelRequest) deepSeekRequest {
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature
 	}
-	// Output cap: an unset (<=0) request falls back to DefaultMaxTokens so the
-	// wire always carries a bounded max_tokens.
-	body.MaxTokens = effectiveMaxTokens(req.MaxTokens)
+	// Output cap: OpenAI-family chat completions OMITS max_tokens when unset
+	// (omitempty + 0 from effectiveMaxTokensFor(false)), letting the provider
+	// apply the model's real bound. Only Anthropic, where max_tokens is
+	// REQUIRED, pulls the DefaultMaxTokens fallback.
+	body.MaxTokens = effectiveMaxTokensFor(req.MaxTokens, false)
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, deepSeekTool{
 			Type: "function",

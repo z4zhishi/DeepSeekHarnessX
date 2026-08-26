@@ -70,6 +70,10 @@ type Agent struct {
 	LlmAdapter   llm.LlmAdapter
 	SystemPrompt string
 	ModelName    string
+	// Effort overrides the reasoning_effort sent to the model for this agent
+	// ("off" | "low" | "high" | "max"). Empty means the provider default. The
+	// GUI/TUI set it per session (mirrors tunedAdapter's live override).
+	Effort string
 
 	nextTurnChan chan session.UserMessagePayload
 	nextStepChan chan session.ContentBlock
@@ -670,14 +674,20 @@ func (a *Agent) finishTurnReason(kind, message string) {
 // dispatchHook runs the CC-style hooks runtime at one interception point. It is
 // a no-op when the runtime is not wired (HookBus or Hooks nil). Each matching
 // command hook first emits hook/invoked, then (after running) hook/result, so
-// the durable log carries the paired lifecycle audit. A failure is isolated and
-// never blocks the loop; decisions are ignored (blocking via PreToolUse hooks is
-// intentionally not applied here — the loop keeps its own permission policy).
-func (a *Agent) dispatchHook(point, subject string, turn int) {
+// the durable log carries the paired lifecycle audit; a failure is isolated and
+// never panics. Returns true when any hook decided to BLOCK (exit code 2), so a
+// PreToolUse hook can actually gate the tool call.
+func (a *Agent) dispatchHook(point, subject string, turn int) bool {
 	if a.HookBus == nil || a.Hooks == nil {
-		return
+		return false
 	}
-	a.HookBus.DispatchHook(a.ctx, a.Hooks, point, subject, turn)
+	os := a.HookBus.DispatchHook(a.ctx, a.Hooks, point, subject, turn)
+	for _, o := range os {
+		if o.Decision == "block" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) actorLoop() {
@@ -784,10 +794,11 @@ turns:
 				}
 
 				modelReq := llm.ModelRequest{
-					Model:    a.ModelName,
-					Messages: derivedMsgs,
-					System:   a.SystemPrompt,
-					Tools:    toolDecls,
+					Model:           a.ModelName,
+					Messages:        derivedMsgs,
+					System:          a.SystemPrompt,
+					Tools:           toolDecls,
+					ReasoningEffort: a.Effort, // "" => provider default
 				}
 
 				// Log-only request/header snapshot (upstream EpochHeader):
@@ -872,10 +883,11 @@ turns:
 								streamDone = true
 								break
 							}
-							_ = a.emitBoundary(session.EventTurnEnd, session.TurnEndPayload{
-								Turn:   turn,
-								Reason: session.TurnEndReason{Kind: "error", Message: err.Error()},
-							})
+							if !a.turnEndError(turn, err) {
+								llmFailed = true
+								streamDone = true
+								break
+							}
 							llmFailed = true
 							streamDone = true
 						}
@@ -1019,7 +1031,7 @@ turns:
 						})
 
 						execCtx := tools.ToolExecutionContext{
-							Context:     a.ctx,
+							Context:     turnCtx,
 							SessionID:   a.Header.ID,
 							Cwd:         a.Header.Cwd,
 							Turn:        turn,
@@ -1036,12 +1048,21 @@ turns:
 						}
 
 						// CC PreToolUse hook: runs with the tool name as subject
-						// before the call executes (best-effort; a hook failure or
-						// "block" decision does not gate the loop's own approval
-						// policy).
-						a.dispatchHook(plugin.HookPointPreToolUse, tc.Name, turn)
-
-						resStr, isErr, _ := a.Tools.ExecutePipeline(execCtx, tc.Name, tc.Arguments)
+						// before the call executes. A hook that exits 2 (block)
+						// now actually gates the tool: the call is skipped and a
+						// tool-result error records the deny reason (the loop's
+						// own permission policy still applies separately).
+						resStr := ""
+						isErr := false
+						hookBlocked := a.dispatchHook(plugin.HookPointPreToolUse, tc.Name, turn)
+						if hookBlocked {
+							isErr = true
+							resStr = "[blocked by PreToolUse hook]"
+						} else {
+							var pipeErr error
+							resStr, isErr, pipeErr = a.Tools.ExecutePipeline(execCtx, tc.Name, tc.Arguments)
+							_ = pipeErr
+						}
 
 						// Spill oversized plain-text results out of the model
 						// context: results over the threshold are persisted to a
@@ -1076,6 +1097,24 @@ turns:
 						// CC PostToolUse hook: runs after the tool result entered
 						// the log, with the tool name as subject (best-effort).
 						a.dispatchHook(plugin.HookPointPostToolUse, tc.Name, turn)
+
+						if turnCtx.Err() != nil {
+							if a.ctx.Err() != nil {
+								a.finishTurnReason("aborted", "User aborted")
+								a.isRunning.Store(false)
+								a.clearTurnCtx()
+								return
+							}
+							a.finishTurnReason("aborted", "User aborted")
+							a.isRunning.Store(false)
+							a.clearTurnCtx()
+							turnClosed = true
+							turnFinished = true
+							break
+						}
+					}
+					if turnClosed {
+						break
 					}
 				} else {
 					// No more tools to run; turn complete
@@ -1361,6 +1400,40 @@ func classifyLlmError(err error) *llmRetryError {
 	return nil
 }
 
+// classifyProviderCode extracts the structured provider failure code for an
+// LLM error so the host (GUI modal vs inline hint) can react without re-parsing
+// the message string. AUTH → "AUTH"; an INVALID_REQUEST with a context-window
+// signature → "CONTEXT_WINDOW_EXCEEDED"; otherwise the raw provider code or
+// "UNKNOWN". The zero value ("") means "no structured code" and is treated as a
+// non-blocking inline failure by the host.
+func classifyProviderCode(err error) string {
+	var dpe *llm.DeepSeekProviderError
+	if errors.As(err, &dpe) && dpe != nil {
+		if dpe.Code != "" {
+			return dpe.Code
+		}
+	}
+	return "UNKNOWN"
+}
+
+// turnEndError emits a turn/end error reason carrying the structured provider
+// code, so the host can route AUTH (401/403) to a modal and param/config
+// failures (400/INVALID_REQUEST) to an inline, non-blocking hint.
+func (a *Agent) turnEndError(turn int, err error) bool {
+	code := classifyProviderCode(err)
+	if code == "" {
+		code = "UNKNOWN"
+	}
+	return a.emitBoundary(session.EventTurnEnd, session.TurnEndPayload{
+		Turn: turn,
+		Reason: session.TurnEndReason{
+			Kind:    "error",
+			Message: err.Error(),
+			Code:    code,
+		},
+	})
+}
+
 // backoffDelay computes the jittered exponential backoff for retry attempt n
 // (1-based): min(initial * 2^(n-1), max) scaled by a symmetric random factor
 // in [1-jitter, 1+jitter], never above max (upstream localDelay).
@@ -1415,10 +1488,10 @@ func buildToolResultView(name, out string, isErr bool) *session.ToolResultView {
 	if isCommandTool(name) {
 		return &session.ToolResultView{
 			Kind:     "terminal",
-			Terminal: &session.TerminalView{Lines: splitLines(out), ExitCode: boolToExit(isErr)},
+			Terminal: &session.TerminalView{Lines: capLines(splitLines(out), 240), ExitCode: boolToExit(isErr)},
 		}
 	}
-	return &session.ToolResultView{Kind: "text", Text: out}
+	return &session.ToolResultView{Kind: "text", Text: capText(out, 32*1024)}
 }
 
 // buildToolCallView derives the running-card rendering intent for an in-flight
@@ -1509,6 +1582,38 @@ func splitLines(s string) []string {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
+}
+
+// capLines keeps a head+tail of lines so a huge shell dump cannot freeze the
+// GUI/TUI renderer. The model-facing tool-result text is unchanged.
+func capLines(lines []string, max int) []string {
+	if max <= 0 || len(lines) <= max {
+		return lines
+	}
+	head := max / 2
+	if head < 1 {
+		head = 1
+	}
+	tail := max - head
+	out := make([]string, 0, max+1)
+	out = append(out, lines[:head]...)
+	out = append(out, fmt.Sprintf("… %d lines omitted …", len(lines)-max))
+	out = append(out, lines[len(lines)-tail:]...)
+	return out
+}
+
+// capText keeps a head+tail of a view payload. Rune-counted so CJK is not
+// sliced mid-character.
+func capText(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	head := max / 2
+	return string(r[:head]) + "\n…\n" + string(r[len(r)-head:])
 }
 
 func boolToExit(isErr bool) int {

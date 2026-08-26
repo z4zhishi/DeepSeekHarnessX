@@ -12,6 +12,7 @@ const MAX_PAIR := 400000
 var _expanded: bool = true
 var _raw: String = ""
 var _plain: String = ""
+var _applying_style: bool = false
 
 
 func _ready() -> void:
@@ -38,7 +39,7 @@ func _ready() -> void:
 
 
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_THEME_CHANGED:
+	if what == NOTIFICATION_THEME_CHANGED and not _applying_style:
 		_apply_style()
 
 
@@ -95,6 +96,9 @@ func _setup_diffs(diffs: Array) -> void:
 
 
 func _apply_style() -> void:
+	if _applying_style:
+		return
+	_applying_style = true
 	add_theme_stylebox_override("panel", DshTokens.box(
 		DshTokens.bg_code(),
 		DshTokens.RADIUS_MD,
@@ -102,12 +106,14 @@ func _apply_style() -> void:
 		1,
 		Vector4(12, 8, 12, 8)
 	))
-	header_label.add_theme_color_override("font_color", DshTokens.text_primary())
-	header_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
-	if icon_rect:
+	if header_label != null:
+		header_label.add_theme_color_override("font_color", DshTokens.text_primary())
+		header_label.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
+	if icon_rect != null:
 		icon_rect.modulate = DshTokens.text_secondary()
 	if is_node_ready() and text_label and _raw != "":
 		text_label.add_theme_color_override("default_color", DshTokens.text_secondary())
+	_applying_style = false
 
 
 func _toggle() -> void:

@@ -44,13 +44,18 @@ func bind(node: Dictionary) -> void:
 func _apply_style() -> void:
 	if bubble == null or body == null:
 		return
-	bubble.add_theme_stylebox_override("panel", DshTokens.box(
+	# 用户气泡：accent 描边 + 轻阴影（与 assistant 无框流形成对比）。
+	var bubble_box := DshTokens.box(
 		DshTokens.bg_bubble(),
 		DshTokens.RADIUS_LG,
-		DshTokens.border_l1(),
-		0,
+		DshTokens.border_l2(),
+		1,
 		Vector4(14, 10, 14, 10)
-	))
+	)
+	bubble_box.shadow_color = DshTokens.shadow_tinted()
+	bubble_box.shadow_size = 10
+	bubble_box.shadow_offset = Vector2(0, 4)
+	bubble.add_theme_stylebox_override("panel", bubble_box)
 
 
 func _fit_bubble() -> void:

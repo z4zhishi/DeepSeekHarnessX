@@ -74,7 +74,10 @@ func show_tool(name: String, input_text: String, output_text: String) -> void:
 
 
 func set_collapsed(collapsed: bool) -> void:
-	visible = not collapsed
+	var want := not collapsed
+	if visible == want:
+		return
+	visible = want
 
 
 func _show_empty(empty: bool) -> void:

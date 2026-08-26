@@ -9,6 +9,7 @@ import (
 
 	"dsh-go/pkg/llm"
 	"dsh-go/pkg/session"
+	"dsh-go/pkg/workflow"
 )
 
 const (
@@ -22,6 +23,7 @@ const (
 	ColorMagenta = "\033[35m"
 	ColorCyan    = "\033[36m"
 	ColorGray    = "\033[90m"
+	ColorReverse = "\033[7m"
 )
 
 const (
@@ -122,7 +124,11 @@ func (u *UI) close() {
 	u.wg.Wait()
 }
 
-func banner() string {
+// banner renders the startup header. model identifies the active LLM route and
+// cwd the working directory the session operates in — both are shown because
+// "which model am I talking to / where will tools write" are the first two
+// questions every new terminal session raises (ux-benchmark 快胜#2).
+func banner(model, cwd string) string {
 	var b strings.Builder
 	b.WriteString(ColorBold)
 	b.WriteString(ColorCyan)
@@ -133,6 +139,19 @@ func banner() string {
 	b.WriteString("DeepSeekHarnessX terminal")
 	b.WriteString(ColorReset)
 	b.WriteString("\n")
+	if model != "" || cwd != "" {
+		dim := func(label, value string) string {
+			return ColorGray + label + ColorReset + ColorDim + value + ColorReset
+		}
+		if model != "" {
+			b.WriteString(dim("model: ", model))
+			b.WriteString("\n")
+		}
+		if cwd != "" {
+			b.WriteString(dim("cwd:   ", cwd))
+			b.WriteString("\n")
+		}
+	}
 	b.WriteString("Type instructions, ")
 	b.WriteString(ColorYellow)
 	b.WriteString("/help")
@@ -186,9 +205,144 @@ func formatEnvelope(env *session.SessionEnvelope) (text string, promptAfter bool
 		return formatToolResult(env), false
 	case session.EventTurnEnd:
 		return fmt.Sprintf("%s\n[Turn Completed]%s\n\n", ColorDim, ColorReset), true
+	case session.EventToolWorkflowRunStart,
+		session.EventToolWorkflowAgentStart,
+		session.EventToolWorkflowAgentEnd,
+		session.EventToolWorkflowRunEnd:
+		return formatWorkflowEvent(env), false
+	case session.EventSubagentDescriptor:
+		return formatSubagentDescriptor(env), false
 	default:
 		return "", false
 	}
+}
+
+// dimStatus renders one quiet progress line ("◇ …") so long workflow/subagent
+// stretches stay visible instead of silent (ux-benchmark P1-5 TUI half).
+// kindOfEvent maps a session envelope type to a scrollback structural kind so
+// the retained transcript can be navigated (select/jump-turn/fold), not merely
+// paged as a flat line stream.
+func kindOfEvent(typ string) scrollKind {
+	switch typ {
+	case session.EventUserMessage:
+		return scrollUser
+	case session.EventAssistantChunk:
+		return scrollAssistant
+	case session.EventToolCall, session.EventToolResult:
+		return scrollTool
+	case session.EventTurnStart:
+		return scrollTurnStart
+	case session.EventTurnEnd:
+		return scrollTurnEnd
+	default:
+		return scrollPlain
+	}
+}
+
+func dimStatus(s string) string {
+	return ColorDim + "◇ " + s + ColorReset + "\n"
+}
+
+// formatWorkflowEvent maps one tool-workflow/* envelope to its status line.
+// Payloads are the upstream tool-workflow/types.ts shapes (pkg/workflow); any
+// field that arrives empty is omitted rather than guessed.
+func formatWorkflowEvent(env *session.SessionEnvelope) string {
+	switch env.Type {
+	case session.EventToolWorkflowRunStart:
+		var d workflow.RunStartData
+		if json.Unmarshal(env.Data, &d) != nil {
+			return ""
+		}
+		name := d.Name
+		if name == "" {
+			name = string(d.RunID)
+		}
+		return dimStatus(fmt.Sprintf("workflow %s: run started", name))
+	case session.EventToolWorkflowAgentStart:
+		var d workflow.AgentStartData
+		if json.Unmarshal(env.Data, &d) != nil {
+			return ""
+		}
+		var b strings.Builder
+		b.WriteString("workflow ")
+		b.WriteString(runNameOrID(d.RunID))
+		fmt.Fprintf(&b, ": agent #%d", d.Seq)
+		if d.Label != "" {
+			fmt.Fprintf(&b, " (%s)", d.Label)
+		}
+		b.WriteString(" started")
+		if d.Phase != "" {
+			fmt.Fprintf(&b, " · phase %s", d.Phase)
+		}
+		return dimStatus(b.String())
+	case session.EventToolWorkflowAgentEnd:
+		var d workflow.AgentEndData
+		if json.Unmarshal(env.Data, &d) != nil {
+			return ""
+		}
+		outcome := d.Outcome
+		if outcome == "" {
+			outcome = "?"
+		}
+		return dimStatus(fmt.Sprintf("workflow %s: agent #%d %s",
+			runNameOrID(d.RunID), d.Seq, outcome))
+	default: // run-end
+		var d workflow.RunEndData
+		if json.Unmarshal(env.Data, &d) != nil {
+			return ""
+		}
+		stop := d.StopReason
+		if stop == "" {
+			stop = "?"
+		}
+		return dimStatus(fmt.Sprintf("workflow %s: run %s", runNameOrID(d.RunID), stop))
+	}
+}
+
+// runNameOrID falls back to the raw run id when a caller-only event carries no
+// display name (agent-start/end/run-end payloads are nameless).
+func runNameOrID(id workflow.RunID) string {
+	if id == "" {
+		return "(unknown)"
+	}
+	return string(id)
+}
+
+// formatSubagentDescriptor renders the subagent/descriptor lifecycle line.
+// The type sits in the known-event vocabulary but this deployment has no
+// emitter yet, so fields are parsed tolerantly and unknown ones omitted.
+func formatSubagentDescriptor(env *session.SessionEnvelope) string {
+	var d struct {
+		ID   string `json:"id"`
+		Role string `json:"role"`
+	}
+	_ = json.Unmarshal(env.Data, &d)
+	if d.ID == "" && d.Role == "" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if d.Role != "" {
+		parts = append(parts, d.Role)
+	}
+	if short := shortSessionID(d.ID); short != "" {
+		parts = append(parts, "("+short+")")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return dimStatus("subagent spawned: " + strings.Join(parts, " "))
+}
+
+// shortSessionID trims a child-session id to its trailing segment (the
+// "<parent>/sub-<n>" form collapses to "sub-<n>").
+func shortSessionID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if i := strings.LastIndexByte(id, '/'); i >= 0 && i+1 < len(id) {
+		return id[i+1:]
+	}
+	return id
 }
 
 func formatToolResult(env *session.SessionEnvelope) string {

@@ -508,7 +508,9 @@ var generalSettingsSchema = []byte(`{
 	"properties": {
 		"language": { "type": "string", "default": "auto" },
 		"composerEnter": { "type": "boolean", "default": true },
-		"model": { "type": "string", "default": "deepseek-v4-flash" }
+		"model": { "type": "string", "default": "deepseek-v4-flash" },
+		"autoReviewModel": { "type": "string", "default": "" },
+		"contextWindow": { "type": "string", "default": "" }
 	}
 }`)
 

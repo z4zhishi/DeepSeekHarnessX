@@ -117,9 +117,10 @@ func buildResponsesRequest(req ModelRequest) responsesRequest {
 	if req.Temperature != nil {
 		body.Temperature = req.Temperature
 	}
-	// Output cap: an unset (<=0) request falls back to DefaultMaxTokens so the
-	// wire always carries a bounded max_output_tokens.
-	body.MaxOutputTokens = effectiveMaxTokens(req.MaxTokens)
+	// Output cap: when unset (0) the field is omitted on the wire so the
+	// provider applies the model's real bound (OpenAI Responses tolerates
+	// omission, unlike Anthropic Messages which requires it).
+	body.MaxOutputTokens = effectiveMaxTokensFor(req.MaxTokens, false)
 	for _, t := range req.Tools {
 		params := t.Parameters
 		if len(params) == 0 {

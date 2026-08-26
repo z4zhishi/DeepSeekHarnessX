@@ -95,8 +95,16 @@ type Server struct {
 	subagents *subagent.Manager
 	// pendingApprovals tracks in-flight one-shot permission requests keyed by callId;
 	// the Godot GUI answers via the approval.respond RPC (mirrors ACP bridge).
-	pendingApprovals map[string]chan tools.ApprovalDecision
+	pendingApprovals map[string]*pendingApproval
 	mu               sync.RWMutex
+}
+
+// pendingApproval is one in-flight host/permission-request. sessionID lets
+// session.abort/stop cancel every prompt belonging to that session so a GUI
+// Stop cannot leave the actor parked inside askApproval until the 60s timeout.
+type pendingApproval struct {
+	sessionID string
+	ch        chan tools.ApprovalDecision
 }
 
 // NewServer creates a new API server.
@@ -113,7 +121,7 @@ func NewServerWithVersion(store SessionStore, toolReg *tools.ToolRegistry, adapt
 		LlmAdapter:       adapter,
 		Version:          version,
 		agents:           make(map[string]*agent.Agent),
-		pendingApprovals: make(map[string]chan tools.ApprovalDecision),
+		pendingApprovals: make(map[string]*pendingApproval),
 	}
 	s.Hub.Replay = func(sessionID string, fromSeq int) []session.SessionEnvelope {
 		if s.Store == nil || sessionID == "" {
@@ -125,7 +133,70 @@ func NewServerWithVersion(store SessionStore, toolReg *tools.ToolRegistry, adapt
 		}
 		return events
 	}
+	// Wire the small-model review seam for the "auto" (review) approval policy.
+	// The gateway's LlmAdapter answers a one-shot safety judgment; when the
+	// adapter is nil or the call fails, the pipeline escalates to the user.
+	if toolReg != nil {
+		toolReg.ReviewTool = s.reviewToolCall
+	}
 	return s
+}
+
+// reviewToolCall asks the configured small review model whether one tool call
+// is safe to auto-run. It returns allow / deny / uncertain (escalate) based on
+// a single short completion; any error resolves to uncertain so the user is
+// always asked rather than silently auto-allowed.
+func (s *Server) reviewToolCall(sessionID, reviewModel, toolName, argsJSON string, timeout time.Duration) tools.ReviewVerdict {
+	if s.LlmAdapter == nil || reviewModel == "" {
+		return tools.ReviewUncertain
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req := llm.ModelRequest{
+		Model:           reviewModel,
+		SessionID:       sessionID,
+		Purpose:         "approval-review",
+		ReasoningEffort: "off",
+		System:          "You judge whether one tool call is safe to auto-run for the local user. Answer with exactly one word: allow, deny, or uncertain. allow = read-only or contained in the workspace; deny = destructive or escapes the workspace; uncertain = needs the user.",
+		Messages: []session.ModelMessage{
+			{Role: "user", Content: []session.ContentBlock{{
+				Type: "text",
+				Text: fmt.Sprintf("Tool: %s\nArguments: %s\nVerdict (allow/deny/uncertain):", toolName, argsJSON),
+			}}},
+		},
+	}
+	chunks, errs := s.LlmAdapter.Stream(ctx, req)
+	var out strings.Builder
+	done := false
+	for !done {
+		select {
+		case c, ok := <-chunks:
+			if !ok {
+				chunks = nil
+				// Drain any error (usually nil on clean finish).
+				select {
+				case <-errs:
+				default:
+				}
+				done = true
+				continue
+			}
+			if c.Text != "" {
+				out.WriteString(c.Text)
+			}
+		case <-ctx.Done():
+			return tools.ReviewUncertain
+		}
+	}
+	verdict := strings.ToLower(strings.TrimSpace(out.String()))
+	switch {
+	case strings.Contains(verdict, "allow"):
+		return tools.ReviewAllow
+	case strings.Contains(verdict, "deny"):
+		return tools.ReviewDeny
+	default:
+		return tools.ReviewUncertain
+	}
 }
 
 // Routes sets up all HTTP routes matching DSH gateway specs.
@@ -378,6 +449,48 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			"tokenUsageOutput": metrics.TokenUsage.OutputTokens,
 		}, nil
 
+	case "session.policy":
+		// {sessionId} -> {mode, sandbox, approval, reviewModel, preset}
+		// Echoes the session's resolved permission policy so the GUI's access
+		// dropdown always reflects the real backend state (not a stale default).
+		sessionID, _ := payload["sessionId"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.policy requires a sessionId")
+		}
+		if s.Tools == nil || s.Tools.Policy == nil {
+			return nil, fmt.Errorf("policy service unavailable")
+		}
+		pol := s.Tools.Policy.Get(sessionID)
+		return map[string]any{
+			"mode":        string(pol.Mode()),
+			"sandbox":     string(pol.Sandbox),
+			"approval":    string(pol.Approval),
+			"reviewModel": pol.ReviewModel,
+			"preset":      pol.Preset,
+		}, nil
+
+	case "session.effort":
+		// {sessionId, effort} -> {effort}
+		// Sets the per-session reasoning effort ("off"|"low"|"high"|"max")
+		// that the agent applies to the next model request. Mirrors the TUI's
+		// tunedAdapter override so the Godot header ⚙ popup and /thinking stay
+		// consistent. get leaves it unchanged (empty effort => read back).
+		sessionID, _ := payload["sessionId"].(string)
+		effort, _ := payload["effort"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.effort requires a sessionId")
+		}
+		ag, err := s.ensureLiveAgent(sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if effort != "" {
+			if eff, ok := normalizeEffort(effort); ok {
+				ag.Effort = eff
+			}
+		}
+		return map[string]any{"effort": ag.Effort}, nil
+
 	case "session.prompt":
 		sessionID, _ := payload["sessionId"].(string)
 		text, _ := payload["text"].(string)
@@ -438,6 +551,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			return map[string]any{"aborted": true}, nil
 		}
 		ag.AbortTurn()
+		s.cancelSessionApprovals(sessionID)
 		return map[string]any{"aborted": true}, nil
 
 	case "session.stop":
@@ -452,6 +566,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			return nil, fmt.Errorf("session not found or active: %s", sessionID)
 		}
 		ag.Stop()
+		s.cancelSessionApprovals(sessionID)
 		return map[string]any{"stopped": true}, nil
 
 	case "command.list":
@@ -960,30 +1075,151 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		}
 		return map[string]any{"name": name, "enabled": enabled}, nil
 
+	case "git.detect":
+		// {} -> {isRepo, root, repoRoot?, head?, detached?, sha?, reason?}
+		return s.gitService().Detect(ctx)
+
+	case "git.status":
+		// {} -> {branch, oid?, upstream?, ahead, behind, detached?, clean, entries:[...]}
+		return s.gitService().Status(ctx)
+
+	case "git.diff":
+		// {path?, staged?} -> {patch, truncated?, stats:[{path, additions, deletions, binary?}],
+		//                      totalAdditions, totalDeletions}
+		g := s.gitService()
+		staged, _ := payload["staged"].(bool)
+		return g.Diff(ctx, strAny(payload["path"], ""), staged)
+
+	case "git.log":
+		// {limit?, offset?} -> {commits:[{hash, abbrev, author, timestamp, subject}]}
+		limitF, _ := payload["limit"].(float64)
+		offsetF, _ := payload["offset"].(float64)
+		return s.gitService().Log(ctx, int(limitF), int(offsetF))
+
+	case "git.branches":
+		// {} -> {current?, detached?, sha?, branches:[{name, kind, fullRef, sha,
+		//        isHead?, upstream?, ahead?, behind?, gone?}]}
+		return s.gitService().Branches(ctx)
+
+	case "git.stage":
+		// {paths:[...]} -> {count}
+		return s.gitService().Stage(ctx, toStringSlice(payload["paths"]))
+
+	case "git.unstage":
+		// {paths:[...]} -> {count}
+		return s.gitService().Unstage(ctx, toStringSlice(payload["paths"]))
+
+	case "git.commit":
+		// {message} -> {committed, sha}
+		message, _ := payload["message"].(string)
+		return s.gitService().Commit(ctx, message)
+
+	case "git.discard":
+		// {path, confirm} -> {count}; confirm=false is refused with an
+		// explanation of the irreversible consequences.
+		path, _ := payload["path"].(string)
+		confirm, _ := payload["confirm"].(bool)
+		return s.gitService().Discard(ctx, path, confirm)
+
 	case "approval.respond":
-		// GUI 对 host/permission-request 的一次性决策（allow_once/deny/cancel）。
+		// GUI 对 host/permission-request 的一次性决策（allow_once/allow_all/deny/cancel）。
 		callID, _ := payload["callId"].(string)
-		outcome, _ := payload["decision"].(string)
+		decisionText, _ := payload["decision"].(string)
+		var decision tools.ApprovalDecision
+		switch decisionText {
+		case "allow_once":
+			decision = tools.ApprovalAllowOnce
+		case "allow_all":
+			// 本会话总是允许：pipeline.go 已定义该决策语义（工具白名单记忆），
+			// GUI 审批卡第三主按钮直发此值；缺此分支会被 default 折叠成 cancel。
+			decision = tools.ApprovalAllowAll
+		case "deny":
+			decision = tools.ApprovalDeny
+		default:
+			decision = tools.ApprovalCancel
+		}
+		// 取走并注销该在途审批。发送与注销必须发生在同一把 s.mu 临界区内：
+		// 它与 askApproval 超时路径的存活检查配对，使双方对"谁拥有裁决权"的
+		// 判定原子一致（否则超时侧可能在决策已投递后误判仍在等待）。容量 1
+		// 的缓冲通道保证持锁发送不会阻塞。
 		s.mu.Lock()
-		ch, ok := s.pendingApprovals[callID]
+		rec, ok := s.pendingApprovals[callID]
 		if ok {
 			delete(s.pendingApprovals, callID)
+			rec.ch <- decision
 		}
 		s.mu.Unlock()
 		if !ok {
 			return map[string]any{"status": "unknown"}, nil
 		}
-		// 审批已决：撤下重放帧，后续重连的下行不再复活该弹窗。
-		s.Hub.unstageReplay(callID)
-		switch outcome {
-		case "allow_once":
-			ch <- tools.ApprovalAllowOnce
-		case "deny":
-			ch <- tools.ApprovalDeny
-		default:
-			ch <- tools.ApprovalCancel
+		// 终态广播：所有在途 GUI 弹窗随 host/permission-resolved 关闭；
+		// 同一 hub 临界区内撤下重放帧，后续重连的下行不再复活该审批
+		// （广播与撤暂存的原子配对见 resolvePermission）。
+		outcome := "cancelled"
+		switch decision {
+		case tools.ApprovalAllowOnce, tools.ApprovalAllowAll:
+			outcome = "allowed"
+		case tools.ApprovalDeny:
+			outcome = "denied"
 		}
+		s.Hub.resolvePermission(callID, outcome)
 		return map[string]any{"status": "ok"}, nil
+
+	case "session.rename":
+		// {sessionId, title} -> {ok:true}。用户固定命名：经该会话 actor 落一条
+		// session/title 事件（source.kind="user"），与 AutoTitle 的 fallback
+		// 快照同构，GUI 依最新一条 title 事件取标题。零存储契约变更。
+		sessionID, _ := payload["sessionId"].(string)
+		title, _ := payload["title"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.rename requires a sessionId")
+		}
+		title = strings.TrimSpace(title)
+		if title == "" {
+			return nil, fmt.Errorf("session.rename requires a non-empty title")
+		}
+		if len([]rune(title)) > maxRenameTitleRunes {
+			return nil, fmt.Errorf("session.rename title too long: %d runes (max %d)",
+				len([]rune(title)), maxRenameTitleRunes)
+		}
+		ag, err := s.ensureLiveAgent(sessionID)
+		if err != nil {
+			return nil, fmt.Errorf("cannot rename %s: %w", sessionID, err)
+		}
+		if _, err := ag.EmitEvent(session.EventSessionTitle, map[string]any{
+			"title":       title,
+			"messageSeqs": []int{},
+			"source":      map[string]any{"kind": "user"},
+		}); err != nil {
+			return nil, fmt.Errorf("append session/title: %w", err)
+		}
+		return map[string]any{"ok": true}, nil
+
+	case "session.delete":
+		// {sessionId} -> {ok:true}。软删除：从 Store 删除 header，停止 live agent，
+		// 广播 host/session-deleted 供前端移除列表项。
+		sessionID, _ := payload["sessionId"].(string)
+		if sessionID == "" {
+			return nil, fmt.Errorf("session.delete requires a sessionId")
+		}
+		if _, ok := s.lookupHeader(sessionID); !ok {
+			return nil, fmt.Errorf("session not found: %s", sessionID)
+		}
+		s.mu.Lock()
+		agDel, hasAg := s.agents[sessionID]
+		delete(s.agents, sessionID)
+		s.mu.Unlock()
+		if hasAg && agDel != nil {
+			agDel.Stop()
+		}
+		if deleter, ok := s.Store.(interface{ DeleteSession(string) error }); ok {
+			if err := deleter.DeleteSession(sessionID); err != nil {
+				// header 已从内存移除，持久层失败仅告警不回滚
+				_ = err
+			}
+		}
+		s.Hub.BroadcastHostEvent("host/session-deleted", map[string]any{"id": sessionID})
+		return map[string]any{"ok": true}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown gateway RPC method: %s", method)
@@ -1337,6 +1573,17 @@ func strAny(v any, def string) string {
 // s.Model is authoritative and is never clamped to the static catalog, so a
 // live provider id stays selected. Empty falls back to the active profile's
 // model, then DefaultModels[0].
+// normalizeEffort maps a user-supplied effort string to a valid
+// reasoning_effort value ("off"|"low"|"high"|"max"); unknown → false.
+func normalizeEffort(e string) (string, bool) {
+	switch e {
+	case "off", "low", "high", "max":
+		return e, true
+	default:
+		return "", false
+	}
+}
+
 func (s *Server) configuredModel() string {
 	if s.Model != "" {
 		return s.Model
@@ -1432,6 +1679,29 @@ func (s *Server) workspaceList() []map[string]any {
 	return list
 }
 
+// gitService binds a GitService to the active workspace root, resolving the
+// root exactly like workspaceList does: first managed workspace, then the
+// injected Workspaces roots, else the process working directory. Constructed
+// per call (it is stateless) so workspace changes take effect immediately
+// without touching the Server wiring.
+func (s *Server) gitService() *tools.GitService {
+	root := ""
+	if s.WorkspaceMgr != nil {
+		if list := s.WorkspaceMgr.List(); len(list) > 0 {
+			root = list[0].Path
+		}
+	}
+	if root == "" && len(s.Workspaces) > 0 && s.Workspaces[0] != "" {
+		root = s.Workspaces[0]
+	}
+	if root == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			root = cwd
+		}
+	}
+	return tools.NewGitService(root)
+}
+
 // toStringSlice coerces a []any of strings into a []string (lenient: nil -> empty).
 func toStringSlice(v any) []string {
 	arr, ok := v.([]any)
@@ -1522,11 +1792,46 @@ var approvalTimeoutNanos atomic.Int64
 
 func setApprovalTimeout(d time.Duration) { approvalTimeoutNanos.Store(int64(d)) }
 
+// maxRenameTitleRunes bounds session.rename titles (rune-counted so CJK
+// titles get the same 200 characters as Latin ones).
+const maxRenameTitleRunes = 200
+
 func approvalTimeoutDelay() time.Duration {
 	if n := approvalTimeoutNanos.Load(); n > 0 {
 		return time.Duration(n)
 	}
 	return 60 * time.Second
+}
+
+// resolvePermission closes out one approval on the host downlink: it first
+// broadcasts host/permission-resolved {callId, outcome} so every connected GUI
+// dismisses its modal, then unstages the replay frame inside the same hub
+// critical section. The order is load-bearing: a downlink reconnecting between
+// broadcast and unstage receives the resolved frame live and must NOT also get
+// the dead request replayed — holding h.mu across both makes the snapshot
+// (registerMux/registerHost) see either "request staged, no resolution" or
+// "resolution sent, request gone", never a resurrected prompt.
+//
+// outcome vocabulary aligns with approval.respond decisions:
+// "allowed" | "denied" | "cancelled" | "timeout".
+func (h *DownlinkHub) resolvePermission(callID, outcome string) {
+	h.mu.Lock()
+	frame, err := encodeHostEvent("host/permission-resolved", map[string]any{
+		"callId":  callID,
+		"outcome": outcome,
+	})
+	if err == nil {
+		for conn := range h.hostClients {
+			conn.enqueue(frame)
+		}
+	}
+	for i, f := range h.stagedFrames {
+		if f.id == callID {
+			h.stagedFrames = append(h.stagedFrames[:i], h.stagedFrames[i+1:]...)
+			break
+		}
+	}
+	h.mu.Unlock()
 }
 
 // askApproval issues one host-level permission request and waits for the GUI's
@@ -1541,7 +1846,7 @@ func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.
 	callID := fmt.Sprintf("approval-%d", time.Now().UnixNano())
 	ch := make(chan tools.ApprovalDecision, 1)
 	s.mu.Lock()
-	s.pendingApprovals[callID] = ch
+	s.pendingApprovals[callID] = &pendingApproval{sessionID: sessionID, ch: ch}
 	s.mu.Unlock()
 
 	optionList := make([]map[string]string, 0, len(options))
@@ -1550,6 +1855,8 @@ func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.
 		switch opt {
 		case "allow_once":
 			label = "Allow once"
+		case "allow_all":
+			label = "Always allow this session"
 		case "deny":
 			label = "Reject"
 		case "cancel":
@@ -1573,13 +1880,50 @@ func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.
 
 	select {
 	case decision := <-ch:
-		s.Hub.unstageReplay(callID)
+		// 决策路径：approval.respond 已广播 host/permission-resolved 并撤下
+		// 重放帧，这里只消费结果。
 		return decision, nil
 	case <-time.After(approvalTimeoutDelay()):
+		// 超时兜底：与 approval.respond 的取走-投递在同一把 s.mu 下配对，
+		// 谁先取走注册项谁拥有裁决权。若决策已抢先投递（select 双就绪时
+		// 可能随机选中本分支），直接消费缓冲中的决策且不广播 timeout——
+		// 一个 callId 的终态帧必须恰好一条。
 		s.mu.Lock()
+		_, stillPending := s.pendingApprovals[callID]
 		delete(s.pendingApprovals, callID)
 		s.mu.Unlock()
-		s.Hub.unstageReplay(callID)
+		if !stillPending {
+			return <-ch, nil
+		}
+		s.Hub.resolvePermission(callID, "timeout")
 		return tools.ApprovalCancel, nil
+	}
+}
+
+// cancelSessionApprovals unblocks every in-flight askApproval for sessionID
+// (GUI Stop / session.stop). Missing or already-resolved prompts are no-ops.
+func (s *Server) cancelSessionApprovals(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	type pair struct {
+		id string
+		ch chan tools.ApprovalDecision
+	}
+	var found []pair
+	s.mu.Lock()
+	for id, rec := range s.pendingApprovals {
+		if rec != nil && rec.sessionID == sessionID {
+			found = append(found, pair{id: id, ch: rec.ch})
+			delete(s.pendingApprovals, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, p := range found {
+		select {
+		case p.ch <- tools.ApprovalCancel:
+		default:
+		}
+		s.Hub.resolvePermission(p.id, "cancelled")
 	}
 }

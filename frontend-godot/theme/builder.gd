@@ -48,8 +48,10 @@ static func build(dark: bool) -> Theme:
 	t.set_color("default_color", "RichTextLabel", tp)
 	t.set_color("font_shadow_color", "RichTextLabel", Color(0, 0, 0, 0))
 
-	t.set_stylebox("panel", "PopupPanel", DshTokens.box(DshTokens.bg_layer1(), DshTokens.RADIUS_LG, b2, 1, Vector4(12, 12, 12, 12)))
-	t.set_stylebox("panel", "PopupMenu", DshTokens.box(DshTokens.bg_layer1(), DshTokens.RADIUS_MD, b2, 1, Vector4(4, 4, 4, 4)))
+	var popup_bg := DshTokens.bg_layer1()
+	popup_bg.a = 0.96 if DshTokens.is_dark() else 0.98
+	t.set_stylebox("panel", "PopupPanel", DshTokens.shadow_box(popup_bg, DshTokens.RADIUS_LG, Vector4(12, 12, 12, 12)))
+	t.set_stylebox("panel", "PopupMenu", DshTokens.shadow_box(popup_bg, DshTokens.RADIUS_MD, Vector4(4, 4, 4, 4)))
 	t.set_stylebox("hover", "PopupMenu", DshTokens.box(l3, DshTokens.RADIUS_SM, Color.TRANSPARENT, 0, Vector4(6, 4, 6, 4)))
 	t.set_color("font_color", "PopupMenu", tp)
 	t.set_color("font_hover_color", "PopupMenu", tp)
@@ -84,7 +86,12 @@ static func build(dark: bool) -> Theme:
 	t.set_stylebox("fill", "ProgressBar", DshTokens.box(DshTokens.accent(), DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(0, 0, 0, 0)))
 
 	t.set_color("font_color", "TooltipLabel", tp)
-	t.set_stylebox("panel", "TooltipPanel", DshTokens.box(DshTokens.bg_layer3(), DshTokens.RADIUS_SM, b2, 1, Vector4(8, 4, 8, 4)))
+	var tip_bg := DshTokens.bg_layer3()
+	tip_bg.a = 0.98
+	var tip_box := DshTokens.box(tip_bg, DshTokens.RADIUS_SM, b2, 1, Vector4(8, 4, 8, 4))
+	tip_box.shadow_color = DshTokens.shadow_tinted()
+	tip_box.shadow_size = 8
+	t.set_stylebox("panel", "TooltipPanel", tip_box)
 	return t
 
 static func _ui_font() -> Font:

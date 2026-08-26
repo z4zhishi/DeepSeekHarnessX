@@ -15,6 +15,8 @@ var _list: ItemList
 var _output: TextEdit
 var _refresh_btn: Button
 var _kill_btn: Button
+var _kill_armed := false
+var _kill_arm_timer: Timer
 var _empty: Label
 var _output_lbl: Label
 var _poll: Timer
@@ -128,6 +130,12 @@ func _build() -> void:
 	_kill_btn = Button.new()
 	_kill_btn.pressed.connect(_kill_selected)
 	btns.add_child(_kill_btn)
+	# kill 防呆定时器：二次点击窗口超时后回到普通态（内联确认模式）。
+	_kill_arm_timer = Timer.new()
+	_kill_arm_timer.one_shot = true
+	_kill_arm_timer.wait_time = 3.0
+	_kill_arm_timer.timeout.connect(_disarm_kill)
+	add_child(_kill_arm_timer)
 
 	_apply_style()
 	_apply_strings()
@@ -224,7 +232,25 @@ func _on_output(ok: bool, data: Variant) -> void:
 func _kill_selected() -> void:
 	if _client == null or _session_id == "" or _selected_id == "":
 		return
+	# 内联二次确认：第一击武装（按钮转危险文案），3 秒内第二击才真正 kill。
+	if not _kill_armed:
+		_kill_armed = true
+		# t() 对缺失键返回键名本身：非 "jobs.killConfirm" 即命中词表。
+		var confirm_txt := DshI18n.t("jobs.killConfirm")
+		_kill_btn.text = confirm_txt if confirm_txt != "jobs.killConfirm" else "Confirm kill?"
+		_kill_btn.modulate = Color(1.0, 0.55, 0.55)
+		_kill_arm_timer.start()
+		return
+	_disarm_kill()
 	_client.kill_job(_session_id, _selected_id, _on_killed)
+
+
+func _disarm_kill() -> void:
+	_kill_armed = false
+	_kill_arm_timer.stop()
+	if _kill_btn:
+		_kill_btn.text = DshI18n.t("jobs.kill")
+		_kill_btn.modulate = Color.WHITE
 
 
 func _on_killed(_ok: bool, _data: Variant) -> void:

@@ -15,10 +15,19 @@ func is_dark() -> bool:
 
 
 func bg_base() -> Color:
-	return Color("151517") if is_dark() else Color("ffffff")
+	return Color("0f0f10") if is_dark() else Color("fcfcfa")
 
 func bg_sidebar() -> Color:
-	return Color("1b1b1c") if is_dark() else Color("f9fafb")
+	return Color("121214") if is_dark() else Color("f6f6f3")
+
+func bg_mesh_a() -> Color:
+	return Color("1a2a6a") if is_dark() else Color("e8eefc")
+
+func bg_mesh_b() -> Color:
+	return Color("0e4a5a") if is_dark() else Color("e6f4f0")
+
+func shadow_tinted() -> Color:
+	return Color(0.06, 0.12, 0.28, 0.28) if is_dark() else Color(0.08, 0.14, 0.32, 0.12)
 
 func bg_layer1() -> Color:
 	return Color("232324") if is_dark() else Color("f9fafb")
@@ -51,7 +60,7 @@ func text_muted() -> Color:
 	return Color("55585e") if is_dark() else Color("9ca3af")
 
 func border_l1() -> Color:
-	return Color(1, 1, 1, 0.06) if is_dark() else Color(0, 0, 0, 0.04)
+	return Color(1, 1, 1, 0.08) if is_dark() else Color(0, 0, 0, 0.05)
 
 func border_l2() -> Color:
 	return Color(1, 1, 1, 0.12) if is_dark() else Color(0, 0, 0, 0.10)
@@ -100,7 +109,7 @@ const COMPOSER_MAX := 780.0
 
 const FONT_UI := 14
 const FONT_UI_LH := 22
-const FONT_BODY := 16
+const FONT_BODY := 17
 const FONT_BODY_LH := 28
 const FONT_CHROME_LG := 16
 const FONT_CHROME_LG_LH := 24
@@ -112,6 +121,11 @@ const FONT_MICRO := 11
 const FONT_MICRO_LH := 14
 const FONT_CODE := 13
 const FONT_CODE_LH := 22
+
+const FONT_WEIGHT_MEDIUM := 500
+const FONT_WEIGHT_SEMI := 600
+const LETTER_MICRO := 0.08
+const LETTER_LABEL := 0.12
 
 ## Motion windows (frontend-rebuild-spec §4). Only opacity/modulate is animated.
 ## Godot exposes no OS reduce-motion probe; flip motion_enabled to honor it.
@@ -165,10 +179,26 @@ func box(bg: Color, radius: int = RADIUS_MD, border: Color = Color.TRANSPARENT, 
 	sb.content_margin_top = pad.y
 	sb.content_margin_right = pad.z
 	sb.content_margin_bottom = pad.w
-	# Compatibility/GLES3 StyleBoxFlat AA blends against black, not the parent fill.
 	sb.anti_aliasing = false
 	sb.anti_aliasing_size = 1.0
 	sb.corner_detail = 8
 	sb.shadow_size = 0
 	sb.draw_center = true
 	return sb
+
+
+func shadow_box(bg: Color, radius: int = RADIUS_MD, pad := Vector4(8, 6, 8, 6)) -> StyleBoxFlat:
+	var sb := box(bg, radius, Color.TRANSPARENT, 0, pad)
+	sb.shadow_color = shadow_tinted()
+	sb.shadow_size = 16
+	sb.shadow_offset = Vector2(0, 8)
+	return sb
+
+
+func double_bezel(outer_bg: Color, inner_bg: Color, outer_r: int = RADIUS_LG, pad_outer := Vector4(6, 6, 6, 6), pad_inner := Vector4(12, 10, 12, 10)) -> Array[StyleBoxFlat]:
+	var outer := box(outer_bg, outer_r, border_l1(), 1, pad_outer)
+	outer.shadow_color = shadow_tinted()
+	outer.shadow_size = 12
+	var inner_r := maxi(4, outer_r - 6)
+	var inner := box(inner_bg, inner_r, border_l1(), 1, pad_inner)
+	return [outer, inner]
