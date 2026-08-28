@@ -67,7 +67,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			"content_block": map[string]any{"type": "text", "text": ""},
 		})
 		var text string
-		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
+		err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "content_block_delta", map[string]any{
@@ -77,6 +77,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				})
 			}
 		})
+		if err != nil {
+			_ = writeSSEData(w, flusher, "error", map[string]any{
+				"type":  "error",
+				"error": map[string]any{"type": "api_error", "message": err.Error()},
+			})
+			return
+		}
 		_ = writeSSEData(w, flusher, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 		_ = writeSSEData(w, flusher, "message_delta", map[string]any{
 			"type":  "message_delta",
@@ -101,7 +108,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if text == "" {
 		text = fromChunks
 	}
-	if err != nil && text == "" {
+	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
 		return
 	}

@@ -41,13 +41,19 @@ var _add_btn: Button
 var _del_btn: Button
 var _appearance_lbl: Label
 var _language_lbl: Label
-var _model_lbl: Label
+var _context_lbl: Label
+var _context_source_lbl: Label
+var _context_edit: LineEdit
+var _context_save_btn: Button
+var _context_reset_btn: Button
+var _context_presets: HBoxContainer
 var _provider_lbl: Label
+var _model_lbl: Label
+var _close_btn: Button
 var _proto_lbl: Label
 var _base_lbl: Label
 var _pmodel_lbl: Label
 var _key_lbl: Label
-var _close_btn: Button
 
 
 func _ready() -> void:
@@ -71,6 +77,7 @@ func open() -> void:
 	_sync_language()
 	_load_models()
 	_load_profiles()
+	_load_context_limit()
 
 
 func close() -> void:
@@ -161,6 +168,36 @@ func _build() -> void:
 	_lang_en.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_lang_en.pressed.connect(_on_lang.bind("en"))
 	lang_row.add_child(_lang_en)
+
+	_context_lbl = _section_label(body)
+	var context_row := HBoxContainer.new()
+	context_row.add_theme_constant_override("separation", 8)
+	body.add_child(context_row)
+	_context_edit = LineEdit.new()
+	_context_edit.custom_minimum_size = Vector2(120, 0)
+	_context_edit.placeholder_text = "200.5"
+	_context_edit.text = "200"
+	context_row.add_child(_context_edit)
+	var unit := Label.new()
+	unit.text = "k"
+	context_row.add_child(unit)
+	_context_save_btn = Button.new()
+	_context_save_btn.pressed.connect(_save_context_limit)
+	context_row.add_child(_context_save_btn)
+	_context_reset_btn = Button.new()
+	_context_reset_btn.pressed.connect(_reset_context_limit)
+	context_row.add_child(_context_reset_btn)
+	_context_source_lbl = Label.new()
+	_context_source_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	body.add_child(_context_source_lbl)
+	_context_presets = HBoxContainer.new()
+	_context_presets.add_theme_constant_override("separation", 6)
+	body.add_child(_context_presets)
+	for preset in ["200", "258", "1000"]:
+		var button := Button.new()
+		button.text = "1M" if preset == "1000" else preset + "k"
+		button.pressed.connect(_select_context_preset.bind(preset))
+		_context_presets.add_child(button)
 
 	_model_lbl = _section_label(body)
 	_model_opt = OptionButton.new()
@@ -293,7 +330,7 @@ func _apply_style() -> void:
 	))
 	_title.add_theme_color_override("font_color", DshTokens.text_primary())
 	_status.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	for lbl in [_appearance_lbl, _language_lbl, _model_lbl, _provider_lbl, _name_lbl, _proto_lbl, _base_lbl, _pmodel_lbl, _key_lbl]:
+	for lbl in [_appearance_lbl, _language_lbl, _model_lbl, _provider_lbl, _name_lbl, _proto_lbl, _base_lbl, _pmodel_lbl, _key_lbl, _context_lbl, _context_source_lbl]:
 		if lbl != null:
 			lbl.add_theme_color_override("font_color", DshTokens.text_secondary())
 	_profile_list.add_theme_stylebox_override("panel", DshTokens.box(
@@ -310,15 +347,24 @@ func _apply_strings() -> void:
 	_appearance_lbl.text = DshI18n.t("settings.appearance")
 	_language_lbl.text = DshI18n.t("settings.language")
 	_model_lbl.text = DshI18n.t("settings.model")
-	_provider_lbl.text = DshI18n.t("provider.profiles")
-	_dark_btn.text = DshI18n.t("app.themeDark")
-	_light_btn.text = DshI18n.t("app.themeLight")
+	_context_lbl.text = DshI18n.t("settings.contextLimit")
 	_save_btn.text = DshI18n.t("common.save")
 	_active_btn.text = DshI18n.t("provider.setActive")
 	_add_btn.text = DshI18n.t("provider.addProfile")
 	_del_btn.text = DshI18n.t("provider.removeProfile")
 	_key_edit.placeholder_text = DshI18n.t("provider.apiKeyPlaceholder")
+	_context_save_btn.text = DshI18n.t("common.save")
+	_context_reset_btn.text = DshI18n.t("settings.contextLimitReset")
+	_provider_lbl.text = DshI18n.t("provider.profiles")
+	_dark_btn.text = DshI18n.t("app.themeDark")
+	_light_btn.text = DshI18n.t("app.themeLight")
 	_fill_protocol()
+	_proto_lbl.text = DshI18n.t("provider.protocol")
+	_base_lbl.text = DshI18n.t("provider.baseUrl")
+	_pmodel_lbl.text = DshI18n.t("provider.model")
+	_key_lbl.text = DshI18n.t("provider.apiKey")
+	_base_edit.placeholder_text = DshI18n.t("provider.baseUrl")
+	_model_edit.placeholder_text = DshI18n.t("provider.model")
 	_proto_lbl.text = DshI18n.t("provider.protocol")
 	_base_lbl.text = DshI18n.t("provider.baseUrl")
 	_pmodel_lbl.text = DshI18n.t("provider.model")
@@ -414,6 +460,81 @@ func _on_model_selected(index: int) -> void:
 	_client.set_model(id, Callable())
 
 
+func _load_context_limit() -> void:
+	if _client == null or not _client.has_method("context_limit_get"):
+		_context_edit.text = "200"
+		_context_source_lbl.text = ""
+		return
+	_client.context_limit_get(func(ok: bool, data: Variant) -> void:
+		if not ok or not (data is Dictionary):
+			_context_edit.text = "200"
+			_context_source_lbl.text = DshI18n.t("settings.contextLimitFailed")
+			return
+		var limit_tokens: int = int((data as Dictionary).get("limitTokens", 0))
+		var source: String = str((data as Dictionary).get("source", ""))
+		var k := limit_tokens / 1000.0
+		_context_edit.text = str(k)
+		_context_source_lbl.text = _context_limit_source_label(k, source)
+	)
+
+
+func _save_context_limit() -> void:
+	if _client == null or not _client.has_method("context_limit_set"):
+		return
+	var k_str := _context_edit.text.strip_edges()
+	if k_str == "":
+		_status.text = DshI18n.t("settings.contextLimitInvalid")
+		return
+	if not k_str.is_valid_float():
+		_status.text = DshI18n.t("settings.contextLimitInvalid")
+		return
+	var k := float(k_str)
+	_client.context_limit_set(k, false, func(ok: bool, data: Variant) -> void:
+		if ok and data is Dictionary:
+			var limit_tokens: int = int((data as Dictionary).get("limitTokens", 0))
+			var source: String = str((data as Dictionary).get("source", ""))
+			var k2 := limit_tokens / 1000.0
+			_context_edit.text = str(k2)
+			_context_source_lbl.text = _t("settings.contextLimitSource", "%s %s" % [str(k2) + "k", source])
+			_status.text = DshI18n.t("common.saved")
+		else:
+			_status.text = DshI18n.t("settings.contextLimitInvalid")
+	)
+
+
+func _reset_context_limit() -> void:
+	if _client == null or not _client.has_method("context_limit_set"):
+		return
+	_client.context_limit_set(0.0, true, func(ok: bool, data: Variant) -> void:
+		if ok and data is Dictionary:
+			var limit_tokens: int = int((data as Dictionary).get("limitTokens", 0))
+			var source: String = str((data as Dictionary).get("source", ""))
+			var k := limit_tokens / 1000.0
+			_context_edit.text = str(k)
+			_context_source_lbl.text = _t("settings.contextLimitSource", "%s %s" % [str(k) + "k", source])
+			_status.text = DshI18n.t("common.saved")
+		else:
+			_status.text = DshI18n.t("settings.contextLimitFailed")
+	)
+
+
+func _context_limit_source_label(k: float, source: String) -> String:
+	var pretty_source := source
+	match source:
+		"user":
+			pretty_source = _t("settings.contextLimitSourceUser", "User override")
+		"model":
+			pretty_source = _t("settings.contextLimitSourceModel", "Model default")
+		_:
+			pretty_source = _t("settings.contextLimitSourceDefault", "Default")
+	return _t("settings.contextLimitSource", "%s (%s)" % [str(k) + "k", pretty_source])
+
+
+func _select_context_preset(preset: String) -> void:
+	_context_edit.text = preset if preset != "1000" else "1000"
+	_save_context_limit()
+
+
 func _load_profiles() -> void:
 	if _client == null:
 		return
@@ -466,7 +587,7 @@ func _seed_deepseek_if_empty() -> void:
 		"baseUrl": "https://api.deepseek.com",
 		"model": "deepseek-v4-flash",
 		"setActive": true,
-	}, _on_saved)
+	}, _on_provider_saved)
 
 
 func _rebuild_profile_list() -> void:
@@ -551,7 +672,7 @@ func _save_profile() -> void:
 	var key := _key_edit.text.strip_edges()
 	if key != "":
 		payload["apiKey"] = key
-	_client.provider_set(payload, _on_saved)
+	_client.provider_set(payload, _on_provider_saved)
 
 
 func _set_profile_active() -> void:
@@ -561,7 +682,7 @@ func _set_profile_active() -> void:
 	var id := str(p.get("id", _editing_id))
 	if id == "":
 		return
-	_client.provider_set({"id": id, "setActive": true}, _on_saved)
+	_client.provider_set({"id": id, "setActive": true}, _on_provider_saved)
 
 
 func _on_saved(ok: bool, _data: Variant) -> void:
@@ -569,6 +690,11 @@ func _on_saved(ok: bool, _data: Variant) -> void:
 	if ok:
 		_load_profiles()
 		_load_models()
+		_load_context_limit()
+
+
+func _on_provider_saved(ok: bool, data: Variant) -> void:
+	_on_saved(ok, data)
 
 
 func _add_profile() -> void:
@@ -582,7 +708,7 @@ func _add_profile() -> void:
 		"baseUrl": "https://api.deepseek.com",
 		"model": "deepseek-v4-flash",
 		"setActive": false,
-	}, _on_saved)
+	}, _on_provider_saved)
 
 
 func _delete_profile() -> void:
@@ -592,7 +718,7 @@ func _delete_profile() -> void:
 	var id := str(p.get("id", _editing_id))
 	if id == "":
 		return
-	_client.provider_delete(id, _on_saved)
+	_client.provider_delete(id, _on_provider_saved)
 
 
 func _on_backdrop(event: InputEvent) -> void:

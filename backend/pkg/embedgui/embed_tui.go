@@ -20,6 +20,10 @@ import (
 // ErrGUIUnavailable is returned by the GUI entry points under `tui_only`.
 var ErrGUIUnavailable = errors.New("this is an only-tui build; no Godot GUI is embedded. Use the full build (dshx.exe) or run the TUI mode")
 
+// EmbeddedPCKHash is unavailable in the only-TUI build because no GUI assets
+// are embedded.
+func EmbeddedPCKHash() (string, error) { return "", ErrGUIUnavailable }
+
 // EmbeddedAssets is the empty filesystem under `tui_only`: no dsh.pck or
 // godot_runner is embedded, so nothing is extracted or launched.
 var EmbeddedAssets fs.FS = emptyFS{}

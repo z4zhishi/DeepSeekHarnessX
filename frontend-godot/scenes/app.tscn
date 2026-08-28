@@ -37,10 +37,21 @@ unique_name_in_owner = true
 layout_mode = 2
 theme_override_constants/separation = 0
 
-[node name="Sidebar" parent="Frame" instance=ExtResource("4_sidebar")]
+[node name="SidebarSlot" type="Control" parent="Frame"]
 unique_name_in_owner = true
-custom_minimum_size = Vector2(280, 0)
+custom_minimum_size = Vector2(0, 0)
 layout_mode = 2
+size_flags_horizontal = 0
+size_flags_vertical = 3
+
+[node name="Sidebar" parent="Frame/SidebarSlot" instance=ExtResource("4_sidebar")]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
 
 [node name="Center" type="PanelContainer" parent="Frame"]
 unique_name_in_owner = true
@@ -105,7 +116,7 @@ layout_mode = 2
 [node name="Details" parent="Frame" instance=ExtResource("7_details")]
 unique_name_in_owner = true
 visible = false
-custom_minimum_size = Vector2(360, 0)
+custom_minimum_size = Vector2(0, 0)
 layout_mode = 2
 
 [node name="ApprovalOverlay" type="CanvasLayer" parent="."]

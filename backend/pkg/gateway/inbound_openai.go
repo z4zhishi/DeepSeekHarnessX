@@ -53,7 +53,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		flusher := prepareSSE(w)
 		var text string
 		finish := "stop"
-		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
+		err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "", map[string]any{
@@ -79,6 +79,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		})
+		if err != nil {
+			_ = writeSSEData(w, flusher, "", map[string]any{"error": map[string]any{"message": err.Error(), "type": "api_error"}})
+			finish = "error"
+		}
 		_ = writeSSEData(w, flusher, "", map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
@@ -108,7 +112,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if text == "" {
 		text = fromChunks
 	}
-	if err != nil && text == "" {
+	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
 	}
@@ -188,7 +192,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"response": map[string]any{"id": respID, "object": "response", "status": "in_progress", "model": model},
 		})
 		var text string
-		_ = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
+		err = s.inboundTurn(r.Context(), ag, driveText, func(env *session.SessionEnvelope) {
 			if delta := chunkDeltaText(env); delta != "" {
 				text += delta
 				_ = writeSSEData(w, flusher, "response.output_text.delta", map[string]any{
@@ -200,6 +204,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		})
+		if err != nil {
+			_ = writeSSEData(w, flusher, "error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+			return
+		}
 		_ = writeSSEData(w, flusher, "response.completed", map[string]any{
 			"type": "response.completed",
 			"response": map[string]any{
@@ -231,7 +239,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if text == "" {
 		text = fromChunks
 	}
-	if err != nil && text == "" {
+	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
 	}

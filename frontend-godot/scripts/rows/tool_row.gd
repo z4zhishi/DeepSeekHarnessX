@@ -193,6 +193,7 @@ func _fill_expand() -> void:
 			card = SCENE_DIFF.instantiate()
 			out_host.add_child(card)
 		card.setup_from_view(_view)
+		_wire_nested_card()
 	elif kind == "terminal":
 		var card: TerminalBlock
 		if out_host.get_child_count() == 1 and out_host.get_child(0) is TerminalBlock:
@@ -202,6 +203,7 @@ func _fill_expand() -> void:
 			card = SCENE_TERM.instantiate()
 			out_host.add_child(card)
 		card.setup_from_view(_view)
+		_wire_nested_card()
 	else:
 		var rtl: RichTextLabel
 		if out_host.get_child_count() == 1 and out_host.get_child(0) is RichTextLabel:
@@ -221,6 +223,18 @@ func _fill_expand() -> void:
 		var out := _output if _output != "" else str(_view.get("text", ""))
 		rtl.text = "[code]%s[/code]" % DshMarkdown.escape(out)
 		rtl.add_theme_color_override("default_color", DshTokens.text_secondary())
+
+
+func _wire_nested_card() -> void:
+	if out_host == null or out_host.get_child_count() != 1:
+		return
+	var card := out_host.get_child(0)
+	if card.has_signal("content_size_changed") and not card.is_connected("content_size_changed", _on_nested_size_changed):
+		card.connect("content_size_changed", _on_nested_size_changed)
+
+
+func _on_nested_size_changed() -> void:
+	height_changed.emit()
 
 
 func _clear_out() -> void:

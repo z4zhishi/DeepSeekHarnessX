@@ -3,7 +3,7 @@
 [ext_resource type="Script" path="res://scripts/ui/sidebar.gd" id="1_script"]
 
 [node name="Sidebar" type="PanelContainer"]
-custom_minimum_size = Vector2(280, 0)
+custom_minimum_size = Vector2(0, 0)
 clip_contents = true
 script = ExtResource("1_script")
 
@@ -20,9 +20,11 @@ layout_mode = 2
 theme_override_constants/separation = 10
 
 [node name="BrandRow" type="HBoxContainer" parent="Margin/VBox"]
-custom_minimum_size = Vector2(0, 36)
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 28)
 layout_mode = 2
 theme_override_constants/separation = 8
+alignment = 0
 
 [node name="BrandMark" type="TextureRect" parent="Margin/VBox/BrandRow"]
 unique_name_in_owner = true
@@ -43,6 +45,8 @@ text_overrun_behavior = 3
 unique_name_in_owner = true
 custom_minimum_size = Vector2(28, 28)
 layout_mode = 2
+size_flags_vertical = 4
+size_flags_horizontal = 4
 flat = true
 
 [node name="CollapseIcon" type="TextureRect" parent="Margin/VBox/BrandRow/CollapseBtn"]

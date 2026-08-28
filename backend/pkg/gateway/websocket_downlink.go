@@ -20,62 +20,128 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// downlinkSendBuffer is the per-connection outbound frame backlog. Beyond this
-// depth a slow consumer starts shedding frames instead of stalling every agent
-// pump broadcasting through the hub (mux streams have store replay for
-// catch-up; host frames are transient lifecycle notices). 4096 (raised from
-// 512) absorbs a tool-result burst that the GUI drains across several frames,
-// so a slow main thread no longer sheds mid-stream host frames.
-const downlinkSendBuffer = 4096
-
 // downlinkWriteTimeout bounds each frame write so a dead TCP peer cannot pin
-// the per-connection writer goroutine forever. 30s (raised from 10s) tolerates
-// a GUI main-thread stall (JSON.parse + chat rebind) without force-closing the
-// socket and forcing a reconnect churn.
+// the per-connection writer goroutine forever. 30s tolerates a GUI main-thread
+// stall (JSON.parse + chat rebind) without force-closing the socket and forcing
+// a reconnect churn.
 const downlinkWriteTimeout = 30 * time.Second
+
+// A downlink is best-effort only in the sense that it may be disconnected; it
+// must never silently shed ordinary events. Once either bound is exceeded the
+// slow peer is closed and removed from the hub, allowing publishers to proceed.
+const (
+	// Keep the queue bounded, but large enough to absorb a normal concurrent
+	// broadcast burst while the single writer drains it. Slow peers still hit
+	// the byte bound (or this frame bound) and are aborted rather than making
+	// publishers wait forever.
+	downlinkQueueMaxFrames  = 1024
+	downlinkQueueMaxBytes   = 4 << 20
+	downlinkReadIdleTimeout = 5 * time.Minute
+)
 
 // downlinkConn couples one WebSocket with a single-writer outbound queue.
 // gorilla/websocket forbids concurrent WriteMessage on one conn; serializing
 // through one pump goroutine both restores that invariant (multiple agent
 // pumps broadcast concurrently) and keeps slow clients from blocking callers.
 type downlinkConn struct {
-	conn      *websocket.Conn
-	send      chan []byte
-	closeOnce sync.Once
+	conn *websocket.Conn
+
+	mu         sync.Mutex
+	queue      [][]byte
+	queueBytes int
+	notify     chan struct{}
+	done       chan struct{}
+	closed     bool
+	onFail     func()
+	failOnce   sync.Once
 }
 
 func newDownlinkConn(c *websocket.Conn) *downlinkConn {
-	d := &downlinkConn{conn: c, send: make(chan []byte, downlinkSendBuffer)}
-	go d.writePump()
-	return d
+	return &downlinkConn{conn: c, notify: make(chan struct{}, 1), done: make(chan struct{})}
 }
 
-// writePump is the ONLY writer of data frames on the conn. Control frames
-// bypass the queue: gorilla documents WriteControl as safe alongside all
-// other methods, and the downlink-only 1008 close relies on it.
+func (d *downlinkConn) start() {
+	go d.writePump()
+}
+
 func (d *downlinkConn) writePump() {
-	for frame := range d.send {
+	defer close(d.done)
+	for {
+		d.mu.Lock()
+		if len(d.queue) == 0 {
+			closed := d.closed
+			d.mu.Unlock()
+			if closed {
+				return
+			}
+			<-d.notify
+			continue
+		}
+		frame := d.queue[0]
+		d.queue[0] = nil
+		d.queue = d.queue[1:]
+		d.queueBytes -= len(frame)
+		d.mu.Unlock()
+
 		_ = d.conn.SetWriteDeadline(time.Now().Add(downlinkWriteTimeout))
 		if err := d.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
-			// Unblock the handler's read loop; it unregisters and closes us.
-			_ = d.conn.Close()
+			d.fail()
+			return
 		}
 	}
 }
 
-// enqueue drops a frame onto the outbound queue without ever blocking the
-// publisher; an overfull queue sheds the frame (slow-consumer policy).
+func (d *downlinkConn) fail() {
+	d.failOnce.Do(func() {
+		d.mu.Lock()
+		d.closed = true
+		d.mu.Unlock()
+		if d.conn != nil {
+			_ = d.conn.Close()
+		}
+		if d.onFail != nil {
+			d.onFail()
+		}
+	})
+}
+
+// enqueue accepts a frame or closes the slow connection when either queue
+// bound is exceeded. It never silently drops an accepted ordinary event.
 func (d *downlinkConn) enqueue(frame []byte) {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	if len(d.queue) >= downlinkQueueMaxFrames || d.queueBytes+len(frame) > downlinkQueueMaxBytes {
+		d.closed = true
+		d.mu.Unlock()
+		go d.fail()
+		return
+	}
+	d.queue = append(d.queue, frame)
+	d.queueBytes += len(frame)
+	d.mu.Unlock()
 	select {
-	case d.send <- frame:
+	case d.notify <- struct{}{}:
 	default:
 	}
 }
 
-// close shuts the queue after unregister so the pump drains the backlog and
-// exits exactly once.
+// close marks the queue closed. The writer drains all already-enqueued frames
+// before exiting, while future enqueues are ignored safely.
 func (d *downlinkConn) close() {
-	d.closeOnce.Do(func() { close(d.send) })
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	d.closed = true
+	d.mu.Unlock()
+	select {
+	case d.notify <- struct{}{}:
+	default:
+	}
 }
 
 // stagedFrame is a host-level frame kept for reconnect replay while its
@@ -85,15 +151,36 @@ type stagedFrame struct {
 	data []byte
 }
 
+// lifecycleFrame is retained only across the short upgrade-to-registration
+// window. It is deliberately bounded and expiring; it is not a host event log.
+type lifecycleFrame struct {
+	data      []byte
+	createdAt time.Time
+}
+
+const (
+	hostLifecycleBacklogLimit = 64
+	hostLifecycleBacklogTTL   = 5 * time.Second
+)
+
 // DownlinkHub manages active WebSocket downlink connections.
 type DownlinkHub struct {
-	mu          sync.Mutex // guards the conn maps and stagedFrames; broadcasts enqueue under the lock so register-vs-publish is atomic
-	muxClients  map[*downlinkConn]string
+	mu         sync.Mutex // guards the conn maps and stagedFrames; broadcasts enqueue under the lock so register-vs-publish is atomic
+	muxClients map[*downlinkConn]string
+	// muxPending buffers live events while a connection's replay snapshot is
+	// being fetched. The connection is registered before the query, so events
+	// published during the query cannot be lost; finishMuxReplay appends the
+	// snapshot before this buffer to preserve stream order.
+	muxPending  map[*downlinkConn][][]byte
 	hostClients map[*downlinkConn]bool
 	// stagedFrames holds in-flight approval frames replayed to newly
 	// connected downlinks so a refreshed/reconnected GUI re-sees pending
 	// prompts instead of waiting for the timeout to cancel them.
 	stagedFrames []*stagedFrame
+	// lifecycleFrames closes the small HTTP-upgrade/registration window for
+	// host lifecycle events. They are drained by the next host registration;
+	// unlike approvals, lifecycle notifications are not retained indefinitely.
+	lifecycleFrames []*lifecycleFrame
 	// Replay returns stored envelopes for mux catch-up. Invoked without
 	// holding h.mu so a store query cannot deadlock the hub.
 	Replay func(sessionID string, fromSeq int) []session.SessionEnvelope
@@ -103,8 +190,16 @@ type DownlinkHub struct {
 func NewDownlinkHub() *DownlinkHub {
 	return &DownlinkHub{
 		muxClients:  make(map[*downlinkConn]string),
+		muxPending:  make(map[*downlinkConn][][]byte),
 		hostClients: make(map[*downlinkConn]bool),
 	}
+}
+
+func configureDownlinkRead(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(downlinkReadIdleTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(downlinkReadIdleTimeout))
+	})
 }
 
 // HandleMux handles /api/events/mux downlinks (session events stream).
@@ -114,7 +209,10 @@ func (h *DownlinkHub) HandleMux(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	configureDownlinkRead(conn)
 	d := newDownlinkConn(conn)
+	d.onFail = func() { h.unregisterMux(d) }
+	d.start()
 	defer h.unregisterMux(d)
 
 	sessionID := r.URL.Query().Get("sessionId")
@@ -125,24 +223,15 @@ func (h *DownlinkHub) HandleMux(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Replay historical envelopes before registering for live events so a
-	// reconnecting GUI sees the log. Query the store without holding h.mu.
+	// Register before querying storage. BroadcastSessionEvent buffers every
+	// event published during the query, and finishMuxReplay orders the stored
+	// snapshot before that buffer. This closes the history-query/live gap.
+	h.registerMuxPending(d, sessionID)
 	var history []session.SessionEnvelope
 	if replay := h.Replay; replay != nil && sessionID != "" {
 		history = replay(sessionID, fromSeq)
 	}
-	for i := range history {
-		if data, err := encodeSessionEvent(&history[i]); err == nil {
-			d.enqueue(data)
-		}
-	}
-
-	// Register atomically with the staged-frame snapshot so an approval
-	// published concurrently is delivered exactly once (live or replayed),
-	// and pending prompts reach the fresh connection before the live stream.
-	for _, frame := range h.registerMux(d, sessionID) {
-		d.enqueue(frame)
-	}
+	h.finishMuxReplay(d, history)
 
 	// Downlink-only enforcement: if client sends any packet, reject with 1008 (policy violation)
 	for {
@@ -165,12 +254,14 @@ func (h *DownlinkHub) HandleHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	configureDownlinkRead(conn)
 	d := newDownlinkConn(conn)
+	d.onFail = func() { h.unregisterHost(d) }
+	d.start()
 	defer h.unregisterHost(d)
 
-	for _, frame := range h.registerHost(d) {
-		d.enqueue(frame)
-	}
+	// Register atomically with the staged-frame snapshot.
+	h.registerHost(d)
 
 	for {
 		_, _, err := conn.ReadMessage()
@@ -212,7 +303,11 @@ func (h *DownlinkHub) BroadcastSessionEvent(sessionID string, env *session.Sessi
 
 	for conn, subID := range h.muxClients {
 		if subID == "" || subID == sessionID {
-			conn.enqueue(data)
+			if _, pending := h.muxPending[conn]; pending {
+				h.muxPending[conn] = append(h.muxPending[conn], data)
+			} else {
+				conn.enqueue(data)
+			}
 		}
 	}
 }
@@ -223,19 +318,53 @@ func (h *DownlinkHub) BroadcastHostEvent(method string, payload any) {
 	if err != nil {
 		return
 	}
-	h.broadcastHostData(data)
+	h.broadcastHostData(data, isHostLifecycleMethod(method))
+}
+
+func isHostLifecycleMethod(method string) bool {
+	switch method {
+	case "host/session-added", "host/session-deleted", "host/subagent-started", "host/subagent-finished":
+		return true
+	default:
+		return false
+	}
 }
 
 // broadcastHostData enqueues a pre-encoded frame to every host client. The
 // critical section is the publish side of the register/snapshot handshake,
-// making replay-vs-live delivery exactly-once per connection.
-func (h *DownlinkHub) broadcastHostData(data []byte) {
+// making replay-vs-live delivery exactly-once per connection. Only lifecycle
+// events use the bounded registration-window backlog; approval replay has its
+// own explicit stagedFrames semantics.
+func (h *DownlinkHub) broadcastHostData(data []byte, lifecycle bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if len(h.hostClients) == 0 {
+		if lifecycle {
+			now := time.Now()
+			h.pruneLifecycleLocked(now)
+			if len(h.lifecycleFrames) >= hostLifecycleBacklogLimit {
+				copy(h.lifecycleFrames, h.lifecycleFrames[len(h.lifecycleFrames)-hostLifecycleBacklogLimit+1:])
+				h.lifecycleFrames = h.lifecycleFrames[:hostLifecycleBacklogLimit-1]
+			}
+			h.lifecycleFrames = append(h.lifecycleFrames, &lifecycleFrame{data: data, createdAt: now})
+		}
+		return
+	}
 	for conn := range h.hostClients {
 		conn.enqueue(data)
 	}
+}
+
+func (h *DownlinkHub) pruneLifecycleLocked(now time.Time) {
+	cutoff := now.Add(-hostLifecycleBacklogTTL)
+	keep := h.lifecycleFrames[:0]
+	for _, f := range h.lifecycleFrames {
+		if f.createdAt.After(cutoff) {
+			keep = append(keep, f)
+		}
+	}
+	h.lifecycleFrames = keep
 }
 
 // stageReplay records an in-flight approval frame for reconnect replay. Must
@@ -260,38 +389,80 @@ func (h *DownlinkHub) unstageReplay(id string) {
 	}
 }
 
-// registerMux registers a mux downlink and returns the staged approval frames
-// snapshot taken under the same lock — the consume side of the handshake.
-func (h *DownlinkHub) registerMux(d *downlinkConn, sessionID string) [][]byte {
+func (h *DownlinkHub) registerMuxPending(d *downlinkConn, sessionID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.muxClients[d] = sessionID
-	return h.stagedSnapshotLocked()
+	h.muxPending[d] = nil
+	h.enqueueStagedLocked(d)
 }
 
-// registerHost registers a host downlink and returns the staged approval
-// frames snapshot taken under the same lock.
-func (h *DownlinkHub) registerHost(d *downlinkConn) [][]byte {
+func sessionEventSeq(data []byte) (int, bool) {
+	var frame struct {
+		Payload struct {
+			Seq int `json:"seq"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil || frame.Payload.Seq <= 0 {
+		return 0, false
+	}
+	return frame.Payload.Seq, true
+}
+
+func (h *DownlinkHub) finishMuxReplay(d *downlinkConn, history []session.SessionEnvelope) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.muxClients[d]; !ok {
+		return
+	}
+	seen := make(map[int]struct{}, len(history))
+	for i := range history {
+		if history[i].Seq > 0 {
+			if _, exists := seen[history[i].Seq]; exists {
+				continue
+			}
+			seen[history[i].Seq] = struct{}{}
+		}
+		if data, err := encodeSessionEvent(&history[i]); err == nil {
+			d.enqueue(data)
+		}
+	}
+	for _, data := range h.muxPending[d] {
+		if seq, ok := sessionEventSeq(data); ok {
+			if _, exists := seen[seq]; exists {
+				continue
+			}
+			seen[seq] = struct{}{}
+		}
+		d.enqueue(data)
+	}
+	delete(h.muxPending, d)
+}
+
+// registerHost registers a host downlink and enqueues the staged approval
+// snapshot while holding the hub lock.
+func (h *DownlinkHub) registerHost(d *downlinkConn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.hostClients[d] = true
-	return h.stagedSnapshotLocked()
+	h.enqueueStagedLocked(d)
+	h.pruneLifecycleLocked(time.Now())
+	for _, f := range h.lifecycleFrames {
+		d.enqueue(f.data)
+	}
+	h.lifecycleFrames = nil
 }
 
-func (h *DownlinkHub) stagedSnapshotLocked() [][]byte {
-	if len(h.stagedFrames) == 0 {
-		return nil
+func (h *DownlinkHub) enqueueStagedLocked(d *downlinkConn) {
+	for _, f := range h.stagedFrames {
+		d.enqueue(f.data)
 	}
-	out := make([][]byte, len(h.stagedFrames))
-	for i, f := range h.stagedFrames {
-		out[i] = f.data
-	}
-	return out
 }
 
 func (h *DownlinkHub) unregisterMux(d *downlinkConn) {
 	h.mu.Lock()
 	delete(h.muxClients, d)
+	delete(h.muxPending, d)
 	h.mu.Unlock()
 	d.close()
 }

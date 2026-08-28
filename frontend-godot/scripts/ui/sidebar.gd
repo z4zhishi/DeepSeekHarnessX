@@ -12,6 +12,7 @@ signal session_rename_requested(id: String, title: String)
 signal session_delete_requested(id: String)
 
 @onready var _margin: MarginContainer = %Margin
+@onready var _brand_row: HBoxContainer = %BrandRow
 @onready var _mark: TextureRect = %BrandMark
 @onready var _title: Label = %BrandTitle
 @onready var _collapse: Button = %CollapseBtn
@@ -55,6 +56,13 @@ var _delete_target_id: String = ""
 func _ready() -> void:
 	clip_contents = true
 	_collapse.pressed.connect(func(): collapse_pressed.emit())
+	_collapse.focus_mode = Control.FOCUS_ALL
+	_collapse.mouse_filter = Control.MOUSE_FILTER_STOP
+	_collapse.custom_minimum_size = Vector2(28, 28)
+	_collapse.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_brand_row.alignment = BoxContainer.ALIGNMENT_BEGIN
+	_collapse.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	_collapse.tooltip_text = _t("toggle.collapse", "Collapse sidebar")
 	_new_btn.pressed.connect(func(): new_session_pressed.emit())
 	_workspace.pressed.connect(func(): workspace_pick_pressed.emit())
 	_theme_btn.pressed.connect(func(): theme_toggled.emit())
@@ -139,10 +147,12 @@ func set_collapsed(collapsed: bool) -> void:
 	if _collapsed == collapsed:
 		return
 	_collapsed = collapsed
-	var pad := 8 if collapsed else 12
+	var pad := 14 if collapsed else 12
 	_margin.add_theme_constant_override("margin_left", pad)
 	_margin.add_theme_constant_override("margin_right", pad)
 	_title.visible = not collapsed
+	_mark.visible = not collapsed
+	_brand_row.alignment = BoxContainer.ALIGNMENT_CENTER if collapsed else BoxContainer.ALIGNMENT_BEGIN
 	_workspace.visible = not collapsed
 	_session_label.visible = not collapsed
 	_search_row.visible = not collapsed
@@ -152,11 +162,18 @@ func set_collapsed(collapsed: bool) -> void:
 	if _lineage != null:
 		_lineage.visible = not collapsed
 	_status_label.visible = not collapsed
+	_status_dot.visible = not collapsed
+	_plugins_btn.visible = not collapsed
+	_settings_btn.visible = not collapsed
 	_theme_btn.visible = not collapsed
+	_footer.visible = not collapsed
 	_collapse.visible = true
 	if _collapse_icon != null:
 		DshIcons.apply(_collapse_icon, "panel_left" if not collapsed else "panel_left", 16.0)
 		_collapse_icon.rotation_degrees = 180.0 if collapsed else 0.0
+		_collapse_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_collapse.mouse_filter = Control.MOUSE_FILTER_STOP
+		_collapse.focus_mode = Control.FOCUS_ALL
 	_collapse.tooltip_text = _t("toggle.open", "Open sidebar") if collapsed else _t("toggle.collapse", "Collapse sidebar")
 	_new_label.visible = not collapsed
 	if _new_btn != null:

@@ -173,13 +173,13 @@ func _style_icon_btn(btn: Button, icon_path: String, tip: String) -> void:
 	btn.flat = true
 	btn.icon = load(icon_path) as Texture2D
 	btn.tooltip_text = tip
-	btn.focus_mode = Control.FOCUS_NONE
+	btn.focus_mode = Control.FOCUS_ALL
 	btn.custom_minimum_size = Vector2(28, 28)
 	var empty := StyleBoxEmpty.new()
 	btn.add_theme_stylebox_override("normal", empty)
 	btn.add_theme_stylebox_override("hover", empty)
 	btn.add_theme_stylebox_override("pressed", empty)
-	btn.add_theme_stylebox_override("focus", empty)
+	btn.add_theme_stylebox_override("focus", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_SM, DshTokens.accent(), 1, Vector4(2, 2, 2, 2)))
 	btn.modulate = DshTokens.text_tertiary()
 
 

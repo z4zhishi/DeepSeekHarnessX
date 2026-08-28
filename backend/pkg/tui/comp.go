@@ -39,7 +39,7 @@ func byline(width int, items ...string) string {
 	if len(items) == 0 {
 		return ""
 	}
-	joined := strings.Join(items, ColorGray + " · " + ColorReset)
+	joined := strings.Join(items, ColorGray+" · "+ColorReset)
 	return truncateANSI(joined, width) + "\n"
 }
 

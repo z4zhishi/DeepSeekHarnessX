@@ -49,6 +49,7 @@ func _ready() -> void:
 	var seat := get_parent() as Control
 	if seat:
 		seat.resized.connect(_cap_width)
+	_prompt.resized.connect(_on_prompt_resized)
 	if DshI18n.has_signal("locale_changed"):
 		DshI18n.locale_changed.connect(func(_loc: String): _apply_strings())
 	get_viewport().files_dropped.connect(_on_files_dropped)
@@ -332,6 +333,10 @@ func _on_text_changed() -> void:
 	_refresh_send_state()
 
 
+func _on_prompt_resized() -> void:
+	_grow()
+
+
 func _build_cmd_list() -> void:
 	_cmd_list = ItemList.new()
 	_cmd_list.visible = false
@@ -434,14 +439,21 @@ func _apply_selected_cmd() -> void:
 
 
 func _grow() -> void:
-	var lines := maxi(_prompt.get_line_count(), 1)
-	_prompt.custom_minimum_size.y = clampf(float(lines * DshTokens.FONT_BODY_LH) + 8.0, 44.0, 140.0)
+	var logical_lines := maxi(_prompt.get_line_count(), 1)
+	var wrap_width := maxi(int(_prompt.size.x), 1)
+	var visual_lines := 0
+	for i in logical_lines:
+		var line_width := maxi(_prompt.get_line_width(i), 1)
+		visual_lines += maxi(1, ceili(float(line_width) / float(wrap_width)))
+	visual_lines = maxi(visual_lines, logical_lines)
+	_prompt.custom_minimum_size.y = clampf(float(visual_lines * DshTokens.FONT_BODY_LH) + 8.0, 44.0, 140.0)
 
 
 func _cap_width() -> void:
 	var seat := get_parent() as Control
 	var avail := seat.size.x if seat else DshTokens.COMPOSER_MAX
-	custom_minimum_size.x = minf(DshTokens.COMPOSER_MAX, maxf(280.0, avail))
+	custom_minimum_size.x = minf(DshTokens.COMPOSER_MAX, maxf(0.0, avail))
+	_grow()
 
 
 func _refresh_send_icon() -> void:

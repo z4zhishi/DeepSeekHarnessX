@@ -27,19 +27,48 @@ func filterCommands(prefix string, defs []commandInfo) []commandInfo {
 			out = append(out, d)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.SliceStable(out, func(i, j int) bool {
+		ei := strings.EqualFold(out[i].Name, prefix)
+		ej := strings.EqualFold(out[j].Name, prefix)
+		if ei != ej {
+			return ei
+		}
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
 	return out
 }
 
-// completionToken decides whether the buffer text (up to the cursor) opens a
-// completion popup and what token is being completed. A popup only appears
-// for a first-word "/prefix" — after a space or inside multi-line input the
-// user is writing arguments or prose, not invoking.
+// completionToken decides whether the buffer text opens completion. It is kept
+// as a compatibility helper for callers that inspect a complete buffer.
 func completionToken(text string) (token string, ok bool) {
-	if !strings.HasPrefix(text, "/") || strings.ContainsAny(text, " \t\n") {
-		return "", false
+	token, _, _, ok = completionTokenAt(text, len([]rune(text)))
+	return token, ok
+}
+
+// completionTokenAt returns the typed command prefix and the rune range of the
+// first slash token. The range covers the whole token so accepting a candidate
+// preserves text before and after the token.
+func completionTokenAt(text string, cursor int) (token string, start, end int, ok bool) {
+	runes := []rune(text)
+	if cursor < 0 {
+		cursor = 0
 	}
-	return text[1:], true
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	if cursor == 0 || runes[0] != '/' {
+		return "", 0, 0, false
+	}
+	for _, r := range runes[:cursor] {
+		if r == ' ' || r == '\t' || r == '\n' {
+			return "", 0, 0, false
+		}
+	}
+	end = 1
+	for end < len(runes) && runes[end] != ' ' && runes[end] != '\t' && runes[end] != '\n' {
+		end++
+	}
+	return string(runes[1:cursor]), 0, end, true
 }
 
 // renderCompletionPopup draws the candidate list as one string of rows joined
@@ -92,7 +121,7 @@ func renderCompletionPopup(matches []commandInfo, selected, width int) string {
 // typed characters — bolded so typed vs suggested parts are distinguishable.
 func highlightPrefix(s, name string) string {
 	runes := []rune(s)
-	n := len([]rune(name)) + 1 // +1 for the leading '/'
+	n := len([]rune(name)) + 1
 	if n > len(runes) {
 		n = len(runes)
 	}
@@ -123,8 +152,21 @@ func truncateWidthPlain(s string, n int) string {
 	return out.String()
 }
 
-// acceptCompletion replaces the current "/tok" token with "/name " and
-// returns the new buffer content. tokenStart is the index of '/' in buf.
+// acceptCompletion replaces a command token in buf. tokenStart is the index
+// of '/' in buf; this helper remains useful for pure completion tests.
 func acceptCompletion(buf, name string) string {
-	return "/" + name + " "
+	runes := []rune(buf)
+	start := strings.LastIndex(string(runes), "/")
+	if start < 0 {
+		return buf
+	}
+	end := start + 1
+	for end < len(runes) && runes[end] != ' ' && runes[end] != '\t' && runes[end] != '\n' {
+		end++
+	}
+	out := make([]rune, 0, len(runes)+len(name)+2)
+	out = append(out, runes[:start]...)
+	out = append(out, []rune("/"+name+" ")...)
+	out = append(out, runes[end:]...)
+	return string(out)
 }

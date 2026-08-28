@@ -85,4 +85,3 @@ func (h *hintBar) get() string {
 	defer h.mu.Unlock()
 	return h.text
 }
-

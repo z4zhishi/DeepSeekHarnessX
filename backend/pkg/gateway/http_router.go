@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -57,6 +58,9 @@ type Server struct {
 	// build-time main.version so the Godot header/jobs panels show the real
 	// build instead of a hardcoded constant.
 	Version string
+	// PCKHash is the SHA-256 of the frontend PCK embedded in the running host.
+	// Empty means the host could not expose an embedded GUI payload.
+	PCKHash string
 	// Workspaces is the workspace root(s) served by workspace.list. nil falls
 	// back to the process working directory.
 	Workspaces []string
@@ -97,6 +101,13 @@ type Server struct {
 	// the Godot GUI answers via the approval.respond RPC (mirrors ACP bridge).
 	pendingApprovals map[string]*pendingApproval
 	mu               sync.RWMutex
+
+	// inboundEnsureSessionFn and inboundTurnFn are deterministic seams for the
+	// HTTP protocol tests. Production leaves them nil and uses the live actor
+	// implementation; tests can drive terminal turn outcomes without waiting on
+	// an actor or a real provider timeout.
+	inboundEnsureSessionFn func(string) (*agent.Agent, string, bool, error)
+	inboundTurnFn          func(context.Context, *agent.Agent, string, func(*session.SessionEnvelope)) error
 }
 
 // pendingApproval is one in-flight host/permission-request. sessionID lets
@@ -188,12 +199,26 @@ func (s *Server) reviewToolCall(sessionID, reviewModel, toolName, argsJSON strin
 			return tools.ReviewUncertain
 		}
 	}
-	verdict := strings.ToLower(strings.TrimSpace(out.String()))
-	switch {
-	case strings.Contains(verdict, "allow"):
+	return parseReviewVerdict(out.String())
+}
+
+func parseReviewVerdict(raw string) tools.ReviewVerdict {
+	verdict := strings.ToLower(strings.TrimSpace(raw))
+	// Accept only a standalone verdict token. Substrings such as "disallow"
+	// and phrases with contradictory/negative language must never auto-allow.
+	fields := strings.FieldsFunc(verdict, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\r' || r == '\n' || r == '.' || r == ',' || r == ':' || r == ';' || r == '!' || r == '?' || r == '`' || r == '"' || r == '\''
+	})
+	if len(fields) != 1 {
+		return tools.ReviewUncertain
+	}
+	switch fields[0] {
+	case "allow":
 		return tools.ReviewAllow
-	case strings.Contains(verdict, "deny"):
+	case "deny":
 		return tools.ReviewDeny
+	case "uncertain":
+		return tools.ReviewUncertain
 	default:
 		return tools.ReviewUncertain
 	}
@@ -414,6 +439,39 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		}
 		return []session.SessionEnvelope{}, nil
 
+	case "context.limit.get":
+		limit, source := s.resolvedContextLimit()
+		return map[string]any{"limitTokens": limit, "source": source}, nil
+
+	case "context.limit.set":
+		reset, _ := payload["reset"].(bool)
+		if reset {
+			if s.Settings == nil {
+				return nil, fmt.Errorf("settings service unavailable")
+			}
+			if _, err := s.Settings.Mutate("general", []settings.Op{{Op: "unset", Path: []string{"contextLimitTokens"}}}); err != nil {
+				return nil, err
+			}
+			limit, source := s.resolvedContextLimit()
+			return map[string]any{"limitTokens": limit, "source": source}, nil
+		}
+		limitK, ok := numberValue(payload["limitK"])
+		if !ok {
+			return nil, fmt.Errorf("context.limit.set requires a numeric limitK")
+		}
+		tokens := limitK * 1000
+		if tokens < 1000 || float64(int(tokens)) != tokens {
+			return nil, fmt.Errorf("context.limit.set limitK must convert to an integer token limit >= 1000")
+		}
+		if s.Settings == nil {
+			return nil, fmt.Errorf("settings service unavailable")
+		}
+		if _, err := s.Settings.Mutate("general", []settings.Op{{Op: "set", Path: []string{"contextLimitTokens"}, Value: int(tokens)}}); err != nil {
+			return nil, err
+		}
+		limit, source := s.resolvedContextLimit()
+		return map[string]any{"limitTokens": limit, "source": source}, nil
+
 	case "session.context":
 		// {sessionId} -> {tokenUsage, contextPressure, projectedTokens,
 		// messageCount, breakdown, contextLimit}
@@ -434,7 +492,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		if events == nil {
 			events = []session.SessionEnvelope{}
 		}
-		metrics, err := (llm.Meter{ContextLimit: llm.ContextLimitForModel(s.configuredModel())}).Measure(events)
+		metrics, err := (llm.Meter{ContextLimit: s.resolvedContextLimitTokens()}).Measure(events)
 		if err != nil {
 			return nil, err
 		}
@@ -1214,8 +1272,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		}
 		if deleter, ok := s.Store.(interface{ DeleteSession(string) error }); ok {
 			if err := deleter.DeleteSession(sessionID); err != nil {
-				// header 已从内存移除，持久层失败仅告警不回滚
-				_ = err
+				return nil, err
 			}
 		}
 		s.Hub.BroadcastHostEvent("host/session-deleted", map[string]any{"id": sessionID})
@@ -1584,6 +1641,78 @@ func normalizeEffort(e string) (string, bool) {
 	}
 }
 
+func (s *Server) resolvedContextLimit() (int, string) {
+	if limit, ok := s.userContextLimit(); ok {
+		return limit, "user"
+	}
+	model := s.configuredModel()
+	for _, m := range llm.DefaultModels {
+		if m.ID == model && m.ContextWindow >= 1000 {
+			return m.ContextWindow, "model"
+		}
+	}
+	if len(llm.DefaultModels) > 0 && llm.DefaultModels[0].ContextWindow >= 1000 {
+		return llm.DefaultModels[0].ContextWindow, "default"
+	}
+	return 1048576, "default"
+}
+
+func (s *Server) resolvedContextLimitTokens() int {
+	limit, _ := s.resolvedContextLimit()
+	return limit
+}
+
+func (s *Server) userContextLimit() (int, bool) {
+	if s.Settings == nil {
+		return 0, false
+	}
+	v, err := s.Settings.Get("general")
+	if err != nil {
+		return 0, false
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	var n int
+	switch x := m["contextLimitTokens"].(type) {
+	case int:
+		n = x
+	case int32:
+		n = int(x)
+	case int64:
+		n = int(x)
+	case float64:
+		if float64(int(x)) == x {
+			n = int(x)
+		}
+	case json.Number:
+		i, err := x.Int64()
+		if err == nil {
+			n = int(i)
+		}
+	}
+	return n, n >= 1000
+}
+
+func numberValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, !math.IsNaN(n) && !math.IsInf(n, 0)
+	case float32:
+		return float64(n), !math.IsNaN(float64(n)) && !math.IsInf(float64(n), 0)
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return 0, false
+	}
+}
+
 func (s *Server) configuredModel() string {
 	if s.Model != "" {
 		return s.Model
@@ -1873,7 +2002,7 @@ func (s *Server) askApproval(sessionID, prompt string, options []string) (tools.
 	}
 	if frame, err := encodeHostEvent("host/permission-request", payload); err == nil {
 		s.Hub.stageReplay(callID, frame)
-		s.Hub.broadcastHostData(frame)
+		s.Hub.broadcastHostData(frame, false)
 	} else {
 		s.Hub.BroadcastHostEvent("host/permission-request", payload)
 	}

@@ -1,6 +1,9 @@
 package tui
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 // Editor is the raw-mode input line: a multi-line buffer with cursor, word
 // motions, history recall and slash-command completion. It is a pure state
@@ -19,6 +22,8 @@ import "strings"
 //	Alt+B/F, Alt+BS  word back / forward / delete-word-before
 //	Ctrl+A/E/K/U/W   line start/end, kill-to-end/start, delete-word
 type Editor struct {
+	mu sync.RWMutex
+
 	buf        []rune
 	cur        int // cursor position as rune index into buf [0..len(buf)]
 	width      int // content viewport width in cells (>0)
@@ -51,39 +56,67 @@ type editorAction struct {
 
 // SetWidth updates the viewport width (re-queried per redraw for resizes).
 func (e *Editor) SetWidth(w int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if w > 0 {
 		e.width = w
 	}
 }
 
 // Buffer returns the current text.
-func (e *Editor) Buffer() string { return string(e.buf) }
+func (e *Editor) Buffer() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.bufferUnlocked()
+}
+
+func (e *Editor) bufferUnlocked() string { return string(e.buf) }
 
 // Empty reports whether the buffer holds no runes.
-func (e *Editor) Empty() bool { return len(e.buf) == 0 }
+func (e *Editor) Empty() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.buf) == 0
+}
 
 // Clear empties the buffer and closes the popup.
 func (e *Editor) Clear() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.clearUnlocked()
+}
+
+func (e *Editor) clearUnlocked() {
 	e.buf = e.buf[:0]
 	e.cur = 0
 	e.closePopup()
 }
 
 // SetPrompt swaps the first-row prefix (approval mode uses "? ").
-func (e *Editor) SetPrompt(p string) { e.prompt = p }
+func (e *Editor) SetPrompt(p string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.prompt = p
+}
 
 // PopupVisible reports whether the completion popup is showing.
-func (e *Editor) PopupVisible() bool { return e.popupOpen }
+func (e *Editor) PopupVisible() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.popupOpen
+}
 
 // ForceCompletion opens the slash-command popup for the current buffer even
 // when the cursor is not mid-token (used by Ctrl+P command palette). If the
 // buffer is empty it assumes a leading "/" so the palette lists all commands;
 // the user can then type to narrow. Safe to call when a popup already shows.
 func (e *Editor) ForceCompletion() {
-	if strings.ContainsAny(e.Buffer(), " ") {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if strings.ContainsAny(e.bufferUnlocked(), " ") {
 		return // composing prose; don't force a command list over it
 	}
-	if !strings.HasPrefix(e.Buffer(), "/") {
+	if !strings.HasPrefix(e.bufferUnlocked(), "/") {
 		e.buf = append([]rune{'/'}, e.buf...)
 		e.cur++
 	}
@@ -93,6 +126,8 @@ func (e *Editor) ForceCompletion() {
 // ---------------------------------------------------------------- key entry
 
 func (e *Editor) HandleKey(k keyEvent) editorAction {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	switch k.kind {
 	case keyRune:
 		e.insert(k.r)
@@ -181,8 +216,10 @@ func (e *Editor) HandleKey(k keyEvent) editorAction {
 			e.acceptSelected()
 			return editorAction{}
 		}
-		text := e.Buffer()
-		e.Clear()
+		text := e.bufferUnlocked()
+		e.buf = e.buf[:0]
+		e.cur = 0
+		e.closePopup()
 		if e.hist != nil {
 			e.hist.Add(text)
 		}
@@ -313,11 +350,11 @@ func (e *Editor) historyPrev() editorAction {
 	if e.hist == nil {
 		return editorAction{}
 	}
-	entry, ok := e.hist.Prev(e.Buffer())
+	entry, ok := e.hist.Prev(e.bufferUnlocked())
 	if !ok {
 		return editorAction{}
 	}
-	e.SetBuffer(entry)
+	e.setBufferUnlocked(entry)
 	return editorAction{}
 }
 
@@ -329,13 +366,19 @@ func (e *Editor) historyNext() editorAction {
 	if !ok {
 		return editorAction{}
 	}
-	e.SetBuffer(entry)
+	e.setBufferUnlocked(entry)
 	return editorAction{}
 }
 
 // SetBuffer replaces the buffer content, cursor at the end (used to restore
 // the pre-approval draft and for history recall).
 func (e *Editor) SetBuffer(s string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setBufferUnlocked(s)
+}
+
+func (e *Editor) setBufferUnlocked(s string) {
 	e.buf = []rune(s)
 	e.cur = len(e.buf)
 	e.refreshCompletion()
@@ -346,7 +389,8 @@ func (e *Editor) SetBuffer(s string) {
 // refreshCompletion recomputes the popup state from buffer + cursor. Called
 // after every mutation.
 func (e *Editor) refreshCompletion() {
-	token, ok := completionToken(e.Buffer())
+	text := e.bufferUnlocked()
+	token, _, _, ok := completionTokenAt(text, e.cur)
 	if !ok || len(e.defs) == 0 {
 		e.closePopup()
 		return
@@ -379,14 +423,26 @@ func (e *Editor) acceptSelected() {
 		return
 	}
 	name := e.matches[e.sel].Name
-	text := acceptCompletion("", name)
-	e.buf = []rune(text)
-	e.cur = len(e.buf)
+	text := string(e.buf)
+	_, start, end, ok := completionTokenAt(text, e.cur)
+	if !ok {
+		return
+	}
+	runes := e.buf
+	replacement := []rune("/" + name + " ")
+	out := make([]rune, 0, len(runes)+len(replacement))
+	out = append(out, runes[:start]...)
+	out = append(out, replacement...)
+	out = append(out, runes[end:]...)
+	e.buf = out
+	e.cur = start + len(replacement)
 	e.closePopup()
 }
 
 // PopupView renders the popup rows, or nil when closed.
 func (e *Editor) PopupView() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if !e.popupOpen || len(e.matches) == 0 {
 		return nil
 	}
@@ -504,6 +560,8 @@ func (e *Editor) cursorColInRow(row vrow) int {
 // View renders the visible rows (with prompts) plus the cursor's visual
 // position. This is everything the screen layer needs to draw the input area.
 func (e *Editor) View() (rows []string, crow, ccol int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	layout := e.layout()
 	crow, ccol = e.cursorVisual(layout)
 	rows = make([]string, len(layout))

@@ -510,7 +510,8 @@ var generalSettingsSchema = []byte(`{
 		"composerEnter": { "type": "boolean", "default": true },
 		"model": { "type": "string", "default": "deepseek-v4-flash" },
 		"autoReviewModel": { "type": "string", "default": "" },
-		"contextWindow": { "type": "string", "default": "" }
+		"contextWindow": { "type": "string", "default": "" },
+		"contextLimitTokens": { "type": "integer", "default": 0 }
 	}
 }`)
 

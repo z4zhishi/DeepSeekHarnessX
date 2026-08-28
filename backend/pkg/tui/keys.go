@@ -139,6 +139,9 @@ func (p *keyParser) Flush() []keyEvent {
 		p.inPast = false
 		out = append(out, ev)
 	}
+	// An ordinary incomplete UTF-8 prefix has no recoverable meaning after
+	// timeout; drop it so it cannot consume the next input byte.
+	p.buf = nil
 	return out
 }
 

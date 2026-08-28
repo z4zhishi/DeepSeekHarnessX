@@ -6,6 +6,7 @@ const TURN_WATCHDOG_SEC := 90.0
 @onready var _client: Node = %DshClient
 @onready var _store: Node = %SessionStore
 @onready var _sidebar: SidebarPane = %Sidebar
+@onready var _sidebar_slot: Control = %SidebarSlot
 @onready var _center: PanelContainer = %Center
 @onready var _header: HeaderBar = %Header
 @onready var _chat_tab: VBoxContainer = %ChatTab
@@ -22,18 +23,30 @@ const TURN_WATCHDOG_SEC := 90.0
 
 var _cwd := ""
 var _dark := true
+## Layout state has one owner: user preferences live here, while computed
+## visibility is derived from viewport width and never writes these preferences.
 var _sidebar_pref := DshTokens.SIDEBAR_DEFAULT
-var _details_pref := 0.0
+var _sidebar_user_collapsed := false
 var _narrow := false
-var _narrow_expanded := false
+var _narrow_user_override := false
+var _narrow_override_set := false
+var _details_pref := 0.0
 var _applied_cols: Dictionary = {}
+var _applying_columns := false
+var _columns_pending := false
 var _drafts := {}
 var _switching := false
+var _creating_session := false
+var _session_continuations: Array[Callable] = []
 var _ws_picker: DshFilePicker = null
 var _watchdog: Timer = null
 var _cols_timer: Timer = null
 var _watch_session := ""
 var _history_epoch: int = 0
+var _history_loading_session := ""
+var _history_loading_epoch: int = -1
+var _pending_session_events: Array[Dictionary] = []
+var _pending_event_keys: Dictionary = {}
 var _mesh_a: TextureRect = null
 var _mesh_b: TextureRect = null
 
@@ -45,6 +58,7 @@ func _ready() -> void:
 	_client.session_event_received.connect(_on_session_event)
 	_client.host_event_received.connect(_on_host_event)
 	_client.connection_state_changed.connect(_on_connection)
+	_bind(_client, "connection_status_changed", _on_connection_status)
 	_bind(_client, "mux_ready", _on_mux_ready)
 	_watchdog = Timer.new()
 	_watchdog.one_shot = true
@@ -222,7 +236,8 @@ func _search_focus_fallback() -> bool:
 
 
 func _request_columns() -> void:
-	if not _cols_timer.is_stopped():
+	_columns_pending = true
+	if _applying_columns or not _cols_timer.is_stopped():
 		return
 	_cols_timer.start()
 
@@ -312,28 +327,42 @@ func _save_theme(dark: bool) -> void:
 
 
 func _apply_columns() -> void:
+	if _applying_columns:
+		_columns_pending = true
+		return
+	_applying_columns = true
+	_columns_pending = false
 	_udbg("columns enter vp=%.1f" % size.x)
 	var vp := size.x
-	var narrow := vp < DshTokens.SIDEBAR_AUTO_COLLAPSE
+	var narrow := vp <= DshTokens.SIDEBAR_AUTO_COLLAPSE
 	if narrow != _narrow:
 		_narrow = narrow
-		_narrow_expanded = false
-	var sidebar_pref := 0.0
-	var rail := (_narrow and not _narrow_expanded) or (not _narrow and _sidebar_pref == 0.0)
-	if not rail:
-		sidebar_pref = _sidebar_pref if _sidebar_pref > 0.0 else DshTokens.SIDEBAR_DEFAULT
-	var cols := DshColumns.compute_columns(vp, sidebar_pref, _details_pref)
-	# 幂等写入：值未变化的属性绝不重写。min size / visible 的无条件重写会
-	# 触发 layout+resized 信号，是列布局自馈环的燃料。
+		# A resize crossing the breakpoint starts a fresh responsive mode. The
+		# user's explicit choice is retained separately and can be reapplied by
+		# clicking the rail button; resize never mutates the desktop preference.
+		_narrow_override_set = false
+	var sidebar_collapsed := _sidebar_user_collapsed
+	if _narrow:
+		# Responsive narrow mode defaults to the rail; only an explicit click
+		# creates an override for this breakpoint.
+		if _narrow_override_set:
+			sidebar_collapsed = not _narrow_user_override
+		else:
+			sidebar_collapsed = true
+	var sidebar_pref := 0.0 if sidebar_collapsed else (_sidebar_pref if _sidebar_pref > 0.0 else DshTokens.SIDEBAR_DEFAULT)
+	var details_pref := _details_pref
+	var cols := DshColumns.compute_columns(vp, sidebar_pref, details_pref)
 	var sb: float = cols.sidebar
 	var ct: float = cols.center
 	var dt: float = cols.details
-	if not is_equal_approx(_applied_cols.get("sidebar", -1.0), sb):
+	# The slot owns the rail width; the child fills it through anchors.
+	if not is_equal_approx(_applied_cols.get("sidebar", -1.0), sb) or not is_equal_approx(_sidebar_slot.custom_minimum_size.x, sb):
 		_applied_cols["sidebar"] = sb
-		_sidebar.custom_minimum_size.x = sb
+		_sidebar_slot.custom_minimum_size.x = sb
+		_sidebar_slot.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	if not is_equal_approx(_applied_cols.get("center", -1.0), ct):
 		_applied_cols["center"] = ct
-		_center.custom_minimum_size.x = ct
+		_center.custom_minimum_size.x = 0.0
 	var sb_collapsed: bool = sb <= DshColumns.SIDEBAR_COLLAPSED + 0.5
 	_sidebar.set_collapsed(sb_collapsed)
 	var open: bool = dt > 0.0
@@ -342,17 +371,26 @@ func _apply_columns() -> void:
 	_applied_cols["details_open"] = open
 	if not is_equal_approx(_applied_cols.get("details", -1.0), dt):
 		_applied_cols["details"] = dt
-		_details.custom_minimum_size.x = dt
+		_details.custom_minimum_size.x = 0.0
+		_details.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	_details.set_collapsed(not open)
 	_udbg("columns exit s=%.0f c=%.0f d=%.0f" % [sb, ct, dt])
+	_applying_columns = false
+	if _columns_pending and _cols_timer.is_stopped():
+		_cols_timer.start()
 
 
 func _toggle_sidebar() -> void:
-	_udbg("toggle enter narrow=%s pref=%.1f" % [_narrow, _sidebar_pref])
+	_udbg("toggle enter narrow=%s user_collapsed=%s" % [_narrow, _sidebar_user_collapsed])
 	if _narrow:
-		_narrow_expanded = not _narrow_expanded
+		# Narrow mode keeps the user's explicit choice, while the column solver
+		# degrades the surrounding panes when the viewport cannot fit them.
+		# This makes the rail button useful at every supported window width.
+		_narrow_user_override = not _narrow_user_override if _narrow_override_set else true
+		_narrow_override_set = true
 	else:
-		_sidebar_pref = 0.0 if _sidebar_pref != 0.0 else DshTokens.SIDEBAR_DEFAULT
+		_sidebar_user_collapsed = not _sidebar_user_collapsed
+		_sidebar_pref = DshTokens.SIDEBAR_DEFAULT if not _sidebar_user_collapsed else 0.0
 	_apply_columns()
 	_udbg("toggle exit")
 
@@ -378,6 +416,15 @@ func _on_tab(name: String) -> void:
 
 func _on_connection(connected: bool) -> void:
 	_sidebar.set_status(_t("app.connected", "Connected") if connected else _t("app.disconnected", "Disconnected"), connected)
+
+
+func _on_connection_status(status: String, attempt: int) -> void:
+	var label := status.capitalize()
+	if status == "reconnecting":
+		label = "Reconnecting (attempt %d)" % attempt
+	elif status == "connecting":
+		label = "Connecting..."
+	_sidebar.set_status(label, status == "connected")
 
 
 func _on_sessions_changed(_payload: Variant = null) -> void:
@@ -409,19 +456,43 @@ func _on_session_picked(id: String) -> void:
 
 
 func _create_session() -> void:
-	_client.create_session(_cwd, "default", func(ok: bool, data: Variant) -> void:
-		if not ok:
-			return
-		var header: Dictionary = data if data is Dictionary else {"id": _id_of(data), "cwd": _cwd}
-		if str(header.get("id", "")) == "":
-			header["id"] = _id_of(data)
-		if str(header.get("cwd", "")) == "":
-			header["cwd"] = _cwd
-		_store.upsert_session(header)
-		var id := _id_of(header)
-		if id != "":
-			_switch(id, true)
-	)
+	if _creating_session:
+		return
+	_start_session_creation()
+
+
+func _start_session_creation() -> void:
+	_creating_session = true
+	_composer.set_enabled(false)
+	_sidebar.set_status(_t("app.creatingSession", "Creating session..."), true)
+	_client.create_session(_cwd, "default", _finish_session_creation)
+
+
+func _finish_session_creation(ok: bool, data: Variant) -> void:
+	_creating_session = false
+	_composer.set_enabled(true)
+	if not ok:
+		_session_continuations.clear()
+		_sidebar.set_status(_t("app.sessionCreateFailed", "Session creation failed"), false)
+		_inject_turn_error(_rpc_error_text(data))
+		return
+	var header: Dictionary = data if data is Dictionary else {"id": _id_of(data), "cwd": _cwd}
+	if str(header.get("id", "")) == "":
+		header["id"] = _id_of(data)
+	if str(header.get("cwd", "")) == "":
+		header["cwd"] = _cwd
+	_store.upsert_session(header)
+	var sid := _id_of(header)
+	if sid == "":
+		_session_continuations.clear()
+		_inject_turn_error(_t("chat.systemFailed", "Failed to create session."))
+		return
+	_switch(sid, true)
+	var queued := _session_continuations
+	_session_continuations.clear()
+	for continuation in queued:
+		if continuation.is_valid():
+			continuation.call(sid)
 
 
 func _switch(id: String, is_new: bool) -> void:
@@ -451,6 +522,10 @@ func _switch(id: String, is_new: bool) -> void:
 	# 递增 epoch 使旧会话的异步回调失效。每次切换或 mux 重连都递增，
 	# 确保只有最新一轮加载的回调能写入 ChatList。
 	_history_epoch += 1
+	_history_loading_session = ""
+	_history_loading_epoch = -1
+	_pending_session_events.clear()
+	_pending_event_keys.clear()
 	_switching = false
 	_composer.grab_input_focus()
 	if is_new:
@@ -464,22 +539,45 @@ func _apply_history(ok: bool, data: Variant) -> void:
 	var events := _as_array(data)
 	if _traj.has_method("set_events"):
 		_traj.set_events(events)
-	if not ok:
-		return
-	if events.is_empty():
-		var live := _chat.has_method("is_empty") and not bool(_chat.call("is_empty"))
-		if not live:
-			_show_empty(true)
-			if _chat.has_method("clear"):
-				_chat.clear()
-		return
-	_show_empty(false)
-	if _chat.has_method("set_nodes"):
-		# set_nodes adopts the folded nodes and resets ChatList's internal fold,
-		# so live mux events after this point re-fold from a clean baseline.
-		var fold := ConversationFold.new()
-		fold.ingest_history(events)
-		_chat.set_nodes(fold.nodes(), fold.seen_seq())
+	if ok and not events.is_empty():
+		_show_empty(false)
+		if _chat.has_method("set_nodes"):
+			var fold := ConversationFold.new()
+			fold.ingest_history(events)
+			_chat.set_nodes(fold.nodes(), fold.seen_seq())
+	elif not ok:
+		# Keep already-buffered live events visible if the RPC failed.
+		if _chat.has_method("is_empty") and not bool(_chat.call("is_empty")):
+			_show_empty(false)
+	var history_keys: Dictionary = {}
+	for event in events:
+		if event is Dictionary:
+			history_keys[_event_key(event)] = true
+	var flushed_keys: Dictionary = {}
+	for event in _pending_session_events:
+		if not (event is Dictionary):
+			continue
+		var key := _event_key(event)
+		if history_keys.has(key) or flushed_keys.has(key):
+			continue
+		flushed_keys[key] = true
+		if _chat.has_method("apply_event"):
+			_chat.apply_event(event)
+		if _traj.has_method("append_event"):
+			_traj.append_event(event)
+	_pending_session_events.clear()
+	_pending_event_keys.clear()
+	_history_loading_session = ""
+	_history_loading_epoch = -1
+	if events.is_empty() and _chat.has_method("is_empty") and bool(_chat.call("is_empty")):
+		_show_empty(true)
+
+
+func _event_key(event: Dictionary) -> String:
+	var seq := int(event.get("seq", 0))
+	if seq != 0:
+		return "seq:%d" % seq
+	return "fallback:%s:%s:%s" % [str(event.get("type", "")), str(event.get("id", "")), JSON.stringify(event.get("data", {}))]
 
 
 func _on_mux_ready(session_id: String) -> void:
@@ -490,9 +588,16 @@ func _on_mux_ready(session_id: String) -> void:
 	# （resume）。顺序反转保证：取历史时 agent 尚未产生新事件，WS
 	# 通道不会在 history 回调到达前推送实时事件造成交错。
 	var epoch := _history_epoch
+	# A reconnect can emit mux_ready more than once; only one load owns this epoch.
+	if _history_loading_session == session_id and _history_loading_epoch == epoch:
+		return
+	_history_loading_session = session_id
+	_history_loading_epoch = epoch
+	_pending_session_events.clear()
+	_pending_event_keys.clear()
 	_client.fetch_history(session_id, 0, func(ok: bool, events: Variant) -> void:
-		# epoch 不匹配说明用户已切到其他会话，丢弃本轮结果。
-		if _history_epoch != epoch or _active_id() != session_id:
+		# epoch mismatch means this callback belongs to an obsolete session/load.
+		if _history_epoch != epoch or _active_id() != session_id or _history_loading_epoch != epoch:
 			return
 		_apply_history(ok, events)
 		_refresh_context()
@@ -504,6 +609,14 @@ func _on_mux_ready(session_id: String) -> void:
 
 
 func _on_session_event(event: Dictionary) -> void:
+	if _history_loading_session == _active_id() and _history_loading_session != "":
+		var key := _event_key(event)
+		if not _pending_event_keys.has(key):
+			_pending_event_keys[key] = true
+			_pending_session_events.append(event)
+		return
+	if _active_id() == "":
+		return
 	_show_empty(false)
 	if _watch_session == _active_id() and _watchdog != null and not _watchdog.is_stopped():
 		_arm_watchdog(_watch_session)
@@ -670,7 +783,10 @@ func _close_details() -> void:
 
 
 func _on_model(id: String) -> void:
-	_client.set_model(id, func(_ok: bool, _d: Variant) -> void: pass)
+	_client.set_model(id, func(ok: bool, data: Variant) -> void:
+		if not ok:
+			_inject_turn_error(_rpc_error_text(data))
+	)
 
 
 func _on_param_effort(effort: Variant) -> void:
@@ -678,7 +794,10 @@ func _on_param_effort(effort: Variant) -> void:
 	if e == "":
 		return
 	_ensure_session(func(id: String) -> void:
-		_client.session_effort(id, e, func(_ok: bool, data: Variant) -> void:
+		_client.session_effort(id, e, func(ok: bool, data: Variant) -> void:
+			if not ok:
+				_inject_turn_error(_rpc_error_text(data))
+				return
 			if data is Dictionary:
 				_header.set_effort(str((data as Dictionary).get("effort", e)))
 		)
@@ -700,12 +819,18 @@ func _on_access_mode(preset: String) -> void:
 
 
 func _on_approval(call_id: String, decision: String) -> void:
-	_client.respond_approval(call_id, decision, func(_ok: bool, _d: Variant) -> void: pass)
+	_client.respond_approval(call_id, decision, func(ok: bool, data: Variant) -> void:
+		if not ok:
+			_inject_turn_error(_rpc_error_text(data))
+	)
 
 
 func _on_feedback(message_id: String, rating: String) -> void:
 	if _client.has_method("feedback_put"):
-		_client.feedback_put(_active_id(), message_id, rating, "", "", func(_ok: bool, _d: Variant) -> void: pass)
+		_client.feedback_put(_active_id(), message_id, rating, "", "", func(ok: bool, data: Variant) -> void:
+			if not ok:
+				_inject_turn_error(_rpc_error_text(data))
+		)
 
 
 func _open_settings() -> void:
@@ -832,23 +957,20 @@ func _rpc_error_text(data: Variant) -> String:
 
 
 func _ensure_session(then: Callable) -> void:
-	var id := _active_id()
-	if id != "":
-		then.call(id)
-		return
-	_client.create_session(_cwd, "default", func(ok: bool, data: Variant) -> void:
-		if not ok:
+	if then.is_valid():
+		if _creating_session:
+			_session_continuations.append(then)
 			return
-		var header: Dictionary = data if data is Dictionary else {"id": _id_of(data), "cwd": _cwd}
-		if str(header.get("id", "")) == "":
-			header["id"] = _id_of(data)
-		_store.upsert_session(header)
-		var sid := _id_of(header)
-		if sid == "":
+		var id := _active_id()
+		if id != "":
+			then.call(id)
 			return
-		_switch(sid, true)
-		then.call(sid)
-	)
+	else:
+		if _creating_session:
+			return
+		if _active_id() != "":
+			return
+	_start_session_creation()
 
 
 ## Backend is authoritative for general.language (settings.mutate on every
@@ -906,6 +1028,8 @@ func _refresh_context() -> void:
 	if id == "":
 		return
 	_client.session_context(id, func(ok: bool, data: Variant) -> void:
+		if _active_id() != id:
+			return
 		if not ok or not (data is Dictionary):
 			return
 		var p := float(data.get("contextPressure", 0.0))

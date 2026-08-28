@@ -1,6 +1,8 @@
 extends PanelContainer
 class_name DiffBlock
 
+signal content_size_changed
+
 @onready var text_label: RichTextLabel = %DiffText
 @onready var header_label: Label = %DiffHeader
 @onready var toggle_btn: Button = %ToggleBtn
@@ -120,6 +122,7 @@ func _toggle() -> void:
 	_expanded = not _expanded
 	text_label.visible = _expanded
 	toggle_btn.text = _t("chat.collapse", "Collapse") if _expanded else _t("chat.expand", "Expand")
+	content_size_changed.emit()
 
 
 func _copy() -> void:

@@ -291,27 +291,42 @@ func (s *JsonlStore) PutSession(meta *session.SessionHeader) error {
 }
 
 func (s *JsonlStore) DeleteSession(sessionID string) error {
-	// Best-effort: remove any matching jsonl file across workspace dirs.
-	if s == nil || sessionID == "" {
+	if s == nil || strings.TrimSpace(sessionID) == "" {
 		return nil
 	}
+	var found bool
 	var firstErr error
-	_ = filepath.Walk(s.root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+	err := filepath.Walk(s.root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info == nil || info.IsDir() || filepath.Base(path) != "session"+jsonlCompressionSuffix {
 			return nil
 		}
-		if !strings.HasSuffix(path, ".jsonl") && !strings.HasSuffix(path, ".jsonl.zstd") {
+		line, err := readFirstZstdLine(path)
+		if err != nil {
+			return err
+		}
+		header, err := parseHeaderBytes(line)
+		if err != nil || header.ID != sessionID {
 			return nil
 		}
-		if !strings.Contains(filepath.Base(path), sessionID) {
-			return nil
-		}
-		if rmErr := os.Remove(path); rmErr != nil && firstErr == nil {
-			firstErr = rmErr
+		found = true
+		if err := os.Remove(path); err != nil && firstErr == nil {
+			firstErr = err
 		}
 		return nil
 	})
-	return firstErr
+	if err != nil {
+		return err
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if !found {
+		return os.ErrNotExist
+	}
+	return nil
 }
 
 // materialize atomically writes the header + first batch: temp-write, fsync,

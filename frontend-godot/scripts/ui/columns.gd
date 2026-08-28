@@ -18,14 +18,21 @@ static func clamp_width(px: float, mn: float, mx: float) -> float:
 
 
 static func compute_columns(viewport: float, sidebar_pref: float, details_pref: float) -> Dictionary:
+	var available := maxf(0.0, viewport)
 	var s := SIDEBAR_COLLAPSED if sidebar_pref == 0.0 else clamp_width(sidebar_pref, SIDEBAR_MIN, SIDEBAR_MAX)
 	var d0 := 0.0 if details_pref == 0.0 else clamp_width(details_pref, DETAILS_MIN, DETAILS_MAX)
 
-	if s + d0 + CENTER_MIN <= viewport:
-		return {"sidebar": s, "center": viewport - s - d0, "details": d0}
+	# Preserve a usable center before honoring optional side panes. If an
+	# expanded sidebar cannot coexist with the center minimum, fall back to the
+	# rail; this keeps the layout fluid below the desktop three-column width.
+	if s + CENTER_MIN > available:
+		s = SIDEBAR_COLLAPSED
 
-	var d1 := 0.0 if d0 == 0.0 else maxf(DETAILS_MIN, viewport - s - CENTER_MIN)
-	if s + d1 + CENTER_MIN <= viewport:
-		return {"sidebar": s, "center": CENTER_MIN, "details": d1}
-
-	return {"sidebar": s, "center": maxf(0.0, viewport - s), "details": 0.0}
+	# Details is optional for this layout pass. Hide it when it would squeeze
+	# the center; the user preference remains intact for wider viewports.
+	var d := d0 if s + d0 + CENTER_MIN <= available else 0.0
+	return {
+		"sidebar": s,
+		"center": maxf(0.0, available - s - d),
+		"details": d,
+	}

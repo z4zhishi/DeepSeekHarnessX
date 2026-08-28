@@ -192,7 +192,8 @@ const (
 // folded hides all but the first line (Vim h/l / e / E fold commands).
 type scrollEntry struct {
 	kind   scrollKind
-	lines  []string // pre-wrapped display rows
+	text   string   // unwrapped rendered content, retained for resize reflow
+	lines  []string // display rows at the current terminal width
 	folded bool
 }
 
@@ -262,8 +263,19 @@ func newPresenter(out io.Writer, ed *Editor, statusFn func() StatusData) *presen
 func (p *presenter) resize() {
 	if w, h, ok := terminalSize(); ok {
 		p.mu.Lock()
+		changed := p.width != w || p.height != h
 		p.width, p.height = w, h
+		if changed {
+			for i := range p.scrollback {
+				if p.scrollback[i].text != "" {
+					p.scrollback[i].lines = splitWrapANSI(p.scrollback[i].text, w)
+				}
+			}
+		}
 		p.mu.Unlock()
+		if changed {
+			p.scr.Refresh()
+		}
 	}
 }
 
@@ -303,13 +315,29 @@ func (p *presenter) WriteKind(text string, kind scrollKind) {
 				ln = strings.TrimSuffix(ln, "\n")
 				p.scrollback = append(p.scrollback, scrollEntry{
 					kind:  kind,
-					lines: []string{ln},
+					text:  ln,
+					lines: splitWrapANSI(ln, p.width),
 				})
 			}
 		}
 		// Cap the retained history at a sane bound to bound memory.
 		if len(p.scrollback) > 10000 {
-			p.scrollback = p.scrollback[len(p.scrollback)-10000:]
+			drop := len(p.scrollback) - 10000
+			droppedRows := 0
+			for _, e := range p.scrollback[:drop] {
+				droppedRows += len(e.lines)
+			}
+			p.scrollback = p.scrollback[drop:]
+			if p.sindex >= 0 {
+				p.sindex -= drop
+				if p.sindex < 0 {
+					p.sindex = 0
+				}
+			}
+			p.sview -= droppedRows
+			if p.sview < 0 {
+				p.sview = 0
+			}
 		}
 	}
 	p.mu.Unlock()
@@ -472,8 +500,67 @@ func (p *presenter) SetFocus(f focusTarget) {
 	p.scr.Refresh()
 }
 
-// SelectMove moves the scrollback selection by delta entries (GrokBuild ↑↓ /
-// k j). Clamps to the transcript bounds. Returns true if the selection moved.
+
+// scrollbackWindowCapacityLocked returns the transcript rows available above
+// the status and shortcut rows. Caller holds p.mu.
+func (p *presenter) scrollbackWindowCapacityLocked() int {
+	cap := p.height - 2
+	if cap < 3 {
+		cap = 3
+	}
+	return cap
+}
+
+// keepSelectionVisibleLocked adjusts sview so the selected entry remains
+// visible after selection or fold changes. Caller holds p.mu.
+func (p *presenter) keepSelectionVisibleLocked() {
+	if p.sindex < 0 || p.sindex >= len(p.scrollback) {
+		return
+	}
+	cap := p.scrollbackWindowCapacityLocked()
+	total, selectedStart, selectedEnd := 0, -1, -1
+	for i, entry := range p.scrollback {
+		rows := len(entry.lines)
+		if entry.folded && rows > 1 {
+			rows = 1
+		}
+		if rows == 0 {
+			continue
+		}
+		start := total
+		total += rows
+		if i == p.sindex {
+			selectedStart, selectedEnd = start, total-1
+		}
+	}
+	if selectedStart < 0 {
+		return
+	}
+	start := total - cap - p.sview
+	if start < 0 {
+		start = 0
+	}
+	end := start + cap
+	if selectedEnd < start {
+		start = selectedStart
+	} else if selectedStart >= end {
+		start = selectedEnd - cap + 1
+	}
+	maxStart := total - cap
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if start > maxStart {
+		start = maxStart
+	}
+	if start < 0 {
+		start = 0
+	}
+	p.sview = total - cap - start
+	if p.sview < 0 {
+		p.sview = 0
+	}
+}
 func (p *presenter) SelectMove(delta int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -495,6 +582,7 @@ func (p *presenter) SelectMove(delta int) bool {
 		return false
 	}
 	p.sindex = next
+	p.keepSelectionVisibleLocked()
 	p.scr.Refresh()
 	return true
 }
@@ -504,7 +592,7 @@ func (p *presenter) SelectMove(delta int) bool {
 func (p *presenter) JumpTurn(delta int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.focus != focusScrollback || len(p.scrollback) == 0 {
+	if p.focus != focusScrollback || len(p.scrollback) == 0 || delta == 0 {
 		return false
 	}
 	cur := p.sindex
@@ -519,6 +607,7 @@ func (p *presenter) JumpTurn(delta int) bool {
 		}
 		if p.scrollback[i].kind == scrollTurnStart {
 			p.sindex = i
+			p.keepSelectionVisibleLocked()
 			p.scr.Refresh()
 			return true
 		}
@@ -699,10 +788,14 @@ func (p *presenter) PaletteRun() bool {
 func (p *presenter) snapshot() bottomSnapshot {
 	p.mu.Lock()
 	w := p.width
-	p.ed.SetWidth(w)
+	var inRows, popup []string
+	var cr, cc int
+	if p.ed != nil {
+		p.ed.SetWidth(w)
+		inRows, cr, cc = p.ed.View()
+		popup = p.ed.PopupView()
+	}
 	tailRows := splitWrapANSI(p.tail, w)
-	inRows, cr, cc := p.ed.View()
-	popup := p.ed.PopupView()
 	focus := p.focus
 	sview := p.sview
 	sindex := p.sindex
@@ -801,7 +894,11 @@ func (p *presenter) snapshot() bottomSnapshot {
 // It returns the display rows and the row index of the selected entry (or -1).
 func (p *presenter) browseView(w, sview, sindex int) ([]string, int) {
 	p.mu.Lock()
-	entries := p.scrollback
+	entries := make([]scrollEntry, len(p.scrollback))
+	for i, entry := range p.scrollback {
+		entries[i] = entry
+		entries[i].lines = append([]string(nil), entry.lines...)
+	}
 	p.mu.Unlock()
 	if len(entries) == 0 {
 		return nil, -1

@@ -53,6 +53,9 @@ func inboundSessionID(r *http.Request, body map[string]any) string {
 // history. Reused live actors and stored sessions derive history from the log,
 // so they must keep the legacy single-last-user-text delivery.
 func (s *Server) inboundEnsureSession(id string) (*agent.Agent, string, bool, error) {
+	if s.inboundEnsureSessionFn != nil {
+		return s.inboundEnsureSessionFn(id)
+	}
 	freshLog := true
 	if id == "" {
 		id = fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
@@ -359,6 +362,9 @@ func turnEndKind(env *session.SessionEnvelope) string {
 // inboundTurn drives one user prompt through the agent and invokes onEvent
 // for every envelope after the prompt is admitted, until turn/end.
 func (s *Server) inboundTurn(ctx context.Context, ag *agent.Agent, userText string, onEvent func(*session.SessionEnvelope)) error {
+	if s.inboundTurnFn != nil {
+		return s.inboundTurnFn(ctx, ag, userText, onEvent)
+	}
 	if ag == nil {
 		return fmt.Errorf("session actor missing")
 	}
@@ -411,6 +417,18 @@ func (s *Server) inboundTurn(ctx context.Context, ag *agent.Agent, userText stri
 			}
 			onEvent(env)
 			if env.Type == session.EventTurnEnd {
+				if kind := turnEndKind(env); kind != "" && kind != "completed" {
+					var reason session.TurnEndReason
+					var payload session.TurnEndPayload
+					if err := json.Unmarshal(env.Data, &payload); err == nil {
+						reason = payload.Reason
+					}
+					message := reason.Message
+					if message == "" {
+						message = fmt.Sprintf("inbound turn ended with %s", kind)
+					}
+					return fmt.Errorf("%s: %s", kind, message)
+				}
 				return nil
 			}
 			if !ag.Alive() {

@@ -1,6 +1,8 @@
 extends PanelContainer
 class_name TerminalBlock
 
+signal content_size_changed
+
 @onready var output_label: RichTextLabel = %TerminalOutput
 @onready var title_label: Label = %TerminalHeader
 @onready var expand_btn: Button = %ExpandBtn
@@ -114,6 +116,7 @@ func finish(exit_code: int = -1) -> void:
 func _toggle_cap() -> void:
 	_expanded_all = not _expanded_all
 	_paint()
+	content_size_changed.emit()
 
 
 func _apply_style() -> void:

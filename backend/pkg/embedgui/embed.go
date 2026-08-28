@@ -66,6 +66,13 @@ func embeddedAssetHash(name string) (string, error) {
 	return r.hex, nil
 }
 
+// EmbeddedPCKHash returns the SHA-256 of the PCK baked into this binary.
+// It is exposed for host.describe so a running GUI can prove which frontend
+// payload it launched.
+func EmbeddedPCKHash() (string, error) {
+	return embeddedAssetHash(pckAsset)
+}
+
 // embeddedAssetData reads the raw bytes of a named embedded asset; used only
 // on the extraction (mismatch) path.
 func embeddedAssetData(name string) ([]byte, error) {

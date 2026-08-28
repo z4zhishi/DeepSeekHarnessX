@@ -146,6 +146,8 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 	pres.RefreshInput()
 
 	keyCh := startKeyPump()
+	resizeTicker := time.NewTicker(200 * time.Millisecond)
+	defer resizeTicker.Stop()
 	state := statePrompt
 	var approval approvalRequest
 	approvalDraft := ""     // message being typed when an approval interrupts
@@ -165,6 +167,21 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 		}
 	}
 	paletteExit := func() { exitReq = true }
+	// cleanApprovalState resets approval-related editor/UI state so transitions
+	// stay consistent across enter/ctrlc/esc paths.
+	cleanApprovalState := func() {
+		state = statePrompt
+		pres.CloseApprovalCard()
+		approvalSel = 0
+		approvalParked = false
+		ed.SetPrompt(promptStr)
+		ed.SetBuffer(approvalDraft)
+		approvalDraft = ""
+		pres.ParkCard(false)
+		pres.SetFocus(focusPrompt)
+		pres.RefreshInput()
+	}
+
 	// Leaving while an approval is pending would strand the agent actor on
 	// its decision channel; settle it as cancelled on every exit path.
 	defer func() {
@@ -255,6 +272,8 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 			ed.Clear()
 			pres.RefreshInput()
 			state = stateApproval
+		case <-resizeTicker.C:
+			pres.resize()
 		case k, ok := <-keyCh:
 			if !ok {
 				return true
@@ -310,16 +329,7 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 						continue
 					case k.kind == keyEsc:
 						approval.decision <- tools.ApprovalCancel
-						state = statePrompt
-						pres.CloseApprovalCard()
-						approvalParked = false
-						pres.ParkCard(false)
-						approvalSel = 0
-						ed.SetPrompt(promptStr)
-						ed.SetBuffer(approvalDraft)
-						approvalDraft = ""
-						pres.SetFocus(focusPrompt)
-						pres.RefreshInput()
+						cleanApprovalState()
 						continue
 					}
 					// fall through to scrollback navigation below
@@ -349,44 +359,18 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 						}
 						if d, ok2 := parseApproval(opt, approval.options); ok2 {
 							approval.decision <- d
-							state = statePrompt
-							pres.CloseApprovalCard()
-							ed.SetPrompt(promptStr)
-							ed.SetBuffer(approvalDraft)
-							approvalDraft = ""
-							approvalSel = 0
-							approvalParked = false
-							pres.ParkCard(false)
-							pres.SetFocus(focusPrompt)
-							pres.RefreshInput()
+							cleanApprovalState()
 							continue
 						}
 					case k.kind == keyCtrl && k.ctrl == 'o':
 						// YOLO: always-allow this session.
 						approval.decision <- tools.ApprovalAllowAll
-						state = statePrompt
-						pres.CloseApprovalCard()
-						ed.SetPrompt(promptStr)
-						ed.SetBuffer(approvalDraft)
-						approvalDraft = ""
-						approvalParked = false
-						pres.ParkCard(false)
-						pres.SetFocus(focusPrompt)
-						pres.RefreshInput()
+						cleanApprovalState()
 						continue
 					case k.kind == keyRune:
 						if d, ok2 := parseApproval(string(k.r), approval.options); ok2 {
 							approval.decision <- d
-							state = statePrompt
-							pres.CloseApprovalCard()
-							ed.SetPrompt(promptStr)
-							ed.SetBuffer(approvalDraft)
-							approvalDraft = ""
-							approvalSel = 0
-							approvalParked = false
-							pres.ParkCard(false)
-							pres.SetFocus(focusPrompt)
-							pres.RefreshInput()
+							cleanApprovalState()
 							continue
 						}
 					}
@@ -561,16 +545,7 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 						pres.SetFocus(focusScrollback)
 					} else {
 						approval.decision <- tools.ApprovalCancel
-						state = statePrompt
-						pres.CloseApprovalCard()
-						approvalParked = false
-						pres.ParkCard(false)
-						pres.ParkCard(false)
-						approvalSel = 0
-						ed.SetPrompt(promptStr)
-						ed.SetBuffer(approvalDraft)
-						approvalDraft = ""
-						pres.SetFocus(focusPrompt)
+						cleanApprovalState()
 					}
 				case turnActive.Load():
 					// Mid-turn Esc cancels, preserving the draft (unlike
@@ -673,7 +648,17 @@ func handleSubmit(
 				return false
 			}
 		}
+		ag.PostUserMessage(session.UserMessagePayload{
+			ID:   fmt.Sprintf("tui-msg-%d", time.Now().UnixNano()),
+			Role: "user",
+			Content: []session.ContentBlock{
+				{Type: "text", Text: line},
+			},
+			Source: session.MessageSource{Kind: "user"},
+		})
+		return false
 	}
+
 	ag.PostUserMessage(session.UserMessagePayload{
 		ID:   fmt.Sprintf("tui-msg-%d", time.Now().UnixNano()),
 		Role: "user",
@@ -731,6 +716,10 @@ func ParseCommandLocal(line string) (name, raw string, ok bool) {
 	return rest[:sp], rest[sp+1:], true
 }
 
+func unknownCommandText(name string) string {
+	return fmt.Sprintf("Unknown command: /%s", name)
+}
+
 // mergedCommandDefs unions the shared registry with TUI-local commands for
 // completion and help. Registry entries win on name collisions.
 func mergedCommandDefs(toolReg *tools.ToolRegistry) []commandInfo {
@@ -767,6 +756,15 @@ func startKeyPump() <-chan keyEvent {
 		var timer *time.Timer
 		var timerC <-chan time.Time
 		buf := make([]byte, 1024)
+		type readResult struct {
+			n   int
+			err error
+		}
+		reads := make(chan readResult, 1)
+		go func() {
+			n, err := reader.Read(buf)
+			reads <- readResult{n: n, err: err}
+		}()
 
 		arm := func() {
 			if !parser.Pending() {
@@ -782,6 +780,12 @@ func startKeyPump() <-chan keyEvent {
 				timer = time.NewTimer(d)
 				timerC = timer.C
 			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				timer.Reset(d)
 			}
 		}
@@ -793,26 +797,30 @@ func startKeyPump() <-chan keyEvent {
 		}
 
 		for {
-			n, err := reader.Read(buf)
-			if n > 0 {
-				var evs []keyEvent
-				for _, b := range buf[:n] {
-					evs = append(evs, parser.Feed(b)...)
-				}
-				emit(evs)
-				arm()
-			}
-			if err != nil {
-				emit(parser.Flush())
-				ch <- keyEvent{kind: keyEOF}
-				return
-			}
 			select {
+			case result := <-reads:
+				if result.n > 0 {
+					var evs []keyEvent
+					for _, b := range buf[:result.n] {
+						evs = append(evs, parser.Feed(b)...)
+					}
+					emit(evs)
+					arm()
+				}
+				if result.err != nil {
+					emit(parser.Flush())
+					ch <- keyEvent{kind: keyEOF}
+					return
+				}
+				reads = make(chan readResult, 1)
+				go func() {
+					n, err := reader.Read(buf)
+					reads <- readResult{n: n, err: err}
+				}()
 			case <-timerC:
 				timer = nil
 				timerC = nil
 				emit(parser.Flush())
-			default:
 			}
 		}
 	}()
@@ -820,6 +828,8 @@ func startKeyPump() <-chan keyEvent {
 }
 
 const approvalPromptStr = ColorBold + "? " + ColorReset
+
+const cookedLimitedBanner = "Raw input unavailable; using cooked input (completion and live editing are limited)."
 
 // buildHelpText renders commands plus the keybinding cheat-sheet.
 func buildHelpText(defs []commandInfo) string {
@@ -899,6 +909,9 @@ func runCookedTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapt
 	signal.Notify(interrupt, os.Interrupt)
 	defer signal.Stop(interrupt)
 
+	if _, _, ok := terminalSize(); ok {
+		ui.write(ColorYellow + cookedLimitedBanner + ColorReset + "\n")
+	}
 	ui.write(banner(modelName, tuiCwd()))
 	ui.prompt()
 
@@ -974,6 +987,11 @@ func runCookedTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapt
 					ui.prompt()
 					continue
 				}
+			}
+			if name, _, ok := ParseCommandLocal(line); ok && name != "" {
+				ui.write(ColorYellow + unknownCommandText(name) + ColorReset + "\n")
+				ui.prompt()
+				continue
 			}
 			ag.PostUserMessage(session.UserMessagePayload{
 				ID:   fmt.Sprintf("tui-msg-%d", time.Now().UnixNano()),
