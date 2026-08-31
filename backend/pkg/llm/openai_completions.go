@@ -1,3 +1,8 @@
+// openai-completions 线格式构造块：dsh-internal/v1（LlmAdapter）到 OpenAI
+// Chat Completions SSE 的翻译器（中转）。协议插件化后本文件只负责这一条线
+// 协议；注册进默认 ProtocolRegistry（internal_protocol.go）。DeepSeek 是走
+// 本线协议的默认 provider profile（无自有线协议），语义沿用
+// docs/deepseek-llm-contract.md。
 package llm
 
 import (
@@ -19,7 +24,7 @@ import (
 func chatCompletionsURL(baseURL string) string {
 	base := trimBaseURL(baseURL)
 	if base == "" {
-		base = DefaultDeepSeekBaseURL
+		base = DefaultCompletionsBaseURL
 	}
 	if pathHas(base, "/chat/completions") {
 		return base
@@ -28,21 +33,21 @@ func chatCompletionsURL(baseURL string) string {
 		return base + "/chat/completions"
 	}
 	if urlHost(base) == "api.deepseek.com" {
-		return base + deepSeekChatPath
+		return base + DefaultCompletionsChatPath
 	}
 	return base + "/v1/chat/completions"
 }
 
-func newCompletionsAdapter(p ProviderProfile) *DeepSeekAdapter {
+func newCompletionsAdapter(p ProviderProfile) *CompletionsAdapter {
 	p = normalizeProfile(p)
 	if p.BaseURL == "" {
-		p.BaseURL = DefaultDeepSeekBaseURL
+		p.BaseURL = DefaultCompletionsBaseURL
 	}
 	if p.Model == "" {
-		p.Model = DefaultDeepSeekModel
+		p.Model = DefaultCompletionsModel
 	}
-	return &DeepSeekAdapter{
-		cfg: DeepSeekConfig{
+	return &CompletionsAdapter{
+		cfg: CompletionsConfig{
 			APIKey:         p.APIKey,
 			BaseURL:        p.BaseURL,
 			Model:          p.Model,
@@ -62,7 +67,7 @@ func newCompletionsAdapter(p ProviderProfile) *DeepSeekAdapter {
 
 // Stream implements LlmAdapter. It returns a chunk channel and an error channel;
 // the error channel carries exactly one fatal error (or none on clean EOF).
-func (d *DeepSeekAdapter) Stream(ctx context.Context, req ModelRequest) (<-chan StreamChunk, <-chan error) {
+func (d *CompletionsAdapter) Stream(ctx context.Context, req ModelRequest) (<-chan StreamChunk, <-chan error) {
 	key, err := resolveStreamKey(d.cfg.APIKey, d.cfg.APIKeyResolver)
 	if err != nil {
 		return failStream(err)
@@ -93,7 +98,7 @@ type deepSeekFunctionCall struct {
 }
 
 type deepSeekMessage struct {
-	Role             string             `json:"role"`
+	Role string `json:"role"`
 	// Content is "" for text-less turns — NEVER null. It stays a pointer so
 	// MarshalJSON below can distinguish "omit the key entirely" (never used
 	// for assistant) from the explicit empty string.
@@ -138,6 +143,7 @@ func derefContent(c *string) string {
 	}
 	return *c
 }
+
 type deepSeekTool struct {
 	Type     string           `json:"type"` // "function"
 	Function deepSeekFunction `json:"function"`
@@ -372,13 +378,13 @@ func buildDeepSeekRequest(req ModelRequest) deepSeekRequest {
 	return body
 }
 
-func (d *DeepSeekAdapter) completionsEndpoint() string {
+func (d *CompletionsAdapter) completionsEndpoint() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return chatCompletionsURL(d.baseURL)
 }
 
-func (d *DeepSeekAdapter) streamCompletions(
+func (d *CompletionsAdapter) streamCompletions(
 	streamCtx context.Context,
 	cancel context.CancelFunc,
 	req ModelRequest,

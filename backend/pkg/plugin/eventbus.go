@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"reflect"
+	"sort"
 	"sync"
 )
 
@@ -15,6 +16,10 @@ import (
 type EventBus struct {
 	mu       sync.RWMutex
 	handlers map[string][]EventHandler
+	nextID   int64
+	subs     map[int64]string
+	owners   map[int64]string
+	ids      map[string][]int64
 }
 
 // Event 是总线上的一个事件载体。
@@ -31,35 +36,58 @@ type EventHandler func(ev Event)
 
 // NewEventBus 构造空总线。
 func NewEventBus() *EventBus {
-	return &EventBus{handlers: map[string][]EventHandler{}}
+	return &EventBus{handlers: map[string][]EventHandler{}, subs: map[int64]string{}, owners: map[int64]string{}, ids: map[string][]int64{}}
 }
 
-// On 订阅一个主题；返回一个取消函数（Cordis ctx.on 的 off 语义）。
-// 主题支持精确匹配。同一 handler 重复订阅会触发多次（上游语义）。
-func (b *EventBus) On(topic string, h EventHandler) func() {
+// OnOwned subscribes a handler and associates it with an owner for lifecycle cleanup.
+func (b *EventBus) OnOwned(owner, topic string, h EventHandler) func() {
+	if owner == "" {
+		return func() {}
+	}
+	return b.on(owner, topic, h)
+}
+
+func (b *EventBus) on(owner, topic string, h EventHandler) func() {
 	if topic == "" || h == nil {
 		return func() {}
 	}
 	b.mu.Lock()
+	b.nextID++
+	id := b.nextID
 	b.handlers[topic] = append(b.handlers[topic], h)
+	b.subs[id] = topic
+	b.owners[id] = owner
+	b.ids[topic] = append(b.ids[topic], id)
 	b.mu.Unlock()
 	var once sync.Once
-	return func() {
-		once.Do(func() { b.off(topic, h) })
-	}
+	return func() { once.Do(func() { b.off(id, topic, h) }) }
 }
 
-func (b *EventBus) off(topic string, h EventHandler) {
+// 主题支持精确匹配。同一 handler 重复订阅会触发多次（上游语义）。
+func (b *EventBus) On(topic string, h EventHandler) func() {
+	return b.on("", topic, h)
+}
+
+func (b *EventBus) off(id int64, topic string, h EventHandler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if t, ok := b.subs[id]; !ok || t != topic {
+		return
+	}
+	delete(b.subs, id)
+	delete(b.owners, id)
+	for i, subID := range b.ids[topic] {
+		if subID == id {
+			b.ids[topic] = append(b.ids[topic][:i], b.ids[topic][i+1:]...)
+			break
+		}
+	}
 	hs := b.handlers[topic]
 	for i := range hs {
-		if hs[i] != nil && sameHandler(hs[i], h) {
-			hs = append(hs[:i], hs[i+1:]...)
-			if len(hs) == 0 {
+		if sameHandler(hs[i], h) {
+			b.handlers[topic] = append(hs[:i], hs[i+1:]...)
+			if len(b.handlers[topic]) == 0 {
 				delete(b.handlers, topic)
-			} else {
-				b.handlers[topic] = hs
 			}
 			return
 		}
@@ -94,11 +122,57 @@ func (b *EventBus) Emit(topic string, payload any) {
 	}
 }
 
-// Has 报告是否有订阅者；测试/诊断用。
+// OffOwner removes all subscriptions registered by owner.
+func (b *EventBus) OffOwner(owner string) {
+	if owner == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id, o := range b.owners {
+		if o != owner {
+			continue
+		}
+		topic := b.subs[id]
+		delete(b.subs, id)
+		delete(b.owners, id)
+		for i, subID := range b.ids[topic] {
+			if subID == id {
+				b.ids[topic] = append(b.ids[topic][:i], b.ids[topic][i+1:]...)
+				if i < len(b.handlers[topic]) {
+					b.handlers[topic] = append(b.handlers[topic][:i], b.handlers[topic][i+1:]...)
+				}
+				break
+			}
+		}
+		if len(b.handlers[topic]) == 0 {
+			delete(b.handlers, topic)
+		}
+		if len(b.ids[topic]) == 0 {
+			delete(b.ids, topic)
+		}
+	}
+}
+
 func (b *EventBus) Has(topic string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.handlers[topic]) > 0
+}
+
+// Describe returns a deterministic snapshot of topics and subscriber counts.
+func (b *EventBus) Describe() []EventView {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]EventView, 0, len(b.handlers))
+	for topic, handlers := range b.handlers {
+		out = append(out, EventView{Topic: topic, Subscribers: len(handlers)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
+	return out
 }
 
 // EventHookInvoked / EventHookResult 是钩子运行时真实发布的事件主题（常量已预埋在

@@ -1,3 +1,8 @@
+// 公共构造面：NewProtocolAdapter / SupportedProtocols 委托包默认协议注册表
+// （internal_protocol.go，三条线协议的播种即默认注册）。签名与语义对旧
+// switch 版本逐字保持：未知协议报错并列出已注册名，空 Protocol 回退
+// openai-completions。内部协议（dsh-internal/v1）的 story 见
+// internal_protocol.go 头注。
 package llm
 
 import (
@@ -6,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -65,34 +69,24 @@ type ProviderProfile struct {
 	Watchdog       time.Duration
 }
 
-// SupportedProtocols returns the three hand-declared wire protocols in stable
-// order: openai-completions, openai-responses, anthropic-messages.
+// SupportedProtocols returns the default registry's registered protocol names
+// in stable seed order: openai-completions, openai-responses, anthropic-messages
+// (most-reached first）。三条线协议的播种即默认注册；消费者自建注册表时以
+// RegisterBuiltinProtocols 复用同一顺序。
 func SupportedProtocols() []string {
-	return []string{
-		ProtocolOpenAICompletions,
-		ProtocolOpenAIResponses,
-		ProtocolAnthropicMessages,
-	}
+	return defaultProtocols.List()
 }
 
-// NewProtocolAdapter builds a streaming LlmAdapter for one profile.
-// Unknown protocol → error. Empty Protocol defaults to openai-completions.
+// NewProtocolAdapter builds a streaming LlmAdapter for one profile by
+// delegating to the package-default ProtocolRegistry. Unknown protocol →
+// error. Empty Protocol defaults to openai-completions.
 func NewProtocolAdapter(p ProviderProfile) (LlmAdapter, error) {
 	proto := p.Protocol
 	if proto == "" {
 		proto = ProtocolOpenAICompletions
 	}
 	p.Protocol = proto
-	switch proto {
-	case ProtocolOpenAICompletions:
-		return newCompletionsAdapter(p), nil
-	case ProtocolOpenAIResponses:
-		return newResponsesAdapter(p), nil
-	case ProtocolAnthropicMessages:
-		return newAnthropicAdapter(p), nil
-	default:
-		return nil, fmt.Errorf("llm: unknown protocol %q (supported: %s)", proto, strings.Join(SupportedProtocols(), ", "))
-	}
+	return defaultProtocols.Build(proto, p)
 }
 
 func normalizeProfile(p ProviderProfile) ProviderProfile {
@@ -101,10 +95,10 @@ func normalizeProfile(p ProviderProfile) ProviderProfile {
 	}
 	p.BaseURL = trimBaseURL(p.BaseURL)
 	if p.Timeout <= 0 {
-		p.Timeout = defaultDeepSeekTimeout
+		p.Timeout = defaultTimeout
 	}
 	if p.Watchdog <= 0 {
-		p.Watchdog = defaultDeepSeekWatchdog
+		p.Watchdog = defaultWatchdog
 	}
 	return p
 }

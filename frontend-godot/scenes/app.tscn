@@ -1,4 +1,4 @@
-[gd_scene load_steps=16 format=3]
+[gd_scene load_steps=20 format=3]
 
 [ext_resource type="Script" path="res://scripts/ui/app.gd" id="1_app"]
 [ext_resource type="Script" path="res://scripts/net/dsh_client.gd" id="2_client"]
@@ -15,6 +15,9 @@
 [ext_resource type="Script" path="res://scripts/overlays/onboarding.gd" id="13_onb"]
 [ext_resource type="Script" path="res://scripts/overlays/jobs.gd" id="14_jobs"]
 [ext_resource type="Script" path="res://scripts/overlays/plugins.gd" id="15_plug"]
+[ext_resource type="Script" path="res://scripts/overlays/approval_inbox.gd" id="16_inbox"]
+[ext_resource type="Script" path="res://scripts/views/subagent_tree.gd" id="17_lineage"]
+[ext_resource type="Script" path="res://scripts/ui/boot_splash.gd" id="18_bootsplash"]
 
 [node name="App" type="PanelContainer"]
 anchors_preset = 15
@@ -93,7 +96,26 @@ visible = false
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
+
+[node name="TrajectoryView" type="Control" parent="Frame/Center/CenterVBox/TrajectoryTab"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
 script = ExtResource("10_traj")
+
+[node name="LineageTree" type="Tree" parent="Frame/Center/CenterVBox/TrajectoryTab"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("17_lineage")
 
 [node name="ComposerSeat" type="MarginContainer" parent="Frame/Center/CenterVBox"]
 unique_name_in_owner = true
@@ -124,6 +146,23 @@ unique_name_in_owner = true
 layer = 50
 script = ExtResource("11_appr")
 
+[node name="ApprovalInbox" type="PanelContainer" parent="."]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(300, 0)
+anchors_preset = 3
+anchor_left = 1.0
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -340.0
+offset_top = -140.0
+offset_right = -16.0
+offset_bottom = -16.0
+grow_horizontal = 0
+grow_vertical = 0
+script = ExtResource("16_inbox")
+
 [node name="SettingsOverlay" type="CanvasLayer" parent="."]
 unique_name_in_owner = true
 layer = 30
@@ -143,3 +182,58 @@ script = ExtResource("14_jobs")
 unique_name_in_owner = true
 layer = 31
 script = ExtResource("15_plug")
+
+[node name="BootSplash" type="CanvasLayer" parent="."]
+unique_name_in_owner = true
+layer = 100
+script = ExtResource("18_bootsplash")
+
+[node name="Fader" type="Control" parent="BootSplash"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Backdrop" type="ColorRect" parent="BootSplash/Fader"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Mid" type="CenterContainer" parent="BootSplash/Fader"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Stack" type="VBoxContainer" parent="BootSplash/Fader/Mid"]
+layout_mode = 2
+theme_override_constants/separation = 14
+alignment = 1
+
+[node name="Logo" type="TextureRect" parent="BootSplash/Fader/Mid/Stack"]
+custom_minimum_size = Vector2(72, 72)
+layout_mode = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="Wordmark" type="Label" parent="BootSplash/Fader/Mid/Stack"]
+layout_mode = 2
+text = "TeplixCode"
+horizontal_alignment = 1
+
+[node name="Track" type="Panel" parent="BootSplash/Fader/Mid/Stack"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(140, 4)
+layout_mode = 2
+
+[node name="Pill" type="Panel" parent="BootSplash/Fader/Mid/Stack/Track"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(36, 4)
+layout_mode = 2

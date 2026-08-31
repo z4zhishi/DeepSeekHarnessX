@@ -1,11 +1,8 @@
 package mcp
 
-// 产品会话挂载入口：把 MCP 服务器工具挂进常驻产品模式（gui/tui/server/acp/
-// sdk/headless）共享的主 ToolRegistry。与专职 `dshx mcp` 校验模式的同步
-// MountConfigFile 不同，产品路径必须零阻塞且可降级：
-//   - 未配置（path 空）：零副作用，不触碰文件系统；
-//   - 配置缺失/解析失败/挂载错误：记日志后静默降级为无 MCP，绝不阻断启动；
-//   - 挂载在独立 goroutine 中执行，调用方不被任何子进程/网络 IO 阻塞。
+// MCP 配置挂载辅助。产品会话路径走 plugin.NewMcpCapability + Registry
+// Mount/Unload（失败可观察、工具有 owner、disable 回收）。本文件的
+// MountAsync 是测试/遗留异步入口，不是 dsh 生产装配。
 
 import (
 	"context"
@@ -51,6 +48,9 @@ func (m *ProductMount) store(sups []*Supervisor) {
 }
 
 // MountAsync 异步把 path 指向的 MCP 配置挂载进 reg。
+//
+// Non-product: production session MCP is plugin.NewMcpCapability + Registry
+// Mount/Unload. This helper is for tests and leftover async host paths.
 //
 //   - path 为空或仅空白：立即完成，mount 不被调用（零副作用）；
 //   - LoadConfigFile 失败（缺失/解析失败）：记日志降级，mount 不被调用；

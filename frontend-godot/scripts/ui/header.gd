@@ -12,6 +12,7 @@ const HEADER_COMPACT := 1180.0
 @onready var _lineage: Label = %Lineage
 @onready var _chat_btn: Button = %ChatTabBtn
 @onready var _traj_btn: Button = %TrajectoryTabBtn
+@onready var _lineage_btn: Button = %LineageTabBtn
 @onready var _models: OptionButton = %ModelPicker
 @onready var _ctx: HBoxContainer = %CtxPressure
 @onready var _ctx_bar: ProgressBar = %CtxBar
@@ -33,11 +34,14 @@ func _ready() -> void:
 	var group := ButtonGroup.new()
 	_chat_btn.toggle_mode = true
 	_traj_btn.toggle_mode = true
+	_lineage_btn.toggle_mode = true
 	_chat_btn.button_group = group
 	_traj_btn.button_group = group
+	_lineage_btn.button_group = group
 	_chat_btn.button_pressed = true
 	_chat_btn.pressed.connect(func(): _emit_tab("chat"))
 	_traj_btn.pressed.connect(func(): _emit_tab("trajectory"))
+	_lineage_btn.pressed.connect(func(): _emit_tab("lineage"))
 	_jobs.pressed.connect(func(): jobs_pressed.emit())
 	_models.item_selected.connect(_on_model_item)
 	resized.connect(_apply_compact)
@@ -68,11 +72,19 @@ func apply_tokens() -> void:
 	_ctx_label.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
 	DshIcons.apply(_plan_icon, "plan", 14.0)
 	DshIcons.apply(_jobs_icon, "jobs", 14.0)
-	var plan_bg := DshTokens.bg_layer2()
-	plan_bg.a = 0.88
-	var plan_box := DshTokens.box(plan_bg, DshTokens.RADIUS_PILL, DshTokens.success(), 1, Vector4(10, 3, 10, 3))
-	plan_box.shadow_color = DshTokens.shadow_tinted()
-	plan_box.shadow_size = 6
+	# Jobs 按钮（Apple 化第一批，截图审出缺陷 2）：全局 Button 主题在暗色下
+	# 会把无 override 的按钮画成反白实底块——Header 内不应有色块按钮。
+	# 改为 quiet ghost：透明底 + hover 轻抬亮，与 tabs 同一视觉语言。
+	var jpad := Vector4(12, 5, 12, 5)
+	_jobs.flat = true
+	_jobs.add_theme_stylebox_override("normal", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, jpad))
+	_jobs.add_theme_stylebox_override("hover", DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, jpad))
+	_jobs.add_theme_stylebox_override("pressed", DshTokens.box(DshTokens.pressed_layer(), DshTokens.RADIUS_PILL, Color(0, 0, 0, 0), 0, jpad))
+	_jobs.add_theme_stylebox_override("focus", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_PILL, DshTokens.accent(), 1, jpad))
+	_jobs.add_theme_color_override("font_color", DshTokens.text_secondary())
+	_jobs.add_theme_color_override("font_hover_color", DshTokens.text_primary())
+	_jobs.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	var plan_box := DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, DshTokens.success(), 1, Vector4(10, 3, 10, 3))
 	_plan.add_theme_stylebox_override("panel", plan_box)
 	_plan_label.add_theme_color_override("font_color", DshTokens.success())
 	_plan_label.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
@@ -124,23 +136,20 @@ func set_models(models: Array, selected: String) -> void:
 
 
 func _refresh_model_visibility() -> void:
-	# §5: the Header "model" surface shows whenever the model list is non-empty.
-	# Compact 态不再整体隐藏：保留缩写（取 id 末段，如 deepseek-v4-flash →
-	# v4-flash），模型身份在任何宽度下都可达。
-	_models.visible = _models.item_count > 0
-	if _models.visible and is_compact():
-		var id := str(_models.get_item_metadata(_models.selected))
-		if id == "":
-			id = _models.text
+	# Composer owns the primary model control. Keep this picker hidden as a
+	# data-sync surface for set_models / the ⚙ param popup.
+	_models.visible = false
+	if _models.item_count <= 0:
+		_models.tooltip_text = _t("common.model", "Model")
+		return
+	var id := ""
+	if _models.selected >= 0 and _models.selected < _models.item_count:
+		id = str(_models.get_item_metadata(_models.selected))
+	if id == "":
+		id = _models.text
+	_models.tooltip_text = id if id != "" else _t("common.model", "Model")
+	if is_compact() and id != "":
 		_models.text = _compact_model_text(id)
-		_models.tooltip_text = id
-	elif _models.visible:
-		var full := ""
-		if _models.selected >= 0 and _models.selected < _models.item_count:
-			full = str(_models.get_item_metadata(_models.selected))
-		if full == "":
-			full = _models.text
-		_models.tooltip_text = full if full != "" else _t("common.model", "Model")
 
 
 func set_context(pressure: float, label: String, detail: String = "") -> void:
@@ -167,27 +176,31 @@ func _emit_tab(name: String) -> void:
 	_tab = name
 	_chat_btn.button_pressed = name == "chat"
 	_traj_btn.button_pressed = name == "trajectory"
+	_lineage_btn.button_pressed = name == "lineage"
 	_paint_tabs()
 	tab_changed.emit(name)
 
 
 func _paint_tabs() -> void:
-	var active_bg := DshTokens.accent()
-	var active_fg := Color(1, 1, 1, 1)
-	var idle_bg := DshTokens.bg_layer2()
+	# 视觉重设计（task #20）：活动态 accent 弱底 + accent 文字（不再是白字
+	# 实底块），非活动态透明、hover 才抬亮；tab 从"色块"降为"分层"——更轻，
+	# 与收件条/侧栏的行语言一致。
 	var idle_fg := DshTokens.text_secondary()
-	for pair in [[_chat_btn, _tab == "chat"], [_traj_btn, _tab == "trajectory"]]:
+	for pair in [[_chat_btn, _tab == "chat"], [_traj_btn, _tab == "trajectory"], [_lineage_btn, _tab == "lineage"]]:
 		var btn: Button = pair[0]
 		var active: bool = pair[1]
 		if btn == null:
 			continue
-		var bg := active_bg if active else idle_bg
-		var fg := active_fg if active else idle_fg
-		btn.add_theme_stylebox_override("normal", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
-		btn.add_theme_stylebox_override("hover", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
-		btn.add_theme_stylebox_override("pressed", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(12, 4, 12, 4)))
+		var bg := DshTokens.accent_soft() if active else Color(0, 0, 0, 0)
+		var hov := DshTokens.accent_soft() if active else DshTokens.bg_layer2()
+		btn.add_theme_stylebox_override("normal", DshTokens.box(bg, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(14, 5, 14, 4)))
+		btn.add_theme_stylebox_override("hover", DshTokens.box(hov, DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(14, 5, 14, 4)))
+		btn.add_theme_stylebox_override("pressed", DshTokens.box(DshTokens.pressed_layer(), DshTokens.RADIUS_PILL, Color.TRANSPARENT, 0, Vector4(14, 5, 14, 4)))
+		btn.add_theme_stylebox_override("focus", DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_PILL, DshTokens.accent(), 1, Vector4(14, 5, 14, 4)))
+		var fg := DshTokens.accent() if active else idle_fg
+		var fg_hover := DshTokens.accent_hover() if active else DshTokens.text_primary()
 		btn.add_theme_color_override("font_color", fg)
-		btn.add_theme_color_override("font_hover_color", fg)
+		btn.add_theme_color_override("font_hover_color", fg_hover)
 		btn.add_theme_color_override("font_pressed_color", fg)
 		btn.add_theme_color_override("font_focus_color", fg)
 
@@ -311,6 +324,7 @@ func is_compact() -> bool:
 func _apply_strings() -> void:
 	_chat_btn.text = _t("app.chatTab", "Chat")
 	_traj_btn.text = _t("app.trajectoryTab", "Trajectory")
+	_lineage_btn.text = _t("app.lineageTab", "Lineage")
 	_plan_label.text = _t("app.planMode", "Plan")
 	_jobs.text = _t("app.jobs", "Jobs")
 	_jobs.tooltip_text = "%s (Ctrl+J)" % _t("app.jobs", "Jobs")

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -26,7 +27,7 @@ import (
 	"dsh-go/pkg/tools"
 )
 
-//go:embed assets/*
+//go:embed assets/dsh.pck
 var EmbeddedAssets embed.FS
 
 const (
@@ -34,10 +35,10 @@ const (
 	runnerAsset = "assets/godot_runner.exe"
 )
 
-// assetHashResult memoizes embeddedAssetHash per asset name: embed.FS content
-// is immutable for the process lifetime, so each launch hashes the ~350MB of
-// embedded GUI assets at most once no matter how many disk copies need
-// checking against it.
+// assetHashResult memoizes embedded-asset hash resolution per asset name:
+// embed.FS content is immutable for the process lifetime, so each launch
+// hashes the ~350MB of embedded GUI assets at most once no matter how many
+// disk copies need checking against it.
 type assetHashResult struct {
 	hex string
 	err error
@@ -45,25 +46,77 @@ type assetHashResult struct {
 
 var assetHashCache sync.Map // name -> assetHashResult
 
+// assetDataSource reads the raw bytes of a named embedded asset. Package-level
+// indirection so tests can serve a small fake asset set instead of the real
+// ~181MB runner (hermetic + fast) without embedding anything extra.
+var assetDataSource = embeddedAssetData
+
+// hashEmbeddedBytes computes the hex content hash of embedded asset bytes.
+// Package-level indirection so tests can count exactly how often the heavy
+// full-hash path runs (a warm launch must run it zero times).
+var hashEmbeddedBytes = sha256Hex
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// exeStamp is the cheap identity of the running binary that keys the
+// persisted embedded-asset hash records: size + mtime. Replacing or
+// rebuilding the exe changes at least one of them, while the check itself
+// costs one os.Stat. A whole-exe CONTENT hash would re-read the same ~181MB
+// the cache exists to avoid and is deliberately NOT used.
+type exeStamp struct {
+	size    int64
+	mtimeNS int64
+}
+
+var (
+	exeStampOnce sync.Once
+	exeStampVal  exeStamp
+)
+
+// currentExeStamp stats the running binary once per process. A zero stamp
+// (stat failed) never matches a persisted record, so the full-hash path —
+// the historical behavior — is what runs when no fingerprint can be
+// established.
+func currentExeStamp() exeStamp {
+	exeStampOnce.Do(func() {
+		path, err := os.Executable()
+		if err != nil {
+			return
+		}
+		fi, err := os.Stat(path)
+		if err != nil || !fi.Mode().IsRegular() {
+			return
+		}
+		exeStampVal = exeStamp{size: fi.Size(), mtimeNS: fi.ModTime().UnixNano()}
+	})
+	return exeStampVal
+}
+
+// embeddedAssetSize reports the size of a named embedded asset without
+// reading its bytes (fs.Stat walks the embed.FS header only). The runner is
+// registered in the GOOS-specific runner embed FS, hence the dispatch.
+func embeddedAssetSize(name string) (int64, bool) {
+	if name == runnerAsset {
+		return runnerEmbeddedSize()
+	}
+	fi, err := fs.Stat(EmbeddedAssets, name)
+	if err != nil {
+		return 0, false
+	}
+	return fi.Size(), true
+}
+
 // embeddedAssetHash returns the hex sha256 of a named embedded asset without
 // retaining the raw bytes (a cached []byte copy would pin hundreds of MB of
 // heap for the process lifetime); extraction re-reads the bytes only on the
-// rare mismatch path.
+// rare mismatch path. Process-level memoization only — callers that have a
+// concrete runtime cache dir go through embeddedCachedHash to also persist
+// the result across launches.
 func embeddedAssetHash(name string) (string, error) {
-	if v, ok := assetHashCache.Load(name); ok {
-		r := v.(assetHashResult)
-		return r.hex, r.err
-	}
-	data, err := EmbeddedAssets.ReadFile(name)
-	if err != nil {
-		r := assetHashResult{err: err}
-		assetHashCache.Store(name, r)
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	r := assetHashResult{hex: hex.EncodeToString(sum[:])}
-	assetHashCache.Store(name, r)
-	return r.hex, nil
+	return embeddedCachedHash(name, "")
 }
 
 // EmbeddedPCKHash returns the SHA-256 of the PCK baked into this binary.
@@ -73,9 +126,72 @@ func EmbeddedPCKHash() (string, error) {
 	return embeddedAssetHash(pckAsset)
 }
 
+// embeddedCachedHash resolves the hex sha256 of a named embedded asset and,
+// when stampTarget is non-empty, lets the result outlive this process: it is
+// persisted as the second record of that target's sidecar stamp file, keyed
+// by the exe fingerprint (size + mtime) and the embedded asset size. A later
+// launch whose fingerprint still matches resolves the hash from a few stats
+// instead of re-reading the ~181MB of embedded bytes; any exe change (rebuild
+// or replacement) or asset-size drift invalidates the record and produces
+// exactly one full re-hash — the cost every cold launch already paid.
+func embeddedCachedHash(name, stampTarget string) (string, error) {
+	if v, ok := assetHashCache.Load(name); ok {
+		r := v.(assetHashResult)
+		return r.hex, r.err
+	}
+	if es := currentExeStamp(); es.size > 0 {
+		if sz, ok := embeddedAssetSize(name); ok {
+			if rec, ok := readEmbeddedStamp(stampTarget); ok && rec.validFor(es, sz) {
+				r := assetHashResult{hex: rec.hashHex}
+				assetHashCache.Store(name, r)
+				return r.hex, nil
+			}
+		}
+	}
+	data, err := assetDataSource(name)
+	if err != nil {
+		r := assetHashResult{err: err}
+		assetHashCache.Store(name, r)
+		return "", err
+	}
+	hex := hashEmbeddedBytes(data)
+	assetHashCache.Store(name, assetHashResult{hex: hex})
+	persistEmbeddedStamp(stampTarget, name, hex)
+	return hex, nil
+}
+
+// persistEmbeddedStamp best-effort records a freshly computed embedded hash.
+// Best-effort like the disk stamps: an unwritable sidecar or an unknown
+// exe/asset size only costs a full re-hash on the next launch.
+func persistEmbeddedStamp(stampTarget, name, hashHex string) {
+	if stampTarget == "" {
+		return
+	}
+	es := currentExeStamp()
+	if es.size <= 0 {
+		return
+	}
+	sz, ok := embeddedAssetSize(name)
+	if !ok {
+		return
+	}
+	writeEmbeddedStamp(stampTarget, embeddedStamp{
+		exeSize:    es.size,
+		exeMtimeNS: es.mtimeNS,
+		assetSize:  sz,
+		hashHex:    hashHex,
+	})
+}
+
 // embeddedAssetData reads the raw bytes of a named embedded asset; used only
-// on the extraction (mismatch) path.
+// on the extraction (mismatch) path. The PCK is embedded for every GOOS
+// from EmbeddedAssets; the runner is embedded per-GOOS and read through
+// readRunnerAsset (Windows PE on windows builds; non-Windows builds embed NO
+// runner — W7-a — and readRunnerAsset reports fs.ErrNotExist there).
 func embeddedAssetData(name string) ([]byte, error) {
+	if name == runnerAsset {
+		return readRunnerAsset(name)
+	}
 	return EmbeddedAssets.ReadFile(name)
 }
 
@@ -107,35 +223,120 @@ type diskStamp struct {
 	mtimeNS int64
 }
 
+// embeddedStamp is the launch-cost record for the embedded assets themselves,
+// carried as a second line of the SAME sidecar stamp file:
+//
+//	dshx-embedded <exeSize> <exeMtimeUnixNano> <assetSize> <embeddedHex>
+//
+// It answers "what does THIS exe's embedded asset hash to" across launches
+// without re-reading the asset. It lives next to the extracted copies
+// (<UserCacheDir>/dsh/runtime/*.sha256) and is validated by three cheap
+// stats (exe size, exe mtime, embedded asset size) — not by hashing anything.
+// A missing, corrupt or foreign-keyed record degrades to the historical
+// full-hash path, which then refreshes the record.
+type embeddedStamp struct {
+	exeSize    int64
+	exeMtimeNS int64
+	assetSize  int64
+	hashHex    string
+}
+
+const embeddedStampTag = "dshx-embedded"
+
+// validFor reports whether the record describes exactly this exe and this
+// embedded asset size. Keyed by cheap stats, not by hashing the exe.
+func (s embeddedStamp) validFor(es exeStamp, assetSize int64) bool {
+	return s.hashHex != "" && es.size > 0 &&
+		s.exeSize == es.size &&
+		s.exeMtimeNS == es.mtimeNS &&
+		s.assetSize == assetSize
+}
+
 func sidecarPath(path string) string { return path + ".sha256" }
 
-func readDiskStamp(path string) (diskStamp, bool) {
-	raw, err := os.ReadFile(sidecarPath(path))
+// parseSidecarFiles tolerantly parses the (up to) two-record sidecar format:
+// line 1 is the v1 disk-copy stamp, line 2 the embedded record. Unknown or
+// malformed lines are skipped individually rather than invalidating the whole
+// file; a sidecar that lost both records simply forces full re-verification.
+func parseSidecarFiles(raw string) (disk diskStamp, diskOK bool, emb embeddedStamp, embOK bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) == 3 && len(fields[0]) == 64:
+			size, errSize := strconv.ParseInt(fields[1], 10, 64)
+			mtimeNS, errMtime := strconv.ParseInt(fields[2], 10, 64)
+			if errSize == nil && errMtime == nil {
+				disk, diskOK = diskStamp{hashHex: fields[0], size: size, mtimeNS: mtimeNS}, true
+			}
+		case len(fields) == 5 && fields[0] == embeddedStampTag:
+			exeSize, errExe := strconv.ParseInt(fields[1], 10, 64)
+			exeMtimeNS, errExeMtime := strconv.ParseInt(fields[2], 10, 64)
+			assetSize, errAsset := strconv.ParseInt(fields[3], 10, 64)
+			if errExe == nil && errExeMtime == nil && errAsset == nil && len(fields[4]) == 64 {
+				emb, embOK = embeddedStamp{exeSize: exeSize, exeMtimeNS: exeMtimeNS, assetSize: assetSize, hashHex: fields[4]}, true
+			}
+		}
+	}
+	return
+}
+
+func readSidecarRecords(target string) (disk diskStamp, diskOK bool, emb embeddedStamp, embOK bool) {
+	raw, err := os.ReadFile(sidecarPath(target))
 	if err != nil {
-		return diskStamp{}, false
+		return diskStamp{}, false, embeddedStamp{}, false
 	}
-	fields := strings.Fields(string(raw))
-	if len(fields) != 3 || len(fields[0]) != 64 {
-		return diskStamp{}, false
+	return parseSidecarFiles(string(raw))
+}
+
+func readDiskStamp(path string) (diskStamp, bool) {
+	disk, ok, _, _ := readSidecarRecords(path)
+	return disk, ok
+}
+
+// readEmbeddedStamp reads the embedded-record line from the sidecar of the
+// given target file.
+func readEmbeddedStamp(target string) (embeddedStamp, bool) {
+	_, _, emb, ok := readSidecarRecords(target)
+	return emb, ok
+}
+
+// writeSidecar rewrites the sidecar file of target, updating only the records
+// handed in as non-nil and preserving the others (each writer owns its own
+// line, so a stamp refresh never wipes the embedded record and vice versa).
+func writeSidecar(target string, setDisk *diskStamp, setEmb *embeddedStamp) {
+	disk, diskOK, emb, embOK := readSidecarRecords(target)
+	if setDisk != nil {
+		disk, diskOK = *setDisk, true
 	}
-	size, errSize := strconv.ParseInt(fields[1], 10, 64)
-	mtimeNS, errMtime := strconv.ParseInt(fields[2], 10, 64)
-	if errSize != nil || errMtime != nil {
-		return diskStamp{}, false
+	if setEmb != nil {
+		emb, embOK = *setEmb, true
 	}
-	return diskStamp{hashHex: fields[0], size: size, mtimeNS: mtimeNS}, true
+	var b strings.Builder
+	if diskOK {
+		fmt.Fprintf(&b, "%s %d %d\n", disk.hashHex, disk.size, disk.mtimeNS)
+	}
+	if embOK {
+		fmt.Fprintf(&b, "%s %d %d %d %s\n", embeddedStampTag, emb.exeSize, emb.exeMtimeNS, emb.assetSize, emb.hashHex)
+	}
+	_ = os.WriteFile(sidecarPath(target), []byte(b.String()), 0644)
 }
 
 // writeDiskStamp records the file's current size+mtime alongside its verified
-// content hash. Best-effort: failure (e.g. read-only install dir) only costs
-// a full hash on the next launch.
-func writeDiskStamp(path, hashHex string) {
-	fi, err := os.Stat(path)
+// content hash, preserving the embedded record line. Best-effort: failure
+// (e.g. read-only install dir) only costs a full hash on the next launch.
+func writeDiskStamp(target, hashHex string) {
+	fi, err := os.Stat(target)
 	if err != nil {
 		return
 	}
-	line := fmt.Sprintf("%s %d %d\n", hashHex, fi.Size(), fi.ModTime().UnixNano())
-	_ = os.WriteFile(sidecarPath(path), []byte(line), 0644)
+	writeSidecar(target, &diskStamp{hashHex: hashHex, size: fi.Size(), mtimeNS: fi.ModTime().UnixNano()}, nil)
+}
+
+// writeEmbeddedStamp persists the embedded-asset hash record under the
+// current exe fingerprint, preserving the disk-copy stamp line. Best-effort,
+// like writeDiskStamp.
+func writeEmbeddedStamp(target string, stamp embeddedStamp) {
+	writeSidecar(target, nil, &stamp)
 }
 
 func stampMatchesDisk(stamp diskStamp, path string) bool {
@@ -170,7 +371,14 @@ func EnsureExtracted() (runnerPath string, pckPath string, err error) {
 	if err != nil {
 		cacheDir = os.TempDir()
 	}
-	runtimeDir := filepath.Join(cacheDir, "dsh", "runtime")
+	// The extraction target and the sidecar stamp home are the same
+	// <UserCacheDir>/dsh/runtime directory.
+	return ensureExtractedInto(filepath.Join(cacheDir, "dsh", "runtime"))
+}
+
+// ensureExtractedInto is EnsureExtracted against an explicit runtime dir;
+// split out so tests can drive the extract + hash-cache logic hermetically.
+func ensureExtractedInto(runtimeDir string) (runnerPath string, pckPath string, err error) {
 	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
 		return "", "", err
 	}
@@ -183,9 +391,11 @@ func EnsureExtracted() (runnerPath string, pckPath string, err error) {
 	runnerPath = filepath.Join(runtimeDir, runnerName)
 	cachePckPath := filepath.Join(runtimeDir, "dsh.pck")
 
-	// Embedded fingerprints are computed once per process and shared by the
-	// exe-side check and the cache checks below.
-	pckSum, pckErr := embeddedAssetHash(pckAsset)
+	// Embedded fingerprints resolve through the persisted sidecar records
+	// (keyed by the exe fingerprint): a warm launch answers them from a few
+	// stats instead of re-reading and re-hashing the ~181MB of embedded
+	// bytes; cold launches compute and persist the record once.
+	pckSum, pckErr := embeddedCachedHash(pckAsset, cachePckPath)
 
 	// Check if dsh.pck is located alongside the executable first; the local
 	// copy wins over the cache so a shipped dsh.pck is preferred — but only
@@ -201,7 +411,7 @@ func EnsureExtracted() (runnerPath string, pckPath string, err error) {
 	// 1. Extract dsh.pck into the cache only when its content differs from the
 	//    embedded build (fast path: sidecar fingerprint; slow path: full sha256).
 	if pckPath == cachePckPath && pckErr == nil && !diskCopyMatches(pckSum, cachePckPath) {
-		if data, derr := embeddedAssetData(pckAsset); derr != nil {
+		if data, derr := assetDataSource(pckAsset); derr != nil {
 			log.Printf("[DSHX] warning: cannot read embedded %s: %v", pckAsset, derr)
 		} else if werr := writeAtomic(cachePckPath, data); werr != nil {
 			log.Printf("[DSHX] warning: failed to extract dsh.pck to %s: %v", cachePckPath, werr)
@@ -212,15 +422,16 @@ func EnsureExtracted() (runnerPath string, pckPath string, err error) {
 		}
 	}
 
-	// 2. Extract embedded runner if present for this GOOS. The embedded runner
-	// is a Windows PE (assets/godot_runner.exe); on non-Windows builds there
-	// is no usable embedded runner, so skip extraction entirely and let the
-	// system godot probe below decide — extracting a PE under a Linux name
-	// would guarantee exec format errors at launch time.
+	// 2. Extract embedded runner if present for this GOOS. The runner is
+	// embedded per-GOOS: the Windows build carries a Windows PE
+	// (assets/godot_runner.exe); non-Windows builds embed NO runner at all
+	// (see runner_other.go), so nothing is extracted here on those platforms
+	// — extracting a PE under a Linux name would guarantee exec format errors
+	// at launch time. Non-Windows relies on the system godot probe below.
 	if runtime.GOOS == "windows" {
-		if sum, aerr := embeddedAssetHash(runnerAsset); aerr == nil {
+		if sum, aerr := embeddedCachedHash(runnerAsset, runnerPath); aerr == nil {
 			if !diskCopyMatches(sum, runnerPath) || !fileHasPEMagic(runnerPath) {
-				if data, derr := embeddedAssetData(runnerAsset); derr != nil {
+				if data, derr := assetDataSource(runnerAsset); derr != nil {
 					log.Printf("[DSHX] warning: cannot read embedded %s: %v", runnerAsset, derr)
 				} else if werr := writeAtomic(runnerPath, data); werr != nil {
 					log.Printf("[DSHX] warning: failed to extract godot runner to %s: %v", runnerPath, werr)

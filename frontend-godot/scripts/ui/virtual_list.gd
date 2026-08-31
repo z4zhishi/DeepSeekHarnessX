@@ -3,7 +3,9 @@ class_name ChatList
 
 signal tool_selected(call_id: String, name: String, input: String, output: String)
 signal feedback_rating(message_id: String, rating: String)
-signal suggestion_clicked(prompt: String)
+# W12-a: 原死路径 `_build_hero`/`show_hero` 与 ChatList 内部 hero 节点已删除。
+# 空态唯一出口是 app.gd 的 HeroView（ChatTab 下 ChatList 的兄弟节点），
+# 由 `_show_empty()` 切换；ChatList 不再持有第二套空态实现。
 
 const OVERSCAN := 400.0
 const GAP := 12.0
@@ -24,8 +26,6 @@ var _fold := ConversationFold.new()
 var _nodes: Array = []
 var _heights: PackedFloat32Array = PackedFloat32Array()
 var _content: Control
-var _hero: Control
-var _hero_wanted: bool = true
 var _pool: Dictionary = {}
 var _live: Dictionary = {}
 # 同步调度走单发 Timer（在下一帧的 _process 阶段触发），绝不走 call_deferred：
@@ -41,14 +41,6 @@ var _heights_dirty: bool = false
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_THEME_CHANGED and _built:
-		if _hero:
-			var vis := _hero.visible
-			_content.remove_child(_hero)
-			_hero.queue_free()
-			_hero = null
-			_build_hero()
-			_hero.visible = vis
-			_layout_hero()
 		for idx in _live.keys():
 			_bind_row(_live[idx], int(idx))
 
@@ -60,7 +52,6 @@ func _ready() -> void:
 	_content.name = "Content"
 	_content.mouse_filter = Control.MOUSE_FILTER_PASS
 	add_child(_content)
-	_build_hero()
 	_sync_timer = Timer.new()
 	_sync_timer.one_shot = true
 	_sync_timer.wait_time = 0.02
@@ -69,7 +60,6 @@ func _ready() -> void:
 	get_v_scroll_bar().value_changed.connect(_on_scroll)
 	resized.connect(func(): _request_sync())
 	_built = true
-	_update_hero()
 	_request_sync()
 
 
@@ -85,7 +75,6 @@ func set_nodes(nodes: Array, seen_seq: Dictionary = {}) -> void:
 	_nodes = _fold.nodes()
 	_rebuild_heights()
 	_stick_bottom = true
-	_update_hero()
 	_sync()
 	call_deferred("_scroll_bottom")
 	_dbg("set_nodes exit")
@@ -112,7 +101,6 @@ func apply_event(env: Dictionary) -> void:
 	_fold.ingest(env)
 	_nodes = _fold.nodes()
 	_ensure_height_len()
-	_update_hero()
 	if typ == "assistant/chunk":
 		_patch_stream()
 	elif typ == "tool/call" or typ == "tool/result":
@@ -134,7 +122,6 @@ func clear() -> void:
 	_nodes = _fold.nodes()
 	_heights = PackedFloat32Array()
 	_stick_bottom = true
-	_update_hero()
 	if _content:
 		_content.custom_minimum_size = Vector2.ZERO
 	_request_sync()
@@ -142,11 +129,6 @@ func clear() -> void:
 
 func is_empty() -> bool:
 	return _nodes.is_empty()
-
-
-func show_hero(visible: bool) -> void:
-	_hero_wanted = visible
-	_update_hero()
 
 
 func _on_scroll(_v: float) -> void:
@@ -168,11 +150,10 @@ func _sync() -> void:
 		return
 	var ts := Time.get_ticks_msec()
 	_dbg("sync enter live=%d nodes=%d" % [_live.size(), _nodes.size()])
-	_layout_hero()
 	if _nodes.is_empty():
 		_unmount_all()
-		if _hero_wanted and _hero:
-			_content.custom_minimum_size = Vector2(0.0, maxf(size.y, 1.0))
+		# 空列表不遗留旧的最小高度，避免幽灵滚动范围（原为 hero 占位逻辑）。
+		_content.custom_minimum_size = Vector2.ZERO
 		return
 	var col := _column()
 	var prefix := PackedFloat32Array()
@@ -501,182 +482,3 @@ func _scroll_bottom() -> void:
 	_scroll_programmatic = true
 	scroll_vertical = int(_content.custom_minimum_size.y)
 	_scroll_programmatic = false
-
-
-func _update_hero() -> void:
-	if _hero == null:
-		return
-	var show := _hero_wanted and _nodes.is_empty()
-	_hero.visible = show
-	if show:
-		_layout_hero()
-
-
-func _layout_hero() -> void:
-	if _hero == null or not _hero.visible:
-		return
-	var col := _column()
-	_hero.position = Vector2(col.x, 0.0)
-	_hero.size = Vector2(col.y, maxf(size.y, 1.0))
-	_content.custom_minimum_size = Vector2(size.x, maxf(size.y, 1.0))
-
-
-func _build_hero() -> void:
-	_hero = VBoxContainer.new()
-	_hero.name = "Hero"
-	_hero.alignment = BoxContainer.ALIGNMENT_CENTER
-	_hero.add_theme_constant_override("separation", 16)
-	_hero.mouse_filter = Control.MOUSE_FILTER_STOP
-	_content.add_child(_hero)
-
-	var badge := PanelContainer.new()
-	badge.add_theme_stylebox_override("panel", DshTokens.box(DshTokens.bg_layer2(), DshTokens.RADIUS_PILL, DshTokens.border_l1(), 1, Vector4(12, 4, 12, 4)))
-	var badge_lbl := Label.new()
-	badge_lbl.text = "AGENT WORKBENCH  •  LOCAL-FIRST"
-	badge_lbl.add_theme_font_size_override("font_size", 9)
-	badge_lbl.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	badge.add_child(badge_lbl)
-	_hero.add_child(badge)
-
-	var mark := TextureRect.new()
-	mark.texture = load("res://assets/brand/dshx_mark.svg") as Texture2D
-	mark.custom_minimum_size = Vector2(48, 48)
-	mark.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	mark.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	mark.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	mark.modulate = DshTokens.text_primary()
-	_hero.add_child(mark)
-
-	var title := Label.new()
-	title.text = _t("chat.heroTitle", "DSHX")
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.add_theme_font_size_override("font_size", 28)
-	title.add_theme_color_override("font_color", DshTokens.text_primary())
-	_hero.add_child(title)
-
-	var sub := Label.new()
-	sub.text = _t("chat.heroSubtitle", "High-performance agent workbench — code, inspect, refactor, orchestrate.")
-	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	sub.add_theme_font_size_override("font_size", DshTokens.FONT_UI)
-	sub.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	_hero.add_child(sub)
-
-	var grid := GridContainer.new()
-	grid.columns = 2
-	grid.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	grid.add_theme_constant_override("h_separation", 14)
-	grid.add_theme_constant_override("v_separation", 14)
-	_hero.add_child(grid)
-
-	var suggestions := [
-		{
-			"icon": "icon_folder.svg",
-			"title": _t("chat.suggestExplore", "Explore workspace"),
-			"desc": _t("chat.suggestExploreDesc", "Index the tree and explain the entry points."),
-			"prompt": "Please explore and explain the architecture of this workspace.",
-		},
-		{
-			"icon": "icon_plan.svg",
-			"title": _t("chat.suggestPlan", "Make a plan"),
-			"desc": _t("chat.suggestPlanDesc", "Draft a multi-step design before editing."),
-			"prompt": "/plan on",
-		},
-		{
-			"icon": "icon_diff.svg",
-			"title": _t("chat.suggestDiff", "Review diff"),
-			"desc": _t("chat.suggestDiffDesc", "Inspect working-tree changes."),
-			"prompt": "Check current git diff and review recent changes.",
-		},
-		{
-			"icon": "icon_check.svg",
-			"title": _t("chat.suggestTest", "Run tests"),
-			"desc": _t("chat.suggestTestDesc", "Execute the test suite and explain failures."),
-			"prompt": "Run the project test suite and report results.",
-		},
-	]
-	for s in suggestions:
-		grid.add_child(_suggest_card(s))
-
-
-func _suggest_card(s: Dictionary) -> Control:
-	var is_featured: bool = str(s.get("featured", false)) == "true" or (s.has("w") and int(s["w"]) == 2)
-	var card_w := 580 if is_featured else 280
-	var wrap := PanelContainer.new()
-	wrap.custom_minimum_size = Vector2(card_w, 96 if is_featured else 88)
-	var box_n: StyleBoxFlat = DshTokens.shadow_box(DshTokens.bg_layer2(), DshTokens.RADIUS_LG, Vector4(16, 12, 16, 12))
-	var box_h: StyleBoxFlat = DshTokens.shadow_box(DshTokens.bg_layer3(), DshTokens.RADIUS_LG, Vector4(16, 12, 16, 12))
-	box_h.shadow_size = 20
-	wrap.add_theme_stylebox_override("panel", box_n)
-	wrap.mouse_filter = Control.MOUSE_FILTER_STOP
-	var vbox := VBoxContainer.new()
-	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_theme_constant_override("separation", 4)
-	wrap.add_child(vbox)
-	var eyebrow := Label.new()
-	eyebrow.text = str(s.get("eyebrow", "")).to_upper()
-	eyebrow.visible = str(s.get("eyebrow", "")) != ""
-	eyebrow.add_theme_font_size_override("font_size", 9)
-	eyebrow.add_theme_color_override("font_color", DshTokens.accent())
-	eyebrow.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(eyebrow)
-	var head := HBoxContainer.new()
-	head.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	head.add_theme_constant_override("separation", 8)
-	vbox.add_child(head)
-	var icon_wrap := PanelContainer.new()
-	icon_wrap.custom_minimum_size = Vector2(28, 28)
-	icon_wrap.add_theme_stylebox_override("panel", DshTokens.box(DshTokens.bg_layer3(), 8, DshTokens.border_l1(), 1, Vector4(6, 6, 6, 6)))
-	icon_wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var ic := TextureRect.new()
-	ic.texture = load("res://assets/icons/%s" % str(s["icon"])) as Texture2D
-	ic.custom_minimum_size = Vector2(16, 16)
-	ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	ic.modulate = DshTokens.text_secondary()
-	ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	icon_wrap.add_child(ic)
-	head.add_child(icon_wrap)
-	var tl := Label.new()
-	tl.text = str(s["title"])
-	tl.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME)
-	tl.add_theme_color_override("font_color", DshTokens.text_primary())
-	tl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	tl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	head.add_child(tl)
-	var arrow := Label.new()
-	arrow.text = "↗"
-	arrow.add_theme_font_size_override("font_size", 12)
-	arrow.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	arrow.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	head.add_child(arrow)
-	var dl := Label.new()
-	dl.text = str(s["desc"])
-	dl.add_theme_font_size_override("font_size", DshTokens.FONT_MICRO)
-	dl.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	dl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	dl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	vbox.add_child(dl)
-	var btn := Button.new()
-	btn.flat = true
-	var empty := StyleBoxEmpty.new()
-	btn.add_theme_stylebox_override("normal", empty)
-	btn.add_theme_stylebox_override("hover", empty)
-	btn.add_theme_stylebox_override("pressed", empty)
-	btn.add_theme_stylebox_override("focus", empty)
-	btn.mouse_filter = Control.MOUSE_FILTER_STOP
-	var prompt := str(s["prompt"])
-	btn.pressed.connect(func(): suggestion_clicked.emit(prompt))
-	var hover_in := func(): wrap.add_theme_stylebox_override("panel", box_h); wrap.position.y -= 2
-	var hover_out := func(): wrap.add_theme_stylebox_override("panel", box_n); wrap.position.y += 2
-	btn.mouse_entered.connect(hover_in)
-	wrap.mouse_entered.connect(hover_in)
-	btn.mouse_exited.connect(hover_out)
-	wrap.mouse_exited.connect(hover_out)
-	wrap.add_child(btn)
-	return wrap
-
-
-func _t(key: String, fallback: String) -> String:
-	var s := DshI18n.t(key)
-	return fallback if s == key else s

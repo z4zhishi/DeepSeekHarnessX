@@ -2,6 +2,10 @@ extends PanelContainer
 
 const THEME_FILE := "user://theme.txt"
 const TURN_WATCHDOG_SEC := 90.0
+const DshApprovals := preload("res://engine/approval_center.gd")
+const ApprovalInboxScript := preload("res://scripts/overlays/approval_inbox.gd")
+const SessionSwitcherScript := preload("res://scripts/ui/session_switcher.gd")
+const ChromeEditorScript := preload("res://scripts/ui/chrome/editor.gd")
 
 @onready var _client: Node = %DshClient
 @onready var _store: Node = %SessionStore
@@ -14,8 +18,11 @@ const TURN_WATCHDOG_SEC := 90.0
 @onready var _composer: ComposerBar = %Composer
 @onready var _hero: HeroView = %Hero
 @onready var _traj: Control = %TrajectoryTab
+@onready var _traj_view: Control = _traj.get_node_or_null(^"TrajectoryView")
+@onready var _lineage: SubagentTree = %LineageTree
 @onready var _details: DetailsPane = %Details
 @onready var _approval: Node = %ApprovalOverlay
+@onready var _inbox: Control = %ApprovalInbox
 @onready var _settings: Node = %SettingsOverlay
 @onready var _onboarding: Node = %OnboardingOverlay
 @onready var _jobs: Node = %JobsOverlay
@@ -49,9 +56,22 @@ var _pending_session_events: Array[Dictionary] = []
 var _pending_event_keys: Dictionary = {}
 var _mesh_a: TextureRect = null
 var _mesh_b: TextureRect = null
+## Central approval store: every real host/permission-request lands here with
+## its owning sessionId, enabling the inbox's click-to-jump flow.
+var _approvals = null
+var _switcher = null
+var _chrome_editor = null
+## 感知启动（supremacy-plan §4）：BootSplash 层 + 收场闸。_boot_finished
+## 幂等守 reveal 单次；列表回包与 1.2s 兜底双入口都汇到这里。
+var _boot_finished := false
+@onready var _boot_splash: CanvasLayer = %BootSplash
 
 func _ready() -> void:
-	DisplayServer.window_set_title("DSHX")
+	# 感知启动（supremacy-plan §4）：splash 在任何 backend await 之前 present——
+	# 场景里 CanvasLayer 自带可见，这里只做 120ms pop 编排；主区域此刻仍被
+	# 整层 backdrop 覆盖，直到 reveal()。窗口标题同步改 TeplixCode。
+	DisplayServer.window_set_title("TeplixCode")
+	_splash_boot()
 	_cwd = _default_cwd()
 	_dark = _load_theme_dark()
 	_apply_theme(_dark)
@@ -86,6 +106,12 @@ func _ready() -> void:
 	_bind(_sidebar, "session_delete_requested", _on_session_delete_requested)
 	_sidebar.theme_toggled.connect(_toggle_theme)
 	_sidebar.collapse_pressed.connect(_toggle_sidebar)
+	if _traj_view == null:
+		_traj_view = _traj
+	if _lineage != null:
+		_lineage.set_store(_store)
+		_lineage.set_sessions(_store.sessions)
+		_lineage.subagent_selected.connect(_on_session_picked)
 	# 工作区选择器：应用内常驻预实例化（非原生对话框），首点零冷启动，
 	# 主题随主窗口自动一致；最近工作区记录在 picker 的 "workspace" bucket。
 	_ws_picker = DshFilePicker.new()
@@ -109,15 +135,34 @@ func _ready() -> void:
 	_composer.command_submitted.connect(_on_command)
 	_bind(_composer, "model_selected", _on_model)
 	_bind(_composer, "access_mode_requested", _on_access_mode)
+	_bind(_composer, "effort_changed", _on_param_effort)
+	_bind(_composer, "reject_all_toggled", _on_reject_all)
+	_bind(_composer, "chrome_customize_requested", _open_chrome_editor)
 	_hero.suggestion_clicked.connect(_on_suggestion)
 	_details.close_requested.connect(_close_details)
 	_bind(_chat, "tool_selected", _on_tool_selected)
 	_bind(_chat, "feedback_rating", _on_feedback)
-	if _chat.has_method("show_hero"):
-		_chat.show_hero(false)
-	_bind(_chat, "suggestion_clicked", _on_suggestion)
+	# W12-a: ChatList.show_hero(false) 与 ChatList.suggestion_clicked 绑定已随
+	# virtual_list 的死 hero 路径删除；空态由上方 HeroView 独立承担（_show_empty）。
 	_bind(_approval, "decision_made", _on_approval)
+	# Approval center + inbox: real host/permission-request events feed the
+	# center; the inbox routes a click to the owning session then opens the
+	# decision card. The full-screen modal stays only as the focused card view.
+	_approvals = DshApprovals.new()
+	if _inbox != null:
+		_inbox.set_center(_approvals)
+		_inbox.entry_clicked.connect(_on_inbox_entry)
+	if _approvals.has_signal("auto_decision"):
+		_approvals.auto_decision.connect(_on_auto_decision)
+	_switcher = SessionSwitcherScript.new()
+	add_child(_switcher)
+	_bind(_switcher, "session_picked", _on_session_picked)
+	_chrome_editor = ChromeEditorScript.new()
+	add_child(_chrome_editor)
+	_bind(_chrome_editor, "layout_saved", _on_chrome_layout_saved)
+	_sync_reject_all_to_center()
 	_bind(_settings, "theme_changed", _on_settings_theme)
+	_bind(_settings, "chrome_customize_requested", _open_chrome_editor)
 	if _settings.has_method("setup"):
 		_settings.setup(_client)
 	if _jobs.has_method("setup"):
@@ -150,9 +195,37 @@ func _ready() -> void:
 			var first := _id_of(arr[0])
 			if first != "":
 				_switch(first, false)
+			else:
+				_create_session()
 		else:
 			_create_session()
+		_finish_boot()
 	)
+	# Splash 不能因慢后端而滞留：列表回包或 1.2s 先到者收场（感知启动≤1.5s
+	# 的上限闸；reveal 幂等，重复调用无害）。
+	var boot_timer := Timer.new()
+	boot_timer.one_shot = true
+	boot_timer.wait_time = 1.2
+	boot_timer.timeout.connect(_finish_boot)
+	add_child(boot_timer)
+	boot_timer.start()
+
+
+## _finish_boot：主区域可用点（首次会话列表/创建回包，或 1.2s 兜底）。
+## splash 整层淡出 → 三区域 stagger 显现（侧栏→中栏→composer 席位）。
+func _splash_boot() -> void:
+	if _boot_splash != null and _boot_splash.has_method("present"):
+		_boot_splash.present()
+
+
+func _finish_boot() -> void:
+	if _boot_finished:
+		return
+	_boot_finished = true
+	if _boot_splash != null and _boot_splash.has_method("reveal"):
+		var seat: Control = _composer.get_parent() as Control
+		var comp_region: Control = seat if seat != null else (_composer as Control)
+		_boot_splash.reveal([_sidebar, _center, comp_region])
 
 
 func _bind(obj: Object, sig: String, cb: Callable) -> void:
@@ -175,6 +248,19 @@ func _unhandled_input(event: InputEvent) -> void:
 				_on_new_session()
 				get_viewport().set_input_as_handled()
 				return
+			KEY_K:
+				_open_session_switcher()
+				get_viewport().set_input_as_handled()
+				return
+			KEY_P:
+				_open_command_palette()
+				get_viewport().set_input_as_handled()
+				return
+			KEY_TAB:
+				if _sidebar.has_method("select_relative"):
+					_sidebar.select_relative(-1 if k.shift_pressed else 1)
+				get_viewport().set_input_as_handled()
+				return
 			KEY_F:
 				if _sidebar.has_method("focus_search"):
 					_sidebar.focus_search()
@@ -191,6 +277,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				get_viewport().set_input_as_handled()
 				return
 	if k.keycode == KEY_ESCAPE:
+		if _chrome_editor != null and _chrome_editor.has_method("is_open") and bool(_chrome_editor.is_open()):
+			_chrome_editor.close()
+			get_viewport().set_input_as_handled()
+			return
 		if _approval != null and _approval.visible:
 			if _approval.has_method("cancel_open"):
 				_approval.cancel_open()
@@ -226,7 +316,7 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _search_focus_fallback() -> bool:
 	if _sidebar != null and _sidebar.has_node("%SessionSearch"):
-		var n := _sidebar.get_node_or_null("%SessionSearch")
+		var n: Node = _sidebar.get_node_or_null("%SessionSearch")
 		if n is Control:
 			(n as Control).grab_focus()
 			if n is LineEdit:
@@ -411,7 +501,11 @@ func _udbg(m: String) -> void:
 
 func _on_tab(name: String) -> void:
 	_chat_tab.visible = name == "chat"
-	_traj.visible = name == "trajectory"
+	_traj.visible = name == "trajectory" or name == "lineage"
+	if _traj_view != null:
+		_traj_view.visible = name == "trajectory"
+	if _lineage != null:
+		_lineage.visible = name == "lineage"
 
 
 func _on_connection(connected: bool) -> void:
@@ -429,6 +523,8 @@ func _on_connection_status(status: String, attempt: int) -> void:
 
 func _on_sessions_changed(_payload: Variant = null) -> void:
 	_sidebar.set_sessions(_store.sessions, _active_id())
+	if _lineage != null:
+		_lineage.set_sessions(_store.sessions)
 
 
 func _on_active_changed(id: String) -> void:
@@ -506,6 +602,8 @@ func _switch(id: String, is_new: bool) -> void:
 		_chat.clear()
 	if _traj.has_method("clear_all"):
 		_traj.clear_all()
+	if _traj_view != _traj and _traj_view != null and _traj_view.has_method("clear_all"):
+		_traj_view.clear_all()
 	_disarm_watchdog()
 	_composer.set_generating(false)
 	_composer.set_enabled(true)
@@ -515,6 +613,10 @@ func _switch(id: String, is_new: bool) -> void:
 	_header.set_title(_title_of(id))
 	_header.set_lineage(_lineage_of(id))
 	_header.set_plan_active(false)
+	# 谱系页保持全局可见但显式高亮当前会话（不再整树 clear，避免每次切换
+	# 丢失用户正在看的子代理关系上下文）。
+	if _lineage != null and _lineage.has_method("highlight_session"):
+		_lineage.highlight_session(id)
 	var cwd := str(_store.get_session(id).get("cwd", _cwd))
 	if cwd != "":
 		_cwd = cwd
@@ -539,6 +641,8 @@ func _apply_history(ok: bool, data: Variant) -> void:
 	var events := _as_array(data)
 	if _traj.has_method("set_events"):
 		_traj.set_events(events)
+	if _traj_view != _traj and _traj_view != null and _traj_view.has_method("set_events"):
+		_traj_view.set_events(events)
 	if ok and not events.is_empty():
 		_show_empty(false)
 		if _chat.has_method("set_nodes"):
@@ -565,6 +669,8 @@ func _apply_history(ok: bool, data: Variant) -> void:
 			_chat.apply_event(event)
 		if _traj.has_method("append_event"):
 			_traj.append_event(event)
+		if _traj_view != _traj and _traj_view != null and _traj_view.has_method("append_event"):
+			_traj_view.append_event(event)
 	_pending_session_events.clear()
 	_pending_event_keys.clear()
 	_history_loading_session = ""
@@ -624,6 +730,8 @@ func _on_session_event(event: Dictionary) -> void:
 		_chat.apply_event(event)
 	if _traj.has_method("append_event"):
 		_traj.append_event(event)
+	if _traj_view != _traj and _traj_view != null and _traj_view.has_method("append_event"):
+		_traj_view.append_event(event)
 	var kind := str(event.get("type", ""))
 	var data: Dictionary = event.get("data", {}) if event.get("data") is Dictionary else {}
 	match kind:
@@ -669,7 +777,8 @@ func _on_session_event(event: Dictionary) -> void:
 
 func _on_host_event(method: String, payload: Variant) -> void:
 	var p: Dictionary = payload if payload is Dictionary else {}
-	_sidebar.handle_host_event(method, payload)
+	if _lineage != null:
+		_lineage.handle_host_event(method, payload)
 	match method:
 		"host/session-added":
 			_store.upsert_session(p)
@@ -687,13 +796,26 @@ func _on_host_event(method: String, payload: Variant) -> void:
 			if child != "":
 				_store.upsert_session({"id": child, "parentSession": parent})
 		"host/permission-request":
-			if _approval.has_method("show_request"):
-				_approval.show_request(str(p.get("callId", "")), str(p.get("prompt", "")), p.get("options", []))
+			var call_id := str(p.get("callId", ""))
+			if call_id != "":
+				# Record into the central store with the real owning session —
+				# this is what makes click-to-jump from the inbox possible.
+				_approvals.upsert(call_id, str(p.get("sessionId", "")), str(p.get("prompt", "")), p.get("options", []))
+				# Auto-reject: center emits auto_decision; do not steal focus.
+				if _is_reject_all():
+					pass
+				elif _approvals.pending_for_session(_active_id()).size() > 0:
+					if _approval.has_method("show_request"):
+						_approval.show_request(call_id, str(p.get("prompt", "")), p.get("options", []))
+			else:
+				if _approval.has_method("show_request"):
+					_approval.show_request("", str(p.get("prompt", "")), p.get("options", []))
 		"host/permission-resolved":
 			# 网关侧审批已成终态（超时取消 / 其他端已决）。转发 overlay 关闭
 			# 匹配卡片，并把 outcome 写一行 system 文案进聊天流。网关侧帧
 			# 未上线期间此分支静默不触发；overlay 缺 resolve_remote 时跳过。
 			var call_id := str(p.get("callId", ""))
+			_approvals.resolve(call_id, str(p.get("outcome", "")))
 			if call_id != "":
 				if _approval.has_method("resolve_remote"):
 					_approval.resolve_remote(call_id, str(p.get("outcome", "")))
@@ -799,7 +921,10 @@ func _on_param_effort(effort: Variant) -> void:
 				_inject_turn_error(_rpc_error_text(data))
 				return
 			if data is Dictionary:
-				_header.set_effort(str((data as Dictionary).get("effort", e)))
+				var applied := str((data as Dictionary).get("effort", e))
+				_header.set_effort(applied)
+				if _composer.has_method("set_effort"):
+					_composer.set_effort(applied)
 		)
 	)
 
@@ -823,6 +948,69 @@ func _on_approval(call_id: String, decision: String) -> void:
 		if not ok:
 			_inject_turn_error(_rpc_error_text(data))
 	)
+
+
+func _on_reject_all(enabled: bool) -> void:
+	_sync_reject_all_to_center(enabled)
+
+
+func _is_reject_all() -> bool:
+	if _composer != null and _composer.has_method("is_reject_all"):
+		return bool(_composer.is_reject_all())
+	if _approvals != null and "auto_reject" in _approvals:
+		return bool(_approvals.auto_reject)
+	return false
+
+
+func _sync_reject_all_to_center(enabled: Variant = null) -> void:
+	var on := bool(enabled) if enabled != null else _is_reject_all()
+	if _approvals != null and _approvals.has_method("set_auto_reject"):
+		_approvals.set_auto_reject(on)
+	if _approval != null and _approval.has_method("set_auto_reject"):
+		_approval.set_auto_reject(on)
+
+
+func _on_auto_decision(call_id: String, decision: String) -> void:
+	_client.respond_approval(call_id, decision, func(ok: bool, data: Variant) -> void:
+		if not ok:
+			_inject_turn_error(_rpc_error_text(data))
+			return
+		if _approvals != null and _approvals.has_method("resolve"):
+			_approvals.resolve(call_id, "denied")
+		_inject_system_line(_t("approval.autoDenied", "已自动拒绝权限请求（不阻断任务）。"))
+	)
+
+
+func _open_session_switcher() -> void:
+	if _switcher == null:
+		return
+	var pinned := PackedStringArray()
+	if _sidebar.has_method("pinned_ids"):
+		pinned = _sidebar.pinned_ids()
+	if _switcher.has_method("open"):
+		_switcher.open(_store.sessions, _active_id(), pinned)
+
+
+## Ctrl+P 全局命令面板（supremacy-plan §3）：聚焦 composer、注入 "/" 前缀并
+## 打开命令候选弹层。只走 composer 公共入口 open_command_palette()，不触碰
+## 其 cmd_palette 私有状态；弹层的候选/Esc/提交/层外关闭语义全部沿用
+## composer 既有行为。
+func _open_command_palette() -> void:
+	if _composer != null and _composer.has_method("open_command_palette"):
+		_composer.open_command_palette()
+
+
+## Inbox click: route to the owning session first, then surface the decision
+## card for that exact call. The center keeps the authoritative entry.
+func _on_inbox_entry(call_id: String) -> void:
+	var e = _approvals.get_item(call_id)
+	if e == null:
+		return
+	var target := str(e.session_id)
+	if target != "" and target != _active_id():
+		_switch(target, false)
+	if _approval.has_method("show_request"):
+		_approval.show_request(call_id, e.prompt, e.options)
 
 
 func _on_feedback(message_id: String, rating: String) -> void:
@@ -858,6 +1046,20 @@ func _open_plugins() -> void:
 		_plugins.open_panel()
 	elif _plugins.has_method("open"):
 		_plugins.open()
+
+
+func _open_chrome_editor() -> void:
+	if _chrome_editor == null:
+		return
+	if _settings != null and _settings.visible and _settings.has_method("close"):
+		_settings.close()
+	if _chrome_editor.has_method("open"):
+		_chrome_editor.open()
+
+
+func _on_chrome_layout_saved(_data: Dictionary) -> void:
+	if _composer != null and _composer.has_method("reload_chrome"):
+		_composer.reload_chrome()
 
 
 func _refresh_commands() -> void:

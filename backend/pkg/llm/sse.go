@@ -14,7 +14,7 @@ import (
 )
 
 // failStream returns already-closed stream channels carrying a single error.
-// Matches the DeepSeekAdapter missing-credential path: the error is buffered
+// Matches the CompletionsAdapter missing-credential path: the error is buffered
 // before both channels close so drain helpers observe it without racing.
 func failStream(err error) (<-chan StreamChunk, <-chan error) {
 	chunkChan := make(chan StreamChunk, 64)
@@ -92,7 +92,7 @@ func resolveStreamKey(apiKey string, resolver func() (string, error)) (string, e
 			return key, nil
 		}
 	}
-	return "", ErrDeepSeekMissingCredential
+	return "", ErrMissingCredential
 }
 
 func applyExtraHeaders(h http.Header, extra map[string]string) {
@@ -216,7 +216,7 @@ func consumeSSE(
 
 	if !isSuccessStatus(resp.StatusCode) {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return mapDeepSeekStatus(
+		return mapProviderStatus(
 			resp.StatusCode,
 			parseWireError(raw, nil),
 			resp.Header.Get("Retry-After"),

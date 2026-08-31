@@ -28,11 +28,13 @@ package storage
 // targets a portable Windows executable, so modernc is the compatible choice;
 // it ships SQLite as transpiled Go and registers the "sqlite" driver.
 //
-// Durability: `PRAGMA journal_mode = WAL` + `PRAGMA synchronous = FULL`
-// (SQLite value 2), `PRAGMA foreign_keys = ON`, `PRAGMA trusted_schema = OFF`,
-// `PRAGMA mmap_size = 0`. Every mutation runs inside a single IMMEDIATE
-// transaction (modernc `_txlock=immediate` DSN) so a competing writer cannot
-// interleave; COMMIT is the durability boundary.
+// Durability: `PRAGMA journal_mode = WAL` + `PRAGMA synchronous = NORMAL`
+// (SQLite value 1 — SQLite's recommended WAL posture), `PRAGMA foreign_keys = ON`,
+// `PRAGMA trusted_schema = OFF`, `PRAGMA mmap_size = 0`. Every mutation runs
+// inside a single IMMEDIATE transaction (modernc `_txlock=immediate` DSN) so a
+// competing writer cannot interleave; COMMIT is the atomicity boundary and
+// fsyncs batch at WAL checkpoints (the former synchronous=FULL flush-synced
+// every event append).
 
 import (
 	"bytes"
@@ -143,6 +145,15 @@ type SqliteStore struct {
 	// storeIdentity mirrors upstream's source-qualified identity so revisions
 	// distinguish this medium. Set at open.
 	storeIdentity string
+
+	// schemaVerifiedOnce guards the once-per-store mutation recheck below:
+	// schema ownership is fully verified at open (configureDatabase →
+	// validateRequiredSchemaTx) and the pool pins ONE connection, so a second
+	// full sqlite_schema + PRAGMA user_version scan inside every write
+	// transaction re-proved what this process already proved (a 21-event turn
+	// ran 21 identical scans). The per-batch application_id pragma tripwire
+	// (see appendBatch) stays as the cheap sentinel for an alien writer.
+	schemaVerified bool
 }
 
 // OpenSqliteStore opens (or creates) the schema-17 SQLite database under
@@ -261,15 +272,22 @@ func (s *SqliteStore) configureDatabase() error {
 	if err := s.selectJournalMode(); err != nil {
 		return err
 	}
-	if _, err := db.Exec("PRAGMA synchronous = FULL"); err != nil {
-		return fmt.Errorf("failed to set synchronous FULL: %w", err)
+	// WAL + synchronous=NORMAL is SQLite's recommended WAL posture: transactions
+	// keep full atomicity and WAL durability (fsyncs move to WAL checkpoints,
+	// which stream over batched appends), while avoiding a per-commit device
+	// flush. The former synchronous=FULL paid one fsync PER EVENT on spinning
+	// disks (a 21-delta turn = 21 × ~40ms syncs ≈ 0.9s of pure flush); power
+	// loss now bounds loss to the WAL window since the last checkpoint, the
+	// upstream harness design accepts for streaming agent logs.
+	if _, err := db.Exec("PRAGMA synchronous = NORMAL"); err != nil {
+		return fmt.Errorf("failed to set synchronous NORMAL: %w", err)
 	}
 	var synchronous int64
 	if err := db.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil {
 		return fmt.Errorf("failed to read synchronous: %w", err)
 	}
-	if synchronous != 2 {
-		return fmt.Errorf("session database at %q retained synchronous=%d, expected FULL (2)", s.path, synchronous)
+	if synchronous != 1 {
+		return fmt.Errorf("session database at %q retained synchronous=%d, expected NORMAL (1)", s.path, synchronous)
 	}
 	return nil
 }
@@ -645,8 +663,26 @@ func (s *SqliteStore) appendBatch(meta *session.SessionHeader, events []*session
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
-	if err := validateSchemaForMutation(tx, s.path); err != nil {
-		return err
+	// Schema ownership: verified once per store lifetime (open + first
+	// mutation), then only the 1-int application_id pragma re-runs per batch
+	// as an alien-writer tripwire. DSHX assumes a single writer per database
+	// (SetMaxOpenConns(1)); the full per-mutation recheck re-scanned
+	// sqlite_schema on every event append.
+	switch {
+	case !s.schemaVerified:
+		if err := validateSchemaForMutation(tx, s.path); err != nil {
+			return err
+		}
+		s.schemaVerified = true
+	default:
+		appID, err := pragmaIntTx(tx, "PRAGMA application_id")
+		if err != nil {
+			return err
+		}
+		if appID != SESSION_PERSISTENCE_SQLITE_APPLICATION_ID {
+			return fmt.Errorf("session database application id changed before mutation (expected %d, got %d)",
+				SESSION_PERSISTENCE_SQLITE_APPLICATION_ID, appID)
+		}
 	}
 
 	if !isMaterialized {
@@ -1285,8 +1321,38 @@ func encodeData(serialized []byte) any {
 	return string(serialized)
 }
 
+// zstdEncPool reuses zstd encoders across write batches. The previous shape
+// (zstd.NewWriter per call) arms one worker per GOMAXPROCS on first EncodeAll:
+// on a 48-core host that measured 63.7 MB TotalAlloc per 64 KB encode
+// (TestZstdPooledCost in pkg/agent) — freed immediately, but churning the heap
+// arena and OS working set on every oversized event / jsonl frame write, a
+// measurable share of the transient memory the first-session verdict saw.
+// EncodeAll is goroutine-safe per encoder (workers are drawn from an internal
+// channel and returned), so a small pooled set bounds the churn to ~105 KB per
+// write. Frame output is byte-identical to the per-call shape for the same
+// input regardless of encoder concurrency (pinned by
+// TestZstdEncoderPooledByteIdentity below) — the schema-17 data-column bytes
+// the upstream decoder reads do not change.
+var zstdEncPool = sync.Pool{
+	New: func() any {
+		enc, err := zstd.NewWriter(nil,
+			zstd.WithEncoderCRC(true), zstd.WithEncoderConcurrency(2))
+		if err != nil {
+			return nil
+		}
+		return enc
+	},
+}
+
 func zstdEncode(data []byte) ([]byte, error) {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
+	if e, ok := zstdEncPool.Get().(*zstd.Encoder); ok && e != nil {
+		defer zstdEncPool.Put(e)
+		return e.EncodeAll(data, nil), nil
+	}
+	// Pool construction failed (not reachable with these options; kept so the
+	// fallback matches the historical per-call shape exactly).
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderCRC(true), zstd.WithEncoderConcurrency(2))
 	if err != nil {
 		return nil, err
 	}

@@ -14,6 +14,8 @@ import (
 	"dsh-go/pkg/tools"
 )
 
+var errHostClosed = errors.New("plugin host: closed")
+
 // hostConfig 描述一个外部子进程插件如何被拉起（复用 mcp.StdioConfig 传输）。
 type hostConfig struct {
 	// Name 是插件名（须与 manifest 一致，用于命名空间前缀与日志标签）。
@@ -166,8 +168,19 @@ func (h *Host) connectGeneration(ctx context.Context, first bool) error {
 		_ = tr.Close()
 		return err
 	}
+	if h.isClosed() {
+		runDisposers(disposers)
+		_ = tr.Close()
+		return errHostClosed
+	}
 
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		runDisposers(disposers)
+		_ = tr.Close()
+		return errHostClosed
+	}
 	h.transport = tr
 	h.disposers = disposers
 	h.connectedAt = time.Now()
@@ -191,10 +204,12 @@ func (h *Host) syncGeneration(ctx context.Context, tr mcp.Transport) ([]Disposer
 			switch cap.Name {
 			case "tool", "tools":
 				if err := h.registerTool(ctx, tr, prefix, m, &disposers); err != nil {
+					runDisposers(disposers)
 					return nil, err
 				}
 			case "command", "commands":
-				if err := h.registerCommand(ctx, tr, m); err != nil {
+				if err := h.registerCommand(ctx, tr, m, &disposers); err != nil {
+					runDisposers(disposers)
 					return nil, err
 				}
 			}
@@ -227,7 +242,7 @@ func (h *Host) registerTool(ctx context.Context, tr mcp.Transport, prefix string
 	}
 	rawName := def.Name
 	pub := h.conf.Name + "__" + rawName
-	if err := h.reg.RegisterChecked(tools.ToolDefinition{
+	d := h.reg.RegisterOwned(h.conf.Name, tools.ToolDefinition{
 		Name:           pub,
 		Description:    desc,
 		ParametersJSON: params,
@@ -235,10 +250,11 @@ func (h *Host) registerTool(ctx context.Context, tr mcp.Transport, prefix string
 		Execute: func(ctx tools.ToolExecutionContext, argsJSON string) (any, error) {
 			return h.callTool(ctx, tr, rawName, argsJSON)
 		},
-	}); err != nil {
-		return fmt.Errorf("tool 注册冲突 %q: %w", pub, err)
+	})
+	if d == nil {
+		return fmt.Errorf("tool/register %q produced no disposer", pub)
 	}
-	*disposers = append(*disposers, func() { h.reg.Unregister(pub) })
+	*disposers = append(*disposers, func() { h.reg.UnregisterOwned(h.conf.Name, pub) })
 	return nil
 }
 
@@ -262,7 +278,10 @@ func (h *Host) callTool(ctx tools.ToolExecutionContext, tr mcp.Transport, rawNam
 	return mcp.McpResult{Content: res.Content}, nil
 }
 
-func (h *Host) registerCommand(ctx context.Context, tr mcp.Transport, m MethodSpec) error {
+func (h *Host) registerCommand(ctx context.Context, tr mcp.Transport, m MethodSpec, disposers *[]Disposer) error {
+	if h.cmds == nil {
+		return fmt.Errorf("command/register: command registry unavailable")
+	}
 	var def pluginCapabilityResult
 	if err := tr.Call(ctx, "command/register", map[string]any{"name": m.Name}, &def); err != nil {
 		return fmt.Errorf("command/register %q: %w", m.Name, err)
@@ -271,12 +290,12 @@ func (h *Host) registerCommand(ctx context.Context, tr mcp.Transport, m MethodSp
 		def.Name = m.Name
 	}
 	rawName := def.Name
-	cmdName := def.Name
+	cmdName := h.conf.Name + "__" + rawName
 	desc := def.Description
 	if desc == "" {
 		desc = m.Description
 	}
-	h.cmds.Register(tools.CommandDefinition{
+	*disposers = append(*disposers, h.cmds.RegisterOwned(h.conf.Name, tools.CommandDefinition{
 		Name:        cmdName,
 		Description: desc,
 		Handler: func(inv tools.CommandInvocation) tools.CommandResult {
@@ -295,8 +314,22 @@ func (h *Host) registerCommand(ctx context.Context, tr mcp.Transport, m MethodSp
 			}
 			return tools.CommandResult{Kind: res.Kind, Text: res.Text}
 		},
-	})
+	}))
 	return nil
+}
+
+func runDisposers(ds []Disposer) {
+	for i := len(ds) - 1; i >= 0; i-- {
+		if ds[i] != nil {
+			ds[i]()
+		}
+	}
+}
+
+func (h *Host) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
 }
 
 // signalConnSet 通知 run() 连接代变化（幂等，然后重置通道）。
@@ -354,14 +387,11 @@ func (h *Host) run() {
 // teardownGeneration 逆序释放当前代全部 disposer 并清空 transport。
 func (h *Host) teardownGeneration() {
 	h.mu.Lock()
-	for i := len(h.disposers) - 1; i >= 0; i-- {
-		if h.disposers[i] != nil {
-			h.disposers[i]()
-		}
-	}
+	disposers := h.disposers
 	h.disposers = nil
 	h.transport = nil
 	h.mu.Unlock()
+	runDisposers(disposers)
 	h.signalConnSet()
 }
 
@@ -395,6 +425,7 @@ func (h *Host) scheduleReconnect(_ bool) {
 	h.mu.Unlock()
 	if failed > policy.MaxAttempts {
 		h.logf("连续 %d 次重连失败，放弃", policy.MaxAttempts)
+		h.teardownGeneration()
 		return
 	}
 	delay := time.Duration(policy.InitialDelayMs) * time.Millisecond
@@ -451,13 +482,10 @@ func (h *Host) Close() error {
 	h.closed = true
 	tr := h.transport
 	h.transport = nil
-	for i := len(h.disposers) - 1; i >= 0; i-- {
-		if h.disposers[i] != nil {
-			h.disposers[i]()
-		}
-	}
+	disposers := h.disposers
 	h.disposers = nil
 	h.mu.Unlock()
+	runDisposers(disposers)
 	close(h.stop)
 	h.signalConnSet()
 	if tr != nil {

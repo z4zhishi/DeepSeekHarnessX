@@ -23,6 +23,8 @@ import (
 	"dsh-go/pkg/embedgui"
 	"dsh-go/pkg/feedback"
 	"dsh-go/pkg/gateway"
+	"dsh-go/pkg/importcc"
+	"dsh-go/pkg/instructions"
 	"dsh-go/pkg/llm"
 	"dsh-go/pkg/mcp"
 	"dsh-go/pkg/plugin"
@@ -40,8 +42,10 @@ var version = "dev"
 
 // knownModes is the whitelist of launch modes. Anything else (e.g. a typo)
 // is rejected with the list of valid values instead of silently launching
-// the desktop GUI.
-var knownModes = []string{"gui", "tui", "server", "web", "acp", "mcp", "sdk", "headless"}
+// the desktop GUI. "import" is the one-shot 收编 mode: it sidesloads
+// third-party harness sessions (Claude Code) into the store via pkg/importcc
+// directly and exits.
+var knownModes = []string{"gui", "tui", "server", "web", "acp", "mcp", "sdk", "headless", "import"}
 
 func isKnownMode(m string) bool {
 	for _, k := range knownModes {
@@ -77,21 +81,16 @@ type modeDeps struct {
 	// build(); may be nil for tooling-only modes.
 	hookBus *plugin.EventBus
 	// mcpConfig is the --mcp-config path honored by every mode ("" = no MCP).
+	// The mount itself lives in the plugin registry as the "mcp" capability.
 	mcpConfig string
-	// mcpMount tracks the async MCP mounting kicked off by build() (nil when
-	// no config was given). Collect() after Done() yields supervisors to close.
-	mcpMount *mcp.ProductMount
-	initErr  error
+	initErr   error
 }
 
-// mcpMountInitTimeout bounds one async MCP config mount's initial-connect
-// budget. The mount runs off the startup path entirely; this only decides how
-// long a slow/hung server may hold the initial generation before its supervisor
-// falls back to the background reconnect loop (or the whole mount degrades).
+// mcpMountInitTimeout bounds one MCP config mount's initial-connect budget.
+// A slow/hung server gives up its initial generation and falls back to the
+// supervisor's background reconnect loop (or the whole mount errors, which is
+// now visible as the plugin's lastErr instead of a silent degrade).
 const mcpMountInitTimeout = 10 * time.Second
-
-// mcpCloseWait caps how long Close blocks on an in-flight async MCP mount.
-const mcpCloseWait = 15 * time.Second
 
 func newModeDeps(needStore, mock bool, dataDir, model, storeKind, pluginDir, mcpConfig string) *modeDeps {
 	d := &modeDeps{needStore: needStore, mock: mock, dataDir: dataDir, model: model, useBbolt: storeKind == "bbolt", pluginDir: pluginDir, mcpConfig: mcpConfig}
@@ -130,27 +129,37 @@ func (m *modeDeps) build() {
 			}
 		}
 
-		m.toolReg = tools.NewToolRegistry()
+		m.toolReg = tools.NewToolRegistryEmpty()
 
 		// Upstream credential semantics: no key is not a load-time failure and
 		// does not silently fall back to a mock. Only an explicit --mock opts
-		// into the demo adapter; otherwise we build a keyless DeepSeekAdapter
-		// whose Stream() reports MISSING_CREDENTIAL at call time, resolving the
-		// key through the credential seam (default reference DEEPSEEK_API_KEY)
-		// once per operation so a changed credential takes effect without a
-		// restart.
+		// into the demo adapter; otherwise we build a keyless default protocol
+		// adapter whose Stream() reports MISSING_CREDENTIAL at call time,
+		// resolving the key through the credential seam (default reference
+		// DEEPSEEK_API_KEY) once per operation so a changed credential takes
+		// effect without a restart.
 		var adapter llm.LlmAdapter
 		if m.mock {
 			adapter = &llm.MockLlmAdapter{}
 		} else {
 			creds := credential.NewManager(credential.Options{})
-			adapter = llm.NewDeepSeekAdapter(llm.DeepSeekConfig{
-				APIKey: "",
-				Model:  m.model,
+			// DeepSeek 语义收敛为默认 provider profile（provider "deepseek"，
+			// 协议 openai-completions，api.deepseek.com，凭据 DEEPSEEK_API_KEY）：
+			// DeepSeek 没有自有线协议，构造只按线协议进行，不再走 DeepSeek
+			// 命名的构造路径（协议可用性由插件平台 protocols 能力管理）。
+			a, aerr := llm.NewProtocolAdapter(llm.ProviderProfile{
+				Protocol: llm.ProtocolOpenAICompletions,
+				Model:    m.model,
 				APIKeyResolver: func() (string, error) {
 					return creds.ResolveValue("DEEPSEEK_API_KEY")
 				},
 			})
+			if aerr != nil {
+				// 协议名为编译期常量，此路径不可达；保守处理为启动失败。
+				m.initErr = fmt.Errorf("failed to build default provider adapter: %w", aerr)
+				return
+			}
+			adapter = a
 		}
 		m.adapter = llm.NewRouter(adapter)
 
@@ -161,13 +170,15 @@ func (m *modeDeps) build() {
 			subOpts = append(subOpts, subagent.WithStore(m.store))
 		}
 		m.subagents = subagent.NewManager(m.toolReg, m.adapter, subOpts...)
-		m.subagents.RegisterSubagentTools(m.toolReg)
 
 		// Agent Teams runtime wiring: the process-global TeamService spawns
 		// teammate children as full DSH agents (shared store/registry/adapter)
 		// whenever spawn_teammate is invoked. Wire lazily through build() so
 		// both server and headless hosts get a live provider.
-		tools.SetTeamSpawner(teamSpawner(m.store, m.toolReg, m.adapter, m.model))
+		// Plugins is built after this line; read m.plugins at spawn time.
+		tools.SetTeamSpawner(func(name, description, prompt, context string) (tools.TeamChild, error) {
+			return teamSpawner(m.store, m.toolReg, m.adapter, m.model, m.plugins)(name, description, prompt, context)
+		})
 
 		// 插件边界：把"扁平单例"收敛为"能力 + 注册表 + 事件总线"。
 		// 内置能力经 Registry.Register 编译期注册；外部子进程插件经
@@ -176,6 +187,18 @@ func (m *modeDeps) build() {
 		// EventBus（hookBus），hooks 运行时与插件监听共享同一总线。
 		m.hookBus = plugin.NewEventBus()
 		m.plugins = plugin.NewRegistry(m.toolReg, m.toolReg.Commands, m.hookBus, log.Default())
+		m.subagents.SetPluginRuntime(m.plugins)
+		// One production assembly path: family capabilities own their tools.
+		// Do not also Register NewBuiltinToolsCapability — that remounts the
+		// same names via Register() and wipes family owners.
+		m.plugins.RegisterHostCapabilities(plugin.HostCapabilityOptions{
+			Adapter:    m.adapter,
+			Subagent:   m.subagents.RegisterSubagentTools,
+			Hooks:      func() *plugin.Hooks { return m.loadHooks() },
+			MCPPath:    m.mcpConfig,
+			MCPTimeout: mcpMountInitTimeout,
+			Logger:     log.Default(),
+		})
 		if m.pluginDir != "" {
 			if err := m.plugins.ScanDir(context.Background(), m.pluginDir); err != nil {
 				m.initErr = fmt.Errorf("扫描插件目录失败: %w", err)
@@ -183,15 +206,6 @@ func (m *modeDeps) build() {
 			}
 		}
 		m.plugins.Reconcile(context.Background())
-
-		// MCP 产品会话挂载：存在 --mcp-config 时把服务器工具异步挂进主工具
-		// 注册表（gui/tui/server/acp/sdk/headless 全模式共享本注册表）。配置
-		// 缺失/解析失败/挂载错误一律静默降级为无 MCP，不阻断启动；挂载在
-		// 后台 goroutine 完成，主启动路径零等待。专职 `dshx mcp` 校验模式
-		// 不走这里（mcpConfig 置空），由其分支同步 MountConfigFile。
-		if m.mcpConfig != "" {
-			m.mcpMount = mcp.MountAsync(m.mcpConfig, m.toolReg, log.Default(), mcp.MountConfigFile, mcpMountInitTimeout)
-		}
 	})
 }
 
@@ -213,19 +227,10 @@ func (m *modeDeps) Subagents() *subagent.Manager {
 	return m.subagents
 }
 
-// Close releases the async MCP mount, the plugin registry, and the store if it
+// Close releases the plugin registry (which owns the MCP mount disposers,
+// builtin capability tools/commands and external hosts) and the store if it
 // was opened. Safe to call unconditionally.
 func (m *modeDeps) Close() {
-	if m.mcpMount != nil {
-		// 挂载仍在后台进行时按上限等待，避免退出被慢 MCP 服务器无限拖延；
-		// 超时放弃的实例随进程退出回收，但插件与存储的收尾不受影响。
-		select {
-		case <-m.mcpMount.Done():
-			mcp.CloseSupervisors(m.mcpMount.Collect(), log.Default())
-		case <-time.After(mcpCloseWait):
-			log.Printf("mcp: 挂载未在 %v 内完成，跳过其收尾（随进程退出回收）", mcpCloseWait)
-		}
-	}
 	if m.plugins != nil {
 		m.plugins.Close()
 	}
@@ -235,42 +240,133 @@ func (m *modeDeps) Close() {
 	}
 }
 
+// invocation is the fully-resolved command line: the effective launch mode
+// plus the final value of every global flag. Produced by parseInvocation and
+// consumed by main.
+type invocation struct {
+	Mode   string // effective launch mode; never empty (default "gui")
+	Prompt string // headless positional prompt ("" = none)
+	Port   int
+
+	Host      string
+	Profile   string
+	Model     string
+	StoreKind string
+	DataDir   string
+	System    string
+	MockLlm   bool
+
+	MCPConfig string
+	PluginDir string
+	ShowVer   bool
+
+	// Import-mode flags (only read by the `import` mode; ignored elsewhere).
+	From        string // source harness: claude (v1) | codex (reserved)
+	ProjectsDir string // CC projects root override (default ~/.claude/projects)
+}
+
+// bindCLIFlags registers the dshx global flag set onto fs, binding values
+// into inv. Defined exactly once: both parse passes (flags before/after the
+// mode word) must agree on names, defaults and help text.
+func bindCLIFlags(fs *flag.FlagSet, inv *invocation) {
+	fs.IntVar(&inv.Port, "port", 3080, "HTTP/WS API server port")
+	fs.StringVar(&inv.Host, "host", "127.0.0.1", "HTTP/WS API server bind address (server/gui modes)")
+	fs.StringVar(&inv.Profile, "profile", "", "Profile to launch: gui | tui | web | headless | server | acp")
+	fs.StringVar(&inv.Model, "model", "deepseek-v4-flash", "Default model name")
+	fs.StringVar(&inv.StoreKind, "store", "sqlite", "Storage engine: sqlite (default) | bbolt")
+	fs.StringVar(&inv.DataDir, "data-dir", ".dsh-data", "Storage data directory")
+	fs.StringVar(&inv.System, "system", "You are DSHX Assistant.", "System prompt")
+	fs.BoolVar(&inv.ShowVer, "version", false, "Print version and exit")
+	fs.BoolVar(&inv.MockLlm, "mock", false, "Use the mock LLM adapter (test/demo only; default behavior reports MISSING_CREDENTIAL when DEEPSEEK_API_KEY is unset)")
+	fs.StringVar(&inv.MCPConfig, "mcp-config", "", "MCP servers JSON config file; honored by every mode (missing/invalid file degrades to no MCP; dedicated validation mode: 'dshx mcp')")
+	fs.StringVar(&inv.PluginDir, "plugin-dir", "", "External plugin directory (JSON-RPC subprocess plugins; *.json manifests)")
+	fs.StringVar(&inv.From, "from", "", "import mode only: source harness (supported: claude; codex is reserved)")
+	fs.StringVar(&inv.ProjectsDir, "projects-dir", "", "import mode only: CC projects root override (default ~/.claude/projects)")
+}
+
+// newFlagSet builds one instance of the shared dshx flag definition, storing
+// values into a fresh invocation struct.
+func newFlagSet(name string) (*flag.FlagSet, *invocation) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	inv := &invocation{}
+	bindCLIFlags(fs, inv)
+	return fs, inv
+}
+
+// parseInvocation resolves the dshx command line (argv without the program
+// name) into the effective launch mode and the final value of every global
+// flag.
+//
+// Global flags must be accepted on either side of the mode word:
+//
+//	dshx --mock headless "hi"   historical: flags before the mode
+//	dshx headless --mock "hi"   flags after the mode (used to be swallowed
+//	                            into the prompt / ignored)
+//
+// The line is therefore parsed twice. Pass 1 keeps the exact historical
+// flag.Parse semantics — it consumes flags up to the first non-flag argument,
+// which is the mode word — so flags-before-mode keeps working unchanged.
+// Pass 2 re-parses whatever remains after the mode word into the same flag
+// set, seeded with pass 1's values, so a repeated flag takes its later
+// occurrence. The mode word itself is pinned in pass 1 (--profile wins when
+// set, else the first positional). Everything that remains positional after
+// pass 2 is the headless prompt, and a bare "--" keeps flag-looking prompt
+// text in the prompt ('dshx headless -- --help me' prompts "--help me").
+func parseInvocation(argv []string) (invocation, error) {
+	fs1, inv1 := newFlagSet("dshx")
+	if err := fs1.Parse(argv); err != nil {
+		return invocation{}, err
+	}
+	rest := fs1.Args()
+
+	mode := "gui"
+	tail := rest
+	switch {
+	case inv1.Profile != "":
+		mode = inv1.Profile
+	case len(rest) > 0:
+		mode = rest[0]
+		tail = rest[1:]
+	}
+
+	fs2, inv2 := newFlagSet("dshx")
+	*inv2 = *inv1 // pass-1 values become pass-2 defaults
+	if len(tail) > 0 {
+		if err := fs2.Parse(tail); err != nil {
+			return invocation{}, err
+		}
+	}
+	inv := *inv2
+	inv.Profile = inv1.Profile // the mode word is pinned in pass 1
+	inv.Mode = mode
+	inv.Prompt = strings.Join(fs2.Args(), " ")
+	return inv, nil
+}
+
 func main() {
-	var (
-		port       = flag.Int("port", 3080, "HTTP/WS API server port")
-		host       = flag.String("host", "127.0.0.1", "HTTP/WS API server bind address (server/gui modes)")
-		profile    = flag.String("profile", "", "Profile to launch: gui | tui | web | headless | server | acp")
-		model      = flag.String("model", "deepseek-v4-flash", "Default model name")
-		storeKind  = flag.String("store", "sqlite", "Storage engine: sqlite (default) | bbolt")
-		dataDir    = flag.String("data-dir", ".dsh-data", "Storage data directory")
-		systemText = flag.String("system", "You are DSHX Assistant.", "System prompt")
-		showVer    = flag.Bool("version", false, "Print version and exit")
-		mockLlm    = flag.Bool("mock", false, "Use the mock LLM adapter (test/demo only; default behavior reports MISSING_CREDENTIAL when DEEPSEEK_API_KEY is unset)")
-		mcpConfig  = flag.String("mcp-config", "", "MCP servers JSON config file; honored by every mode (missing/invalid file degrades to no MCP; dedicated validation mode: 'dshx mcp')")
-		pluginDir  = flag.String("plugin-dir", "", "External plugin directory (JSON-RPC subprocess plugins; *.json manifests)")
-	)
-	flag.Parse()
+	inv, perr := parseInvocation(os.Args[1:])
+	if perr != nil {
+		// The flag package (ContinueOnError) already printed the error and
+		// usage to stderr. -h/-help arrives here as flag.ErrHelp after the
+		// usage output, matching the historical os.Exit(0) behavior.
+		if errors.Is(perr, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
 
 	// Fast paths: --help (handled by flag package) and --version return before
 	// any storage/tools/adapter work is done.
-	if *showVer {
+	if inv.ShowVer {
 		fmt.Printf("DSHX %s\n", version)
 		os.Exit(0)
 	}
-
-	args := flag.Args()
 
 	// Default mode is adaptive: prefer the desktop GUI when a display session
 	// is available, otherwise fall back to the TUI (original-design.md:13
 	// "dsh（自适应/TUI）"). On Linux without DISPLAY/WAYLAND there is no GUI to
 	// launch, so TUI keeps the no-arg invocation usable on headless servers.
-	mode := "gui"
-	if *profile != "" {
-		mode = *profile
-	} else if len(args) > 0 {
-		mode = args[0]
-		args = args[1:]
-	}
+	mode := inv.Mode
 	if mode == "gui" && !guiAvailable() {
 		if runtime.GOOS == "windows" {
 			// Windows always reports a desktop session in practice; if it does
@@ -290,21 +386,33 @@ func main() {
 		os.Exit(2)
 	}
 
-	// ACP is automation-only over stdio: it never opens storage. Every other
-	// mode persists, so it is the only mode that constructs deps without a store.
-	needStore := mode != "acp" && mode != "mcp"
-	if *pluginDir == "" {
-		*pluginDir = filepath.Join(*dataDir, "plugins")
+	// ACP is automation-only over stdio: it never opens storage. "import" opens
+	// its own store directly (pkg/importcc) without assembling deps.Full().
+	// Every other mode persists through the shared deps.
+	needStore := mode != "acp" && mode != "mcp" && mode != "import"
+	if inv.PluginDir == "" {
+		inv.PluginDir = filepath.Join(inv.DataDir, "plugins")
 	}
 	// The dedicated `dshx mcp` validation mode mounts its config synchronously
 	// in its own branch; blank it here so deps.build() does not mount a second
 	// time (duplicate serverName would be a namespace-conflict error).
-	depsMcpConfig := *mcpConfig
+	depsMcpConfig := inv.MCPConfig
 	if mode == "mcp" {
 		depsMcpConfig = ""
 	}
-	deps := newModeDeps(needStore, *mockLlm, *dataDir, *model, *storeKind, *pluginDir, depsMcpConfig)
+	deps := newModeDeps(needStore, inv.MockLlm, inv.DataDir, inv.Model, inv.StoreKind, inv.PluginDir, depsMcpConfig)
 	defer deps.Close()
+
+	// 生态收编:解析社区指令文件族(AGENTS.md / CLAUDE.md / GEMINI.md /
+	// .cursor/rules / ...)注入 system seam。进程启动时解析一次,托管模式
+	// 共享;无文件时为空串,system prompt 保持逐字节不变。解析失败视作
+	// 无指令(best-effort,不阻塞启动)。
+	instr, instrDetail := "", []instructions.InstructionSource(nil)
+	if cwd, err := os.Getwd(); err == nil {
+		if sys, detail, rerr := instructions.Resolve(cwd); rerr == nil {
+			instr, instrDetail = sys, detail
+		}
+	}
 
 	switch mode {
 	case "gui":
@@ -315,10 +423,12 @@ func main() {
 		// server/gui 共用进程级 subagent 管理器：host 下行广播
 		// host/subagent-started|finished，Godot 谱系树据此渲染。
 		srv := gateway.NewServerWithVersion(store, toolReg, adapter, version)
+		srv.Instructions = instr
+		srv.InstructionSources = instrDetail
 		wireSettings(srv)
 		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
-		if err := embedgui.LaunchAllInOneGUIWithServer(*host, *port, srv); err != nil {
+		if err := embedgui.LaunchAllInOneGUIWithServer(inv.Host, inv.Port, srv); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: GUI launch failed: %v\n", err)
 			fmt.Fprintln(os.Stderr, "[DSHX] Try 'dshx tui' for the terminal interface.")
 			deps.Close()
@@ -330,7 +440,7 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		tui.RunTUI(store, toolReg, adapter, *model)
+		tui.RunTUI(store, toolReg, adapter, inv.Model, deps.plugins, instr)
 
 	case "server", "web":
 		store, toolReg, adapter, err := deps.Full()
@@ -338,10 +448,12 @@ func main() {
 			fatal(err)
 		}
 		srv := gateway.NewServerWithVersion(store, toolReg, adapter, version)
+		srv.Instructions = instr
+		srv.InstructionSources = instrDetail
 		wireSettings(srv)
 		wireServerExt(srv, deps)
 		srv.AttachSubagentManager(deps.Subagents())
-		addr := fmt.Sprintf("%s:%d", *host, *port)
+		addr := fmt.Sprintf("%s:%d", inv.Host, inv.Port)
 		httpSrv := &http.Server{Addr: addr, Handler: srv.Routes()}
 		fmt.Printf("DSHX Go API Gateway (%s) listening on http://%s\n", version, addr)
 
@@ -370,13 +482,14 @@ func main() {
 			fatal(err)
 		}
 		acpSrv := acp.NewServer(toolReg, adapter)
+		acpSrv.AttachPluginRuntime(deps.plugins)
 		if err := acpSrv.Serve(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "ACP server error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "mcp":
-		if *mcpConfig == "" {
+		if inv.MCPConfig == "" {
 			fmt.Fprintln(os.Stderr, "Error: mcp mode requires --mcp-config (JSON file)")
 			os.Exit(1)
 		}
@@ -384,7 +497,7 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		sups, err := mcp.MountConfigFile(context.Background(), *mcpConfig, toolReg, nil)
+		sups, err := mcp.MountConfigFile(context.Background(), inv.MCPConfig, toolReg, nil)
 		if err != nil {
 			fatal(err)
 		}
@@ -404,7 +517,9 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		sdkSrv := gateway.NewSDKServer(store, toolReg, adapter, *model)
+		sdkSrv := gateway.NewSDKServer(store, toolReg, adapter, inv.Model)
+		sdkSrv.Instructions = instr
+		sdkSrv.AttachPluginRuntime(deps.plugins)
 		// 复用进程级 subagent 管理器（其工具已注册在 toolReg 上），
 		// 让 SDK 客户端收到 subagent.started / subagent.finished 通知。
 		sdkSrv.AttachSubagentManager(deps.Subagents())
@@ -414,7 +529,7 @@ func main() {
 		}
 
 	case "headless":
-		prompt := strings.Join(args, " ")
+		prompt := inv.Prompt
 		if prompt == "" {
 			fmt.Fprintln(os.Stderr, "Error: headless mode requires a prompt string.")
 			os.Exit(1)
@@ -423,9 +538,27 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		if code := runHeadless(store, toolReg, adapter, *model, *systemText, prompt); code != 0 {
+		if code := runHeadless(store, toolReg, adapter, inv.Model, inv.System, prompt, deps.plugins, instr); code != 0 {
 			deps.Close()
 			os.Exit(code)
+		}
+
+	case "import":
+		// 收编模式：把第三方 harness 会话（Claude Code）经正常写入路径
+		// 直接侧载进当前 store。自开 store，不装配 deps.Full()（工具注册表/
+		// LLM 适配器/插件运行时与本模式无关）。exit 0 成功；exit 1 参数或
+		// 目录不可读。
+		if inv.StoreKind == "bbolt" {
+			fmt.Fprintln(os.Stderr, "Error: import mode requires the sqlite store (default --store sqlite)")
+			os.Exit(1)
+		}
+		if err := importcc.Run(importcc.Options{
+			From:        inv.From,
+			ProjectsDir: inv.ProjectsDir,
+			DataDir:     inv.DataDir,
+			Out:         os.Stdout,
+		}); err != nil {
+			fatal(err)
 		}
 
 	default:
@@ -461,7 +594,7 @@ func guiAvailable() bool {
 // store may be nil (headless spawn of an in-memory child is unsupported, so
 // the host must own a store for Team to be live); callers only invoke this
 // after deps.Full() has opened the store.
-func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model string) tools.TeamSpawner {
+func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model string, plugins agent.PluginRuntime) tools.TeamSpawner {
 	return func(name, description, prompt, context string) (tools.TeamChild, error) {
 		childID := fmt.Sprintf("team-%d/%s", time.Now().UnixNano(), name)
 		header := session.SessionHeader{
@@ -474,6 +607,7 @@ func teamSpawner(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapte
 		ringBuf := storage.NewRingBuffer(256)
 		child := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter,
 			fmt.Sprintf("You are teammate '%s'. %s", name, description), model)
+		child.AttachPluginRuntime(plugins)
 		child.AutoTitle = true
 		child.Start()
 		return &teamChildAgent{ag: child}, nil
@@ -532,13 +666,14 @@ var providerSchema = []byte(`{
 // workspace backend, message-feedback sidecar) to a gateway server. It is
 // called alongside wireSettings for every server-hosted profile.
 func wireServerExt(srv *gateway.Server, deps *modeDeps) {
-	// CC-style hooks runtime: load the first available hooks.json and attach the
-	// shared registry's event bus + parsed hooks so every created session drives
-	// its four dispatch intercept points. Loaded once at startup; best-effort.
-	if h := deps.loadHooks(); h != nil {
-		srv.Hooks = h
-	}
+	// Live hooks pointer lives on the plugin registry (capability Mount/Unload).
+	// srv.Hooks is only an initial snapshot for tests that still read s.Hooks;
+	// spawnAgent attaches Plugins as HooksProvider so Unload is visible.
 	srv.HookBus = deps.hookBus
+	srv.Plugins = deps.plugins
+	if deps.plugins != nil {
+		srv.Hooks = deps.plugins.Hooks()
+	}
 
 	// Real workspace backend: one manager rooted at the process working
 	// directory, seeded with the configured roots (if any). Drives
@@ -566,7 +701,6 @@ func wireServerExt(srv *gateway.Server, deps *modeDeps) {
 	srv.Model = deps.model
 
 	srv.PluginDir = deps.pluginDir
-	srv.Plugins = deps.plugins
 	srv.HydrateRuntime()
 }
 
@@ -655,7 +789,7 @@ func wireSettings(srv *gateway.Server) {
 	srv.Credentials = creds
 }
 
-func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model, system, prompt string) int {
+func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, model, system, prompt string, plugins agent.PluginRuntime, instructions string) int {
 	header := session.SessionHeader{
 		ID:        fmt.Sprintf("headless-%d", time.Now().UnixNano()),
 		CreatedAt: time.Now().UnixMilli(),
@@ -665,6 +799,8 @@ func runHeadless(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapte
 
 	ringBuf := storage.NewRingBuffer(256)
 	ag := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter, system, model)
+	ag.Instructions = instructions
+	ag.AttachPluginRuntime(plugins)
 	// Headless 无交互用户：RequiresPerm 工具默认拒绝；设置
 	// DSH_HEADLESS_ALLOW=all 可放行（确定性批处理策略，不弹窗）。
 	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {

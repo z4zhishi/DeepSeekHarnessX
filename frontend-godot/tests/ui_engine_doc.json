@@ -1,0 +1,30 @@
+{
+  "type": "column",
+  "key": "root",
+  "props": { "gap": 12 },
+  "children": [
+    {
+      "type": "panel",
+      "key": "hero-card",
+      "props": { "bg": "#232324", "border": "#4176e6", "radius": 12, "min_height": 64 },
+      "children": [
+        { "type": "text", "key": "hero-title", "props": { "text": "DeepSeekHarnessX" } },
+        { "type": "text", "key": "hero-sub", "props": { "text": "UI runtime probe", "tooltip": "hover me" } }
+      ]
+    },
+    {
+      "type": "row",
+      "key": "actions",
+      "props": { "gap": 8 },
+      "children": [
+        { "type": "button", "key": "btn-send", "props": { "text": "Send", "on_click": "send_msg" } },
+        { "type": "button", "key": "btn-stop", "props": { "text": "Stop" } }
+      ]
+    },
+    {
+      "type": "text",
+      "key": "status",
+      "props": { "text": "idle", "min_width": 280 }
+    }
+  ]
+}

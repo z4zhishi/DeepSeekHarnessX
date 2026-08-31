@@ -1,4 +1,4 @@
-extends Node
+﻿extends Node
 
 ## Semantic tokens ported from CK ui-theme aliases. Feature scripts must
 ## read these (or the built Theme) — never Color("#…") literals.
@@ -28,6 +28,29 @@ func bg_mesh_b() -> Color:
 
 func shadow_tinted() -> Color:
 	return Color(0.06, 0.12, 0.28, 0.28) if is_dark() else Color(0.08, 0.14, 0.32, 0.12)
+
+## Elevation shadows (modern desktop depth scale). L1 lifts cards off the
+## base, L2 floats overlays/inbox, L3 anchors modals. Tint carries the bg hue
+## instead of pure black, matching the theme family.
+func shadow_l1() -> Color:
+	return Color(0, 0, 0, 0.22) if is_dark() else Color(0.10, 0.12, 0.20, 0.10)
+
+func shadow_l2() -> Color:
+	return Color(0, 0, 0, 0.34) if is_dark() else Color(0.10, 0.14, 0.30, 0.16)
+
+func shadow_l3() -> Color:
+	return Color(0, 0, 0, 0.42) if is_dark() else Color(0.10, 0.14, 0.30, 0.18)
+
+func accent_soft() -> Color:
+	var c := accent()
+	c.a = 0.14 if is_dark() else 0.10
+	return c
+
+func hover_layer() -> Color:
+	return Color(1, 1, 1, 0.05) if is_dark() else Color(0, 0, 0, 0.04)
+
+func pressed_layer() -> Color:
+	return Color(0, 0, 0, 0.10) if is_dark() else Color(0, 0, 0, 0.06)
 
 func bg_layer1() -> Color:
 	return Color("232324") if is_dark() else Color("f9fafb")
@@ -127,20 +150,31 @@ const FONT_WEIGHT_SEMI := 600
 const LETTER_MICRO := 0.08
 const LETTER_LABEL := 0.12
 
-## Motion windows (frontend-rebuild-spec §4). Only opacity/modulate is animated.
-## Godot exposes no OS reduce-motion probe; flip motion_enabled to honor it.
+## Motion windows. Opacity is the safe default; slide/scale is allowed for
+## chrome popovers and trays (IA 2026-08-30). Honor motion_enabled: when
+## false, skip interpolation and snap to the end state.
 const MOTION_QUICK := 0.1
 const MOTION_BASE := 0.2
 const MOTION_SLOW := 0.3
+const MOTION_SNAP := 0.16
+const MOTION_SHEET := 0.22
 
 var motion_enabled := true
+
+
+func motion_tween(node: Node, parallel: bool = true) -> Tween:
+	var tw := node.create_tween()
+	tw.set_trans(Tween.TRANS_CUBIC)
+	tw.set_ease(Tween.EASE_OUT)
+	tw.set_parallel(parallel)
+	return tw
 
 
 func fade_in(node: CanvasItem, dur: float = MOTION_BASE) -> void:
 	if node == null or not motion_enabled:
 		return
 	node.modulate.a = 0.0
-	var tw := node.create_tween()
+	var tw := motion_tween(node, false)
 	tw.tween_property(node, "modulate:a", 1.0, dur)
 
 
@@ -153,12 +187,48 @@ func fade_out(node: CanvasItem, dur: float, finished: Callable) -> void:
 			finished.call_deferred()
 		return
 	node.modulate.a = 1.0
-	var tw := node.create_tween()
+	var tw := motion_tween(node, false)
 	tw.tween_property(node, "modulate:a", 0.0, dur)
 	if finished.is_valid():
 		tw.finished.connect(finished)
 	else:
 		tw.finished.connect(func() -> void: node.visible = false)
+
+
+## Slide a Control in from a vertical offset while fading. Use for composer
+## overflow trays, session switcher, and approval sheets.
+func slide_in_y(node: Control, from_delta: float = 12.0, dur: float = MOTION_SNAP) -> void:
+	if node == null:
+		return
+	if not motion_enabled:
+		node.modulate.a = 1.0
+		return
+	var target := node.position
+	node.position = target + Vector2(0, from_delta)
+	var c := node.modulate
+	c.a = 0.0
+	node.modulate = c
+	var tw := motion_tween(node)
+	tw.tween_property(node, "position", target, dur)
+	tw.tween_property(node, "modulate:a", 1.0, dur * 0.85)
+
+
+## Soft pop (scale + fade) for chips and compact popovers.
+func pop_in(node: Control, dur: float = MOTION_QUICK) -> void:
+	if node == null:
+		return
+	if not motion_enabled:
+		node.scale = Vector2.ONE
+		node.modulate.a = 1.0
+		return
+	node.pivot_offset = node.size * 0.5
+	node.scale = Vector2(0.96, 0.96)
+	var c := node.modulate
+	c.a = 0.0
+	node.modulate = c
+	var tw := motion_tween(node)
+	tw.tween_property(node, "scale", Vector2.ONE, dur)
+	tw.tween_property(node, "modulate:a", 1.0, dur)
 
 func to_html(c: Color, with_alpha: bool = false) -> String:
 	return "#" + c.to_html(with_alpha)
@@ -179,11 +249,22 @@ func box(bg: Color, radius: int = RADIUS_MD, border: Color = Color.TRANSPARENT, 
 	sb.content_margin_top = pad.y
 	sb.content_margin_right = pad.z
 	sb.content_margin_bottom = pad.w
-	sb.anti_aliasing = false
+	sb.anti_aliasing = true
 	sb.anti_aliasing_size = 1.0
-	sb.corner_detail = 8
+	sb.corner_detail = 12
 	sb.shadow_size = 0
 	sb.draw_center = true
+	return sb
+
+
+## Smooth-corner elevated box: the standard surface for floating chrome
+## (inbox, popovers). Elevation 1..3 scales shadow depth: inboxes and rails
+## float at L2, dialogs at L3; surfaces never fight for attention.
+func elevated(bg: Color, radius: int = RADIUS_LG, pad := Vector4(12, 10, 12, 10), elevation: int = 2) -> StyleBoxFlat:
+	var sb := box(bg, radius, border_l1(), 1, pad)
+	sb.shadow_color = Color(0, 0, 0, 0.32) if is_dark() else Color(0.12, 0.16, 0.34, 0.14)
+	sb.shadow_size = 10 + 4 * elevation
+	sb.shadow_offset = Vector2(0, 3 + 2 * elevation)
 	return sb
 
 

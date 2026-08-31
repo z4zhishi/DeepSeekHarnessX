@@ -39,6 +39,13 @@ type SDKServer struct {
 	model     string
 	exit      func(code int)
 	subagents *subagent.Manager
+	plugins   agent.PluginRuntime
+
+	// Instructions carries the resolved workspace instruction text
+	// (AGENTS.md / CLAUDE.md / ...) that every lazily created session
+	// appends to its system prompt. Set by the host once at boot before
+	// Serve; empty keeps the legacy system prompt.
+	Instructions string
 
 	mu           sync.Mutex
 	sessions     map[string]*agent.Agent
@@ -76,6 +83,18 @@ func NewSDKServerWithIO(r io.Reader, w io.Writer, store SessionStore, tools *too
 	}
 }
 
+// AttachPluginRuntime binds the live plugin host so SDK-created agents
+// re-read hooks/llm-provider on each dispatch/Stream. Nil-safe.
+func (s *SDKServer) AttachPluginRuntime(rt agent.PluginRuntime) {
+	if s == nil {
+		return
+	}
+	s.plugins = rt
+	if s.subagents != nil {
+		s.subagents.SetPluginRuntime(rt)
+	}
+}
+
 // AttachSubagentManager 绑定进程级 subagent 管理器并挂上 SDK 生命周期通知。
 // 由 main 流程注入（复用已注册 invoke_subagent 工具的同一管理器），
 // 否则 SDK 内部构造的独立管理器不会接收子代理调用事件。
@@ -84,6 +103,7 @@ func (s *SDKServer) AttachSubagentManager(m *subagent.Manager) {
 		return
 	}
 	s.subagents = m
+	m.SetPluginRuntime(s.plugins)
 	m.SetLifecycleHooks(subagent.LifecycleHooks{
 		OnStarted: func(parent, child string) {
 			s.Notify("subagent.started", map[string]any{
@@ -221,6 +241,8 @@ func (s *SDKServer) getOrCreateSession(sessionID string) (*agent.Agent, error) {
 		_ = s.store.PutSession(&header)
 	}
 	ag := agent.NewAgent(header, storage.NewRingBuffer(512), nil, s.store, s.tools, s.adapter, "You are DSHX Assistant.", s.model)
+	ag.Instructions = s.Instructions
+	ag.AttachPluginRuntime(s.plugins)
 	ag.Start()
 	s.sessions[sessionID] = ag
 	// Pipe the agent's live event stream to the client as session.event

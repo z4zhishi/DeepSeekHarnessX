@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,18 +40,20 @@ type CommandDefinition struct {
 	Name        string
 	Description string
 	Handler     func(inv CommandInvocation) CommandResult
+	Owner       string
 }
 
 // CommandRegistry owns the slash-command table and the lifecycle event pair
 // command/run -> command/done (upstream @deepseek-ai/dsh-commands).
 type CommandRegistry struct {
-	mu   sync.RWMutex
-	cmds map[string]CommandDefinition
+	mu     sync.RWMutex
+	cmds   map[string]CommandDefinition
+	owners map[string]string
 }
 
 // NewCommandRegistry builds an empty registry.
 func NewCommandRegistry() *CommandRegistry {
-	return &CommandRegistry{cmds: map[string]CommandDefinition{}}
+	return &CommandRegistry{cmds: map[string]CommandDefinition{}, owners: map[string]string{}}
 }
 
 // Register adds a command definition; a duplicate name is replaced (last
@@ -58,7 +61,71 @@ func NewCommandRegistry() *CommandRegistry {
 func (cr *CommandRegistry) Register(def CommandDefinition) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	def.Owner = ""
+	delete(cr.owners, def.Name)
 	cr.cmds[def.Name] = def
+}
+
+// RegisterOwned adds a command definition with an owner and returns a disposer.
+func (cr *CommandRegistry) RegisterOwned(owner string, def CommandDefinition) func() {
+	if owner == "" || def.Name == "" {
+		return func() {}
+	}
+	cr.mu.Lock()
+	def.Owner = owner
+	cr.cmds[def.Name] = def
+	cr.owners[def.Name] = owner
+	cr.mu.Unlock()
+	return func() { cr.UnregisterOwned(owner, def.Name) }
+}
+
+// UnregisterOwned removes a command only when it still belongs to owner.
+func (cr *CommandRegistry) UnregisterOwned(owner, name string) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.owners[name] != owner {
+		return
+	}
+	delete(cr.cmds, name)
+	delete(cr.owners, name)
+}
+
+// OwnerMap returns a copy of command ownership assignments.
+func (cr *CommandRegistry) OwnerMap() map[string]string {
+	cr.mu.RLock()
+	defer cr.mu.RUnlock()
+	out := make(map[string]string, len(cr.owners))
+	for name, owner := range cr.owners {
+		out[name] = owner
+	}
+	return out
+}
+
+// ClaimOwner associates existing command definitions with an owner after a
+// compatibility family has mounted them (mirrors ToolRegistry.ClaimOwner).
+func (cr *CommandRegistry) ClaimOwner(owner string, names ...string) {
+	if owner == "" {
+		return
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	for _, name := range names {
+		if _, ok := cr.cmds[name]; ok {
+			cr.owners[name] = owner
+		}
+	}
+}
+
+// Names returns a stable sorted snapshot of registered command names.
+func (cr *CommandRegistry) Names() []string {
+	cr.mu.RLock()
+	defer cr.mu.RUnlock()
+	names := make([]string, 0, len(cr.cmds))
+	for name := range cr.cmds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // List returns name-sorted descriptors for discovery UI.
@@ -67,6 +134,7 @@ func (cr *CommandRegistry) List() []CommandDefinition {
 	defer cr.mu.RUnlock()
 	out := make([]CommandDefinition, 0, len(cr.cmds))
 	for _, def := range cr.cmds {
+		def.Owner = cr.owners[def.Name]
 		out = append(out, def)
 	}
 	return out

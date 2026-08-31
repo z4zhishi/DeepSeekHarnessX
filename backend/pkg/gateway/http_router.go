@@ -18,6 +18,7 @@ import (
 	"dsh-go/pkg/agent"
 	"dsh-go/pkg/credential"
 	"dsh-go/pkg/feedback"
+	"dsh-go/pkg/instructions"
 	"dsh-go/pkg/llm"
 	"dsh-go/pkg/plugin"
 	"dsh-go/pkg/session"
@@ -36,6 +37,14 @@ type PluginCtl interface {
 	InstallFromPath(ctx context.Context, src, destDir string) (plugin.PluginInfo, error)
 	Uninstall(name string) error
 	SetEnabled(name string, enabled bool) error
+	Describe() plugin.RegistryView
+	Hooks() *plugin.Hooks
+	LlmAdapter() llm.LlmAdapter
+	HasBuiltin(name string) bool
+	// ProtocolRegistry publishes the wire-protocol registry mounted by the
+	// builtin protocols capability. Non-nil whenever the capability is
+	// registered (empty registry = disabled); nil on plugin-less runtimes.
+	ProtocolRegistry() plugin.ProtocolRegistry
 }
 
 // SessionStore is the storage surface the gateway consumes. Both the
@@ -84,6 +93,14 @@ type Server struct {
 	// Credentials is the credential-reference backend (settings.credentials).
 	// nil reports every reference unconfigured/read-only.
 	Credentials *credential.Manager
+	// Instructions is the resolved workspace instruction text (community
+	// memory family: AGENTS.md / CLAUDE.md / ...). The host resolves it once
+	// at boot via instructions.Resolve and every created session appends it
+	// to the system prompt. Empty keeps the legacy system prompt.
+	Instructions string
+	// InstructionSources is the resolver detail (per-file provenance) behind
+	// the instructions count reported by host.describe.
+	InstructionSources []instructions.InstructionSource
 	// Model is the configured default model id (e.g. "deepseek-v4-flash").
 	// It is reported by llm.models and seeds the token meter's context window
 	// for session.context. Empty falls back to the active provider profile, then
@@ -368,6 +385,9 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			"runtime":     "go1.25",
 			"activeHub":   true,
 			"environment": "desktop",
+			"instructions": map[string]any{
+				"sources": len(s.InstructionSources),
+			},
 		}, nil
 
 	case "session.list":
@@ -865,10 +885,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		var fetchError string
 		active, profiles := s.providerState()
 		if p, ok := profiles[active]; ok && active != "" {
-			protocol := p.Protocol
-			if protocol == "" || protocol == "deepseek" {
-				protocol = llm.ProtocolOpenAICompletions
-			}
+			protocol := normalizeStoredProtocol(p.Protocol)
 			key := ""
 			if s.Credentials != nil && p.APIKeyRef != "" {
 				if k, kerr := s.Credentials.ResolveValue(p.APIKeyRef); kerr == nil {
@@ -884,7 +901,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 				models = mergeModelCatalog(live, llm.DefaultModels)
 			}
 		}
-		out := map[string]any{"models": modelInfoMaps(models), "selected": s.configuredModel()}
+		out := map[string]any{"models": modelInfoMaps(models), "selected": s.configuredModel(), "protocols": s.supportedProtocols()}
 		if fetchError != "" {
 			out["fetchError"] = fetchError
 		}
@@ -904,11 +921,10 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 			}
 		}
 		s.Model = model
-		switch a := s.LlmAdapter.(type) {
-		case *llm.Router:
-			a.SetModel(model)
-		case *llm.DeepSeekAdapter:
-			a.SetModel(model)
+		// SetModel 经接口转发（Router 与各协议适配器都实现），不再按具体
+		// 适配器类型分派 —— DeepSeek 没有协议身份，只是一个 provider。
+		if sm, ok := s.LlmAdapter.(interface{ SetModel(string) }); ok {
+			sm.SetModel(model)
 		}
 		s.mu.Lock()
 		for _, ag := range s.agents {
@@ -932,7 +948,7 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		}
 		// Read existing profile (or create a default-shaped one).
 		_, profiles := s.providerState()
-		cur := map[string]any{"id": id, "name": id, "protocol": llm.ProtocolOpenAICompletions, "baseUrl": llm.DefaultDeepSeekBaseURL, "model": llm.DefaultDeepSeekModel, "apiKeyRef": "DEEPSEEK_API_KEY"}
+		cur := map[string]any{"id": id, "name": id, "protocol": llm.ProtocolOpenAICompletions, "baseUrl": llm.DefaultCompletionsBaseURL, "model": llm.DefaultCompletionsModel, "apiKeyRef": "DEEPSEEK_API_KEY"}
 		if ex, ok := profiles[id]; ok {
 			cur = ex.Raw
 		}
@@ -1029,9 +1045,9 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 		if !ok {
 			return map[string]any{"models": llm.DefaultModels, "selected": s.configuredModel()}, nil
 		}
-		protocol := p.Protocol
-		if protocol == "" || protocol == "deepseek" {
-			protocol = llm.ProtocolOpenAICompletions
+		protocol := normalizeStoredProtocol(p.Protocol)
+		if err := s.ensureProtocolAvailable(protocol); err != nil {
+			return nil, err
 		}
 		key := ""
 		if s.Credentials != nil && p.APIKeyRef != "" {
@@ -1086,11 +1102,25 @@ func (s *Server) dispatch(ctx context.Context, method string, payload map[string
 	case "plugin.list":
 		list := []map[string]any{}
 		if s.Plugins != nil {
-			for _, p := range s.Plugins.ListInfo() {
+			view := s.Plugins.Describe()
+			for _, p := range view.Metadata {
 				list = append(list, pluginInfoValue(p))
 			}
+			return map[string]any{
+				"plugins":          list,
+				"capabilities":     view.Capabilities,
+				"events":           view.Events,
+				"permissions":      view.Permissions,
+				"toolOwnership":    view.ToolOwnership,
+				"commandOwnership": view.CommandOwnership,
+			}, nil
 		}
-		return map[string]any{"plugins": list}, nil
+		return map[string]any{
+			"plugins":      list,
+			"capabilities": []any{},
+			"events":       []any{},
+			"permissions":  []any{},
+		}, nil
 
 	case "plugin.install":
 		if s.Plugins == nil {
@@ -1320,6 +1350,80 @@ func (s *Server) hostVersion() string {
 	return "dev"
 }
 
+// legacyDeepSeekProtocol 曾被存量 provider profile 当作协议值，但 DeepSeek
+// 从没有自己的线协议——provider "deepseek" 是 openai-completions 之上的默认
+// provider profile（api.deepseek.com、凭据 DEEPSEEK_API_KEY）。旧值只在读取
+// 处归一化；协议清单来自线协议注册表，"deepseek" 永不再作为可选协议公布。
+const legacyDeepSeekProtocol = "deepseek"
+
+// normalizeStoredProtocol maps a stored profile protocol value onto a wire
+// protocol. Legacy "deepseek" and empty resolve to openai-completions (the
+// wire default) so stored old profiles keep loading; other values pass
+// through and surface the standard unknown-protocol error when unregistered.
+func normalizeStoredProtocol(protocol string) string {
+	p := strings.ToLower(strings.TrimSpace(protocol))
+	if p == "" || p == legacyDeepSeekProtocol {
+		return llm.ProtocolOpenAICompletions
+	}
+	return p
+}
+
+// protocolRegistry reads the wire-protocol registry through the plugin
+// runtime. nil when the gateway runs without the protocols capability
+// (plugin-less runtimes / opt-out); callers then fall back to the package
+// default adapters. A non-nil registry stays reachable while the capability
+// is disabled — its emptiness IS the disabled state, so the gateway never
+// silently downgrades a disabled protocol to the package default.
+func (s *Server) protocolRegistry() plugin.ProtocolRegistry {
+	if s.Plugins == nil {
+		return nil
+	}
+	return s.Plugins.ProtocolRegistry()
+}
+
+// supportedProtocols lists the wire protocols advertised on settings
+// surfaces: from the mounted protocols registry when wired (empty list =
+// capability disabled; availability is never faked), else the package default.
+// 输出归一化为非 nil 空 slice：disable 态在 RPC 面必须是 []，不是 null。
+func (s *Server) supportedProtocols() []string {
+	if reg := s.protocolRegistry(); reg != nil {
+		if list := reg.List(); list != nil {
+			return list
+		}
+		return []string{}
+	}
+	return llm.SupportedProtocols()
+}
+
+// ensureProtocolAvailable enforces the protocols capability's enable state on
+// provider-facing RPCs that do not construct an adapter themselves: a registry
+// that no longer offers the protocol yields the same unknown-protocol error
+// shape as the package default adapter construction.
+func (s *Server) ensureProtocolAvailable(protocol string) error {
+	reg := s.protocolRegistry()
+	if reg == nil {
+		return nil
+	}
+	for _, name := range reg.List() {
+		if name == protocol {
+			return nil
+		}
+	}
+	return fmt.Errorf("llm: unknown protocol %q (supported: %s)", protocol, strings.Join(reg.List(), ", "))
+}
+
+// buildProtocolAdapter constructs one protocol adapter for a profile. With the
+// protocols capability mounted the build routes through its registry, so a
+// disabled or unknown protocol fails with the unknown-protocol error instead
+// of being built; without the registry the package default construction keeps
+// every plugin-less path (tests, tooling) unchanged.
+func (s *Server) buildProtocolAdapter(protocol string, profile llm.ProviderProfile) (llm.LlmAdapter, error) {
+	if reg := s.protocolRegistry(); reg != nil {
+		return reg.Build(protocol, profile)
+	}
+	return llm.NewProtocolAdapter(profile)
+}
+
 // providerProfile is the resolved view of one provider configuration.
 type providerProfile struct {
 	ID            string         `json:"id"`
@@ -1365,9 +1469,9 @@ func (s *Server) providerState() (string, map[string]providerProfile) {
 		p := providerProfile{
 			ID:        id,
 			Name:      strAny(pmap["name"], id),
-			Protocol:  strAny(pmap["protocol"], llm.ProtocolOpenAICompletions),
-			BaseURL:   strAny(pmap["baseUrl"], llm.DefaultDeepSeekBaseURL),
-			Model:     strAny(pmap["model"], llm.DefaultDeepSeekModel),
+			Protocol:  normalizeStoredProtocol(strAny(pmap["protocol"], llm.ProtocolOpenAICompletions)),
+			BaseURL:   strAny(pmap["baseUrl"], llm.DefaultCompletionsBaseURL),
+			Model:     strAny(pmap["model"], llm.DefaultCompletionsModel),
 			APIKeyRef: strAny(pmap["apiKeyRef"], "DEEPSEEK_API_KEY"),
 			Raw:       pmap,
 		}
@@ -1406,7 +1510,7 @@ func (s *Server) providerDescribeResp() map[string]any {
 			"keyWritable":   p.KeyWritable,
 		})
 	}
-	return map[string]any{"active": active, "profiles": list, "usable": usable}
+	return map[string]any{"active": active, "profiles": list, "usable": usable, "protocols": s.supportedProtocols()}
 }
 
 // setActiveProvider persists the active id and reconfigures the adapter.
@@ -1434,11 +1538,8 @@ func (s *Server) applyProviderConfig(id string) (map[string]any, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown provider profile %q", id)
 	}
-	protocol := p.Protocol
-	if protocol == "" || protocol == "deepseek" {
-		protocol = llm.ProtocolOpenAICompletions
-	}
-	adapter, err := llm.NewProtocolAdapter(llm.ProviderProfile{
+	protocol := normalizeStoredProtocol(p.Protocol)
+	adapter, err := s.buildProtocolAdapter(protocol, llm.ProviderProfile{
 		Protocol:       protocol,
 		BaseURL:        p.BaseURL,
 		Model:          p.Model,
@@ -1500,16 +1601,17 @@ func (s *Server) HydrateRuntime() {
 		return
 	}
 	s.Model = model
-	switch a := s.LlmAdapter.(type) {
-	case *llm.Router:
-		a.SetModel(model)
-	case *llm.DeepSeekAdapter:
-		a.SetModel(model)
+	// SetModel 经接口转发（Router 与各协议适配器都实现），不再按具体
+	// 适配器类型分派 —— DeepSeek 没有协议身份，只是一个 provider。
+	if sm, ok := s.LlmAdapter.(interface{ SetModel(string) }); ok {
+		sm.SetModel(model)
 	}
 }
 
 // SeedDefaultProvider writes a `deepseek` openai-completions profile when the
-// provider namespace has no profiles yet.
+// provider namespace has no profiles yet. "deepseek" 是 provider 档案 id，不是
+// 协议：协议字段始终写线协议（openai-completions），历史存量里的协议旧值在
+// providerState 读取处归一化。
 func (s *Server) SeedDefaultProvider() {
 	if s.Settings == nil {
 		return
@@ -1522,8 +1624,8 @@ func (s *Server) SeedDefaultProvider() {
 		"id":        "deepseek",
 		"name":      "deepseek",
 		"protocol":  llm.ProtocolOpenAICompletions,
-		"baseUrl":   llm.DefaultDeepSeekBaseURL,
-		"model":     llm.DefaultDeepSeekModel,
+		"baseUrl":   llm.DefaultCompletionsBaseURL,
+		"model":     llm.DefaultCompletionsModel,
 		"apiKeyRef": "DEEPSEEK_API_KEY",
 	}
 	ops := []settings.Op{
@@ -1724,7 +1826,7 @@ func (s *Server) configuredModel() string {
 		}
 	}
 	if len(llm.DefaultModels) == 0 {
-		return llm.DefaultDeepSeekModel
+		return llm.DefaultCompletionsModel
 	}
 	return llm.DefaultModels[0].ID
 }
@@ -1861,15 +1963,32 @@ func settingsHasDocument(m *settings.Manager) bool {
 	return m.DocumentExists()
 }
 
+// runtimeAdapter returns the live plugin-owned LLM adapter when the
+// llm-provider builtin is registered. After disable/unload the registry
+// pointer is nil, so NEW agents get no adapter. Existing agents re-read
+// via liveAdapter when AttachPluginRuntime has been called.
+func (s *Server) runtimeAdapter() llm.LlmAdapter {
+	if s.Plugins != nil && s.Plugins.HasBuiltin("llm-provider") {
+		return s.Plugins.LlmAdapter()
+	}
+	return s.LlmAdapter
+}
+
 // spawnAgent starts (or replaces) the in-process actor for header. NewAgent
 // already seeds seq from the store so resume appends contiguously. A previous
 // !Alive() entry left by session.stop is replaced.
 func (s *Server) spawnAgent(header session.SessionHeader) {
 	id := header.ID
 	ringBuf := storage.NewRingBuffer(512)
-	ag := agent.NewAgent(header, ringBuf, nil, s.Store, s.Tools, s.LlmAdapter, "You are DSHX Assistant.", s.configuredModel())
+	ag := agent.NewAgent(header, ringBuf, nil, s.Store, s.Tools, s.runtimeAdapter(), "You are DSHX Assistant.", s.configuredModel())
+	// Workspace instruction files (AGENTS.md / CLAUDE.md / ...) resolved once
+	// at boot by the host; empty keeps the legacy system prompt.
+	ag.Instructions = s.Instructions
 	ag.HookBus = s.HookBus
 	ag.Hooks = s.Hooks
+	if s.Plugins != nil {
+		ag.AttachPluginRuntime(s.Plugins)
+	}
 	ag.AutoTitle = true
 	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
 		return s.askApproval(id, prompt, options)
@@ -1877,9 +1996,47 @@ func (s *Server) spawnAgent(header session.SessionHeader) {
 	ag.Start()
 
 	sub := ag.Subscribe()
+	done := ag.Done()
 	go func() {
-		for env := range sub {
-			s.Hub.BroadcastSessionEvent(id, env)
+		// Downlink pump. The agent never closes subscriber channels itself,
+		// so a plain `for range sub` would park this goroutine (and pin the
+		// dead Agent) on every create/stop cycle. Select on the agent's
+		// termination signal instead; after Stop(), one bounded drain window
+		// lets the closing events already queued (and the actor's final
+		// turn/end on a mid-turn abort — emitted asynchronously AFTER
+		// cancelFunc, so it races Done) reach the hub before the stream goes
+		// silent. The grace must outlast that actor teardown under load
+		// (-race scheduling + durable persist latency): the downlink contract
+		// is that a stopped session still streams its closing turn/end, so a
+		// too-tight window would drop it. Unsubscribe removes the channel
+		// under subMu, so the agent's EmitEvent fan-out can no longer reach
+		// the closed channel (no send-on-closed race), and it only closes a
+		// channel still present in the list — idempotent against any other
+		// reaper.
+		const drainGrace = time.Second
+		for {
+			select {
+			case env, ok := <-sub:
+				if !ok {
+					return
+				}
+				s.Hub.BroadcastSessionEvent(id, env)
+			case <-done:
+				timer := time.NewTimer(drainGrace)
+				for {
+					select {
+					case env, ok := <-sub:
+						if !ok {
+							timer.Stop()
+							return
+						}
+						s.Hub.BroadcastSessionEvent(id, env)
+					case <-timer.C:
+						ag.Unsubscribe(sub)
+						return
+					}
+				}
+			}
 		}
 	}()
 

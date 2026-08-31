@@ -5,6 +5,7 @@ class_name SettingsOverlay
 
 signal theme_changed(is_dark: bool)
 signal closed
+signal chrome_customize_requested
 
 const THEME_PATH := "user://theme.txt"
 const PANEL_SIZE := Vector2(720, 560)
@@ -50,6 +51,8 @@ var _context_presets: HBoxContainer
 var _provider_lbl: Label
 var _model_lbl: Label
 var _close_btn: Button
+var _chrome_lbl: Label
+var _chrome_btn: Button
 var _proto_lbl: Label
 var _base_lbl: Label
 var _pmodel_lbl: Label
@@ -168,6 +171,14 @@ func _build() -> void:
 	_lang_en.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_lang_en.pressed.connect(_on_lang.bind("en"))
 	lang_row.add_child(_lang_en)
+
+	_chrome_lbl = _section_label(body)
+	_chrome_btn = Button.new()
+	_chrome_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_chrome_btn.pressed.connect(func() -> void:
+		chrome_customize_requested.emit()
+	)
+	body.add_child(_chrome_btn)
 
 	_context_lbl = _section_label(body)
 	var context_row := HBoxContainer.new()
@@ -330,7 +341,7 @@ func _apply_style() -> void:
 	))
 	_title.add_theme_color_override("font_color", DshTokens.text_primary())
 	_status.add_theme_color_override("font_color", DshTokens.text_tertiary())
-	for lbl in [_appearance_lbl, _language_lbl, _model_lbl, _provider_lbl, _name_lbl, _proto_lbl, _base_lbl, _pmodel_lbl, _key_lbl, _context_lbl, _context_source_lbl]:
+	for lbl in [_appearance_lbl, _language_lbl, _chrome_lbl, _model_lbl, _provider_lbl, _name_lbl, _proto_lbl, _base_lbl, _pmodel_lbl, _key_lbl, _context_lbl, _context_source_lbl]:
 		if lbl != null:
 			lbl.add_theme_color_override("font_color", DshTokens.text_secondary())
 	_profile_list.add_theme_stylebox_override("panel", DshTokens.box(
@@ -346,6 +357,11 @@ func _apply_strings() -> void:
 	_title.text = DshI18n.t("settings.title")
 	_appearance_lbl.text = DshI18n.t("settings.appearance")
 	_language_lbl.text = DshI18n.t("settings.language")
+	if _chrome_lbl != null:
+		_chrome_lbl.text = _t("chrome.title", "自定义工具栏")
+	if _chrome_btn != null:
+		_chrome_btn.text = _t("chrome.customize", "自定义工具栏")
+		_chrome_btn.tooltip_text = _t("chrome.hint", "调整 Composer 槽位中的控件，保存后立即生效。")
 	_model_lbl.text = DshI18n.t("settings.model")
 	_context_lbl.text = DshI18n.t("settings.contextLimit")
 	_save_btn.text = DshI18n.t("common.save")

@@ -51,6 +51,12 @@ layout_mode = 2
 toggle_mode = true
 text = "Trajectory"
 
+[node name="LineageTabBtn" type="Button" parent="Margin/HBox/TabBar"]
+unique_name_in_owner = true
+layout_mode = 2
+toggle_mode = true
+text = "Lineage"
+
 [node name="ModelPicker" type="OptionButton" parent="Margin/HBox"]
 unique_name_in_owner = true
 visible = false

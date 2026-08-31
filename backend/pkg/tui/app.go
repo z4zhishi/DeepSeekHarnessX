@@ -30,14 +30,16 @@ func leaveAltScreen() {
 // RunTUI launches the native terminal interactive mode. Two input stacks:
 // a raw-mode editor (real-time completion, history, status bar) whenever the
 // terminal supports it, and the legacy cooked line scanner as fallback for
-// piped/non-TTY stdin — byte-for-byte the pre-overhaul behavior.
-func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string) {
+// piped/non-TTY stdin — byte-for-byte the pre-overhaul behavior. instructions
+// is the resolved workspace instruction text ("" = none) appended to every
+// TUI session's system prompt.
+func RunTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string, runtime agent.PluginRuntime, instructions string) {
 	enterAltScreen()
 	exit := false
 	if restore, ok := enableRawInput(); ok {
-		exit = runInteractiveTUI(store, toolReg, adapter, modelName, restore)
+		exit = runInteractiveTUI(store, toolReg, adapter, modelName, restore, runtime, instructions)
 	} else {
-		exit = runCookedTUI(store, toolReg, adapter, modelName)
+		exit = runCookedTUI(store, toolReg, adapter, modelName, runtime, instructions)
 	}
 	leaveAltScreen()
 	if exit {
@@ -49,7 +51,7 @@ const tuiHistoryEntries = 500
 
 // runInteractiveTUI is the raw-mode session. Returns true when the user asked
 // to exit (vs stdin EOF without explicit request — both print the goodbye).
-func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string, restoreRaw func()) bool {
+func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string, restoreRaw func(), runtime agent.PluginRuntime, instructions string) bool {
 	defer restoreRaw()
 	fmt.Fprint(os.Stdout, "\033[?2004h") // bracketed paste on
 	defer fmt.Fprint(os.Stdout, "\033[?2004l")
@@ -69,6 +71,8 @@ func runInteractiveTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, 
 
 	ringBuf := storage.NewRingBuffer(512)
 	ag := agent.NewAgent(header, ringBuf, nil, store, toolReg, tune, "You are DSHX Assistant.", modelName)
+	ag.Instructions = instructions
+	ag.AttachPluginRuntime(runtime)
 	approvalCh := make(chan approvalRequest, 4)
 	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
 		req := approvalRequest{
@@ -865,7 +869,7 @@ func buildHelpText(defs []commandInfo) string {
 // Legacy cooked-mode fallback: byte-for-byte the pre-overhaul loop, kept for
 // piped stdin where raw mode is impossible.
 
-func runCookedTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string) bool {
+func runCookedTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapter llm.LlmAdapter, modelName string, runtime agent.PluginRuntime, instructions string) bool {
 	ui := newUI(os.Stdout)
 	defer ui.close()
 
@@ -878,6 +882,8 @@ func runCookedTUI(store gateway.SessionStore, toolReg *tools.ToolRegistry, adapt
 
 	ringBuf := storage.NewRingBuffer(512)
 	ag := agent.NewAgent(header, ringBuf, nil, store, toolReg, adapter, "You are DSHX Assistant.", modelName)
+	ag.Instructions = instructions
+	ag.AttachPluginRuntime(runtime)
 	approvalCh := make(chan approvalRequest, 4)
 	ag.RequestUser = func(prompt string, options []string) (tools.ApprovalDecision, error) {
 		req := approvalRequest{

@@ -1,0 +1,14 @@
+{
+  "name": "echo-plugin",
+  "abiVersion": 1,
+  "command": "./echo-plugin",
+  "args": [],
+  "capabilities": [
+    { "name": "tool", "description": "echo says text back to the caller" },
+    { "name": "command", "description": "/echo replies with its input" }
+  ],
+  "policy": {
+    "requiresPerm": true,
+    "reconnect": { "enabled": true, "initialDelayMs": 500, "maxDelayMs": 30000, "maxAttempts": 10 }
+  }
+}

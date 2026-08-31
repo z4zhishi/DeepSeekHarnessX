@@ -1,0 +1,16 @@
+{
+  "name": "demo-easyapi",
+  "abiVersion": 1,
+  "command": "./demo-easyapi",
+  "args": [],
+  "capabilities": [
+    { "name": "tool", "description": "demo_easysay echoes text back" },
+    { "name": "event", "description": "publishes demo-easyapi/tick" }
+  ],
+  "libs": [
+    { "id": "dshx-easy-api", "version": "^1.0" }
+  ],
+  "policy": {
+    "requiresPerm": true
+  }
+}

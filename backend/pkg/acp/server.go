@@ -13,12 +13,14 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,7 @@ import (
 
 	"dsh-go/pkg/agent"
 	"dsh-go/pkg/llm"
+	"dsh-go/pkg/mcp"
 	"dsh-go/pkg/session"
 	"dsh-go/pkg/tools"
 )
@@ -72,6 +75,13 @@ const (
 // permissionTimeout bounds one server->client requestPermission round trip;
 // a missing or timed-out answer cancels the tool call. Overridable in tests.
 var permissionTimeout = 60 * time.Second
+
+// session/new 内联 mcpServers 透传限制（生态收编：标准 {名称: {定义}} 配置
+// 形状，经 mcp.ImportConfig 翻译后挂载；载荷/服务器数双重封顶）。
+const (
+	maxInlineMCPBytes   = 64 << 10
+	maxInlineMCPServers = 16
+)
 
 // ContentBlock mirrors one ACP prompt content block (upstream content.ts).
 // Only type:"text" is admitted onto the model surface; every other family
@@ -213,6 +223,17 @@ type Server struct {
 
 	tools      *tools.ToolRegistry
 	llmAdapter llm.LlmAdapter
+	plugins    agent.PluginRuntime
+
+	// mountInlineMCP 把 session/new 的内联 mcpServers（已翻译的 FileConfig）
+	// 挂载进注册表；测试可注入替换。生产实现走 mcp.MountConfig。
+	mountInlineMCP func(ctx context.Context, cfg *mcp.FileConfig, reg *tools.ToolRegistry, logger *log.Logger) ([]*mcp.Supervisor, error)
+
+	// mcpMu 串行化内联 MCP 挂载（注册表与 serverName 命名空间为进程级共享）；
+	// mcpSups 持有连接生命周期的透传 Supervisor（会话与代理同为连接生命周期，
+	// 进程关闭时统一回收）。
+	mcpMu   sync.Mutex
+	mcpSups []*mcp.Supervisor
 
 	mu       sync.Mutex
 	sessions map[string]*SessionRecord
@@ -239,9 +260,19 @@ func NewServerWithIO(r io.Reader, w io.Writer, toolReg *tools.ToolRegistry, adap
 		writer:             w,
 		tools:              toolReg,
 		llmAdapter:         adapter,
+		mountInlineMCP:     mountInlineMCPDefault,
 		sessions:           make(map[string]*SessionRecord),
 		pendingPermissions: make(map[string]chan tools.ApprovalDecision),
 	}
+}
+
+// AttachPluginRuntime binds the live plugin host so ACP-created agents
+// re-read hooks/llm-provider on each dispatch/Stream. Nil-safe.
+func (s *Server) AttachPluginRuntime(rt agent.PluginRuntime) {
+	if s == nil {
+		return
+	}
+	s.plugins = rt
 }
 
 // Serve reads newline-delimited JSON-RPC frames until EOF or ctx cancellation.
@@ -333,9 +364,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, error) {
 
 	case "session/new":
 		var p struct {
-			Cwd                   string            `json:"cwd"`
-			McpServers            []json.RawMessage `json:"mcpServers"`
-			AdditionalDirectories []string          `json:"additionalDirectories"`
+			Cwd                   string          `json:"cwd"`
+			McpServers            json.RawMessage `json:"mcpServers"`
+			AdditionalDirectories []string        `json:"additionalDirectories"`
 		}
 		if err := json.Unmarshal(params, &p); err != nil && !isEmptyParams(params) {
 			return nil, invalidParams("session/new params: %v", err)
@@ -400,7 +431,10 @@ func (s *Server) initialize() (map[string]any, error) {
 // newSession validates parameters exactly like upstream validateSessionParams:
 // relative cwd and unsupported feature families are explicitly rejected with
 // invalidParams instead of silently accepted, then boots one live actor.
-func (s *Server) newSession(cwd string, additionalDirs []string, mcpServers []json.RawMessage) (map[string]any, error) {
+// A client-passed mcpServers payload（生态收编）is transparently imported via
+// the standard {名称: {定义}} config shapes and mounted into the session's tool
+// registry; any import/mount failure rejects the session fail-closed.
+func (s *Server) newSession(cwd string, additionalDirs []string, mcpServers json.RawMessage) (map[string]any, error) {
 	s.mu.Lock()
 	closed := s.closed
 	s.mu.Unlock()
@@ -413,8 +447,9 @@ func (s *Server) newSession(cwd string, additionalDirs []string, mcpServers []js
 	if len(additionalDirs) > 0 {
 		return nil, invalidParams("additionalDirectories is not supported")
 	}
-	if len(mcpServers) > 0 {
-		return nil, invalidParams("mcpServers is not supported")
+	inlineSups, err := s.mountInlineMCPServers(mcpServers)
+	if err != nil {
+		return nil, err
 	}
 
 	sessionID := newSessionID()
@@ -426,6 +461,7 @@ func (s *Server) newSession(cwd string, additionalDirs []string, mcpServers []js
 	}
 	ag := agent.NewAgent(header, nil, nil, nil, s.tools, s.llmAdapter,
 		"You are DeepSeekHarnessX (DSHX) ACP automation assistant.", "deepseek-chat")
+	ag.AttachPluginRuntime(s.plugins)
 	// Permission-gated tools wake the ACP permission waterfall; the wire shape
 	// is decided inside askPermission (server request -> client response).
 	ag.RequestUser = func(reason string, _ []string) (tools.ApprovalDecision, error) {
@@ -443,11 +479,93 @@ func (s *Server) newSession(cwd string, additionalDirs []string, mcpServers []js
 		stopRelay()
 		ag.Unsubscribe(sub)
 		ag.Stop()
+		s.discardMCPMounts(inlineSups) // 本次挂载随会话失败回滚
 		return nil, internalError("connection closed during session/new")
 	}
 	s.sessions[sessionID] = &SessionRecord{agent: ag, stopRelay: stopRelay}
 	s.mu.Unlock()
 	return map[string]any{"sessionId": sessionID}, nil
+}
+
+// mountInlineMCPServers 翻译并挂载 session/new 的原始 mcpServers 参数
+// （生态收编透传）：仅接受 {名称: {定义}} 映射形（Claude/Cursor 等配置形状），
+// 经 mcp.ImportConfig 统一翻译后挂入共享工具注册表。空载荷/空映射是零操作。
+// 超限（字节/服务器数）、形状或翻译错误、挂载错误一律 fail-closed 回
+// invalidParams（沿用 ACP 显式拒绝而非静默吞掉的错误风格）。
+func (s *Server) mountInlineMCPServers(raw json.RawMessage) ([]*mcp.Supervisor, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	cfg, err := buildInlineMCPConfig(raw)
+	if err != nil {
+		return nil, invalidParams("%v", err)
+	}
+	if len(cfg.Servers) == 0 {
+		return nil, nil
+	}
+	mount := s.mountInlineMCP
+	if mount == nil {
+		mount = mountInlineMCPDefault
+	}
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+	sups, err := mount(context.Background(), cfg, s.tools, nil)
+	if err != nil {
+		return nil, invalidParams("%v", err)
+	}
+	s.mcpSups = append(s.mcpSups, sups...)
+	return sups, nil
+}
+
+// discardMCPMounts 把一次失败的 session/new 已挂载的服务器自连接级集合撤下
+// 并关闭（回滚未落地的挂载）。
+func (s *Server) discardMCPMounts(sups []*mcp.Supervisor) {
+	if len(sups) == 0 {
+		return
+	}
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+	for _, sup := range sups {
+		for i, cur := range s.mcpSups {
+			if cur == sup {
+				s.mcpSups = append(s.mcpSups[:i], s.mcpSups[i+1:]...)
+				break
+			}
+		}
+		_ = sup.Close()
+	}
+}
+
+// mountInlineMCPDefault 是内联 mcpServers 的生产挂载实现。
+func mountInlineMCPDefault(ctx context.Context, cfg *mcp.FileConfig, reg *tools.ToolRegistry, logger *log.Logger) ([]*mcp.Supervisor, error) {
+	return mcp.MountConfig(ctx, cfg, reg, logger)
+}
+
+// buildInlineMCPConfig 把 session/new 的原始 mcpServers 参数翻译为 FileConfig
+// （载荷字节与服务器数封顶；空映射等价于未传）。
+func buildInlineMCPConfig(raw json.RawMessage) (*mcp.FileConfig, error) {
+	if len(raw) > maxInlineMCPBytes {
+		return nil, fmt.Errorf("mcpServers: 载荷 %d 字节超过 %d 上限", len(raw), maxInlineMCPBytes)
+	}
+	var dict map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &dict); err != nil {
+		return nil, fmt.Errorf("mcpServers: 只支持 {名称: {定义}} 映射形（Claude/Cursor 配置形状）: %v", err)
+	}
+	if len(dict) == 0 {
+		return &mcp.FileConfig{}, nil // 空映射：零效果
+	}
+	wrapped := make([]byte, 0, len(raw)+len(`{"mcpServers":}`))
+	wrapped = append(wrapped, `{"mcpServers":`...)
+	wrapped = append(wrapped, raw...)
+	wrapped = append(wrapped, '}')
+	cfg, err := mcp.ImportConfig(bytes.NewReader(wrapped), "mcpServers.json")
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.Servers) > maxInlineMCPServers {
+		return nil, fmt.Errorf("mcpServers: 服务器数量 %d 超过 %d 上限", len(cfg.Servers), maxInlineMCPServers)
+	}
+	return cfg, nil
 }
 
 // newSessionID returns a fresh random hex identifier.

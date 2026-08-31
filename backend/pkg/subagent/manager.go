@@ -119,6 +119,8 @@ type Manager struct {
 	// modelGetter 返回父请求当前模型（每次 spawn 时查询，模型可热切换）；
 	// nil 时回落父请求快照中的模型，再回落 DefaultModelName。
 	modelGetter func() string
+	// pluginRuntime is the live plugin host forwarded to every child agent.
+	pluginRuntime agent.PluginRuntime
 }
 
 // Option 配置 Manager 的可选依赖（保持 NewManager 两参签名兼容既有调用方，
@@ -146,6 +148,21 @@ func WithTimeout(d time.Duration) Option {
 // 使子代理路由继承父请求模型（模型热切换即时生效）。
 func WithModelGetter(getter func() string) Option {
 	return func(m *Manager) { m.modelGetter = getter }
+}
+
+// WithPluginRuntime injects the live plugin host forwarded to child agents.
+func WithPluginRuntime(rt agent.PluginRuntime) Option {
+	return func(m *Manager) { m.pluginRuntime = rt }
+}
+
+// SetPluginRuntime updates the live plugin host used by subsequent spawns.
+// Nil-safe. Called after the host builds the plugin registry (which happens
+// after NewManager in the production assembly order).
+func (m *Manager) SetPluginRuntime(rt agent.PluginRuntime) {
+	if m == nil {
+		return
+	}
+	m.pluginRuntime = rt
 }
 
 // SetLifecycleHooks 注入生命周期回调（幂等，可随时替换）。
@@ -340,6 +357,7 @@ func (m *Manager) RegisterSubagentTools(r *tools.ToolRegistry) {
 				fmt.Sprintf("You are a specialized subagent with role: %s.", args.Role),
 				childModel,
 			)
+			childAgent.AttachPluginRuntime(m.pluginRuntime)
 
 			// 容忍调用方未注入 context（如直接执行工具的测试路径）：
 			// nil context 视为不可取消。
@@ -348,6 +366,13 @@ func (m *Manager) RegisterSubagentTools(r *tools.ToolRegistry) {
 				execCtx = context.Background()
 			}
 			eventsChan := childAgent.Subscribe()
+			// 订阅作用域 = 本次派生的 collect：collectLoop 以任一路径退出
+			// （turn/end / 超时 / 取消 / 子代理终止）时，经 defer 从子代理
+			// fan-out 列表摘除并关闭通道（gateway inbound inboundTurn 的
+			// defer-detach 同型）。缺此回收时，每次派生都会在（常驻续写的）
+			// 子代理上残留一个永不关闭的幽灵订阅者——连同其缓冲里已无人
+			// 消费的事件——并让子代理此后每轮 emit 都空扫一次死通道。
+			defer childAgent.Unsubscribe(eventsChan)
 			childAgent.Start()
 			m.notifyStarted(ctx.SessionID, subID)
 
@@ -379,8 +404,9 @@ func (m *Manager) RegisterSubagentTools(r *tools.ToolRegistry) {
 			})
 
 			// Wait for subagent response or turn/end。超时可配（默认 60s）；
-			// 三条退出路径（turn/end、超时、取消）都走统一收尾：Stop 存活
-			// 循环、复位 Continuable、按需回收条目、附结构化用量行返回。
+			// 四条退出路径（turn/end、超时、取消、子代理循环被终止）都走统一
+			// 收尾：Stop 存活循环、复位 Continuable、按需回收条目（defer 则
+			// 摘除本次订阅）、附结构化用量行返回。
 			var finalResponse string
 			var usage session.TokenUsage
 			stopReason := "error"
@@ -425,6 +451,13 @@ func (m *Manager) RegisterSubagentTools(r *tools.ToolRegistry) {
 					exitKind = "canceled"
 					childAgent.Stop()
 					break collectLoop
+				case <-childAgent.Done():
+					// 子代理循环被外部终止（本轮 turn/end 不会再到达）：
+					// 即时收束为 aborted，避免静默等满超时；终止方已
+					// Stop，无需重复调用（gateway pump 的 ag.Done() 同型）。
+					stopReason = "aborted"
+					exitKind = "stopped"
+					break collectLoop
 				}
 			}
 
@@ -436,6 +469,9 @@ func (m *Manager) RegisterSubagentTools(r *tools.ToolRegistry) {
 					args.Role, m.effectiveTimeout(), finalResponse, usageFooter(usage)), nil
 			case exitKind == "canceled":
 				return fmt.Sprintf("Subagent execution canceled.\n%s", usageFooter(usage)), nil
+			case exitKind == "stopped":
+				return fmt.Sprintf("Subagent '%s' aborted: agent stopped before completion. Partial output: %s\n%s",
+					args.Role, finalResponse, usageFooter(usage)), nil
 			}
 
 			if finalResponse == "" {
@@ -639,9 +675,14 @@ func (m *Manager) ContinueSubagent(subID, prompt string) (string, error) {
 	// 注意：Agent.IsRunning() 仅表示「是否在轮中」，单轮结束后为 false，
 	// 但 actorLoop 仍存活并阻塞等待下一条消息，因此不以此作为续写可用性的
 	// 判据。续写通过向既有会话投递新 turn 实现；若底层循环已被 Stop() 取消，
-	// 事件流将保持静默并在超时后兜底返回，不会破坏既有生命周期。
+	// 下方 collectLoop 经 ag.Done() 即时收束为 aborted（此前表现为事件流
+	// 静默、等满超时兜底）。
 
 	eventsChan := ca.Subscribe()
+	// 订阅作用域 = 本轮续写的 collect：collectLoop 退出（turn/end / 超时 /
+	// 子代理终止）经 defer 摘除并关闭通道，与 invoke_subagent 同型。缺此
+	// 回收时每次续写都会在常驻子代理上再残留一个永不关闭的幽灵订阅者。
+	defer ca.Unsubscribe(eventsChan)
 	ca.PostUserMessage(session.UserMessagePayload{
 		ID:   fmt.Sprintf("cont-msg-%d", time.Now().UnixNano()),
 		Role: "user",
@@ -654,6 +695,7 @@ func (m *Manager) ContinueSubagent(subID, prompt string) (string, error) {
 	var finalResponse string
 	var usage session.TokenUsage
 	timedOut := false
+	stopped := false
 	timer := time.NewTimer(m.effectiveTimeout())
 	defer timer.Stop()
 collectLoop:
@@ -681,14 +723,23 @@ collectLoop:
 			timedOut = true
 			ca.Stop()
 			break collectLoop
+		case <-ca.Done():
+			// 底层循环已被外部 Stop：即时收束（历史行为是事件流静默、
+			// 等满超时兜底），终止方已 Stop，无需重复调用。
+			stopped = true
+			break collectLoop
 		}
 	}
-	// 续写轮同样收尾：底层循环已被 Stop()（如本轮超时路径）则复位
+	// 续写轮同样收尾：底层循环已被 Stop()（本轮超时/外部终止路径）则复位
 	// Continuable 并回收条目；正常完成的存活循环保持可续。
-	m.settleSubagent(info, map[bool]string{true: "aborted", false: "completed"}[timedOut])
-	if timedOut {
+	m.settleSubagent(info, map[bool]string{true: "aborted", false: "completed"}[timedOut || stopped])
+	switch {
+	case timedOut:
 		return fmt.Sprintf("Subagent '%s' aborted: timed out after %s. Partial output: %s\n%s",
 			info.Role, m.effectiveTimeout(), finalResponse, usageFooter(usage)), nil
+	case stopped:
+		return fmt.Sprintf("Subagent '%s' aborted: agent stopped before completion. Partial output: %s\n%s",
+			info.Role, finalResponse, usageFooter(usage)), nil
 	}
 	if finalResponse == "" {
 		finalResponse = fmt.Sprintf("Subagent '%s' continued with no text output.", info.Role)

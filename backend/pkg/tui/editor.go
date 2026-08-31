@@ -230,6 +230,13 @@ func (e *Editor) HandleKey(k keyEvent) editorAction {
 }
 
 func (e *Editor) insert(r rune) {
+	// IME 宽斜杠归一（与 GUI composer 同规格，supremacy-plan §1）：中文 IME
+	// 无法直出半角 '/'——缓冲为空时键入 、(U+3001) 或 ／(U+FF0F) 原位改写为
+	// 半角 '/'，使命令补全与 slash 路由可用；仅首位生效，句中不参与。等长
+	// 单 rune 替换，宽度记账由 stringWidth 按替换后内容重算，无残差。
+	if len(e.buf) == 0 && (r == '、' || r == '／') {
+		r = '/'
+	}
 	e.buf = append(e.buf, 0)
 	copy(e.buf[e.cur+1:], e.buf[e.cur:])
 	e.buf[e.cur] = r

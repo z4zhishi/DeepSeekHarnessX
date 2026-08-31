@@ -119,6 +119,18 @@ func (s LlmSummarizer) Summarize(ctx context.Context, input SummarizationInput) 
 			}
 		case chunk, ok := <-chunkChan:
 			if !ok {
+				// A fatal buffered error must not be lost to select randomness:
+				// failStream (missing credential etc.) closes both channels
+				// with the error already buffered, so closed-chunkChan alone
+				// is not proof of clean EOF — draining finds the buffered
+				// failure; closed-empty means the stream really ended.
+				select {
+				case err, errOk := <-errChan:
+					if errOk && err != nil {
+						return nil, nil, nil, false, err
+					}
+				default:
+				}
 				streamDone = true
 				break
 			}

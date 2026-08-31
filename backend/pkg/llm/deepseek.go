@@ -1,3 +1,18 @@
+// pkg/llm 架构（协议插件化）：
+//
+//   - 本包对外只暴露内部协议 dsh-internal/v1（internal_protocol.go）——内部协议即
+//     LlmAdapter 接口本身：ModelRequest 进，StreamChunk 流 + error 通道出。
+//     宿主 / Router / agent / 插件 LlmCapability 之间全部以内部协议对话。
+//   - 线协议（openai-completions / openai-responses / anthropic-messages）是
+//     注册进 ProtocolRegistry 的线格式构造块，是内部协议到外部线格式的翻译器
+//     （中转）。三条线协议的播种即默认注册（见 internal_protocol.go）。
+//   - DeepSeek 不是协议（它没有自有线格式，还是老三样之一）：它是
+//     openai-completions 之上的默认 provider profile —— api.deepseek.com /
+//     deepseek-v4-flash / DEEPSEEK_API_KEY 凭据引用，保留为网关种子 profile
+//     的取值默认（见 profileFromDeepSeek）。
+//
+// 本文件持有 openai-completions 线协议的配置构造块、类型化错误与 HTTP 状态
+// 映射（语义沿用 docs/deepseek-llm-contract.md）。
 package llm
 
 import (
@@ -14,24 +29,38 @@ import (
 )
 
 const (
-	// DefaultDeepSeekBaseURL is the DeepSeek OpenAI-compatible chat origin.
-	DefaultDeepSeekBaseURL = "https://api.deepseek.com"
-	// DefaultDeepSeekModel is the default chat model advertised by the CLI.
-	DefaultDeepSeekModel = "deepseek-v4-flash"
-	// deepSeekChatPath is the streaming Chat Completions route DeepSeek serves
-	// at the origin (NOT /v1/chat/completions).
-	deepSeekChatPath = "/chat/completions"
+	// DefaultCompletionsBaseURL is the default openai-completions origin — the
+	// seeded "deepseek" provider profile (a provider profile, NOT a protocol)
+	// is what speaks here.
+	DefaultCompletionsBaseURL = "https://api.deepseek.com"
+	// DefaultCompletionsModel is the default chat model of the same
+	// seeded provider profile (advertised by the CLI).
+	DefaultCompletionsModel = "deepseek-v4-flash"
+	// DefaultCompletionsChatPath is the streaming Chat Completions route the
+	// api.deepseek.com origin serves at the host root (NOT /v1/chat/completions).
+	DefaultCompletionsChatPath = "/chat/completions"
 
-	// defaultDeepSeekTimeout is the connect+headers deadline applied by
+	// defaultTimeout is the connect+headers deadline applied by
 	// startStream (upstream AbortSignal.timeout(300_000)); it does NOT bound
 	// the streaming body — a healthy stream may outlive it (deepseek-llm-contract.md:93).
-	defaultDeepSeekTimeout = 300 * time.Second
-	// defaultDeepSeekWatchdog is the max silence between SSE bytes before
-	// abort. 300s mirrors defaultDeepSeekTimeout: a reasoning-heavy generation
+	defaultTimeout = 300 * time.Second
+	// defaultWatchdog is the max silence between SSE bytes before
+	// abort. 300s mirrors defaultTimeout: a reasoning-heavy generation
 	// can legitimately stay quiet for minutes between visible bytes, and the
 	// watchdog is an idle bound — not a whole-call deadline (a healthy stream
 	// may outlive it as long as bytes keep arriving).
-	defaultDeepSeekWatchdog = 300 * time.Second
+	defaultWatchdog = 300 * time.Second
+)
+
+// Deprecated aliases for one release so out-of-tree callers (and pkg/gateway,
+// whose own reference migration is Track 2's job) keep compiling unchanged.
+// Do not write new code against these names.
+const (
+	// Deprecated: use DefaultCompletionsBaseURL. DeepSeek 是 provider profile
+	// 而非协议，基础 URL 常量本就属于 openai-completions 线协议构造块。
+	DefaultDeepSeekBaseURL = DefaultCompletionsBaseURL
+	// Deprecated: use DefaultCompletionsModel.
+	DefaultDeepSeekModel = DefaultCompletionsModel
 )
 
 // ModelInfo describes one selectable model in the llm.models catalog served to
@@ -69,28 +98,36 @@ func ContextLimitForModel(model string) int {
 }
 
 // Typed error sentinels so callers can distinguish retryable vs fatal failures.
+// sentinels 由三条线协议适配器共用，错误文案保持原样（错误文本是行为契约的
+// 一部分，不做无提示的字符串变更）。
 var (
-	// ErrDeepSeekMissingCredential mirrors upstream adapter.ts: without an API
-	// key the adapter stays registered (routes browsable) but every stream call
-	// fails with LlmError('MISSING_CREDENTIAL') rather than a silent mock reply.
-	ErrDeepSeekMissingCredential = errors.New("deepseek: no API key configured, set DEEPSEEK_API_KEY and retry (MISSING_CREDENTIAL)")
-	ErrDeepSeekAuth              = errors.New("deepseek: authentication failed (check DEEPSEEK_API_KEY)")
-	ErrDeepSeekQuota             = errors.New("deepseek: quota/balance exhausted")
-	ErrDeepSeekRateLimit         = errors.New("deepseek: rate limited")
-	ErrDeepSeekContext           = errors.New("deepseek: context window exceeded")
-	ErrDeepSeekBadRequest        = errors.New("deepseek: malformed request")
-	ErrDeepSeekServer            = errors.New("deepseek: upstream server error")
-	ErrDeepSeekStream            = errors.New("deepseek: malformed SSE stream")
-	ErrDeepSeekWatchdog          = errors.New("deepseek: stream idle watchdog fired")
+	// ErrMissingCredential mirrors upstream adapter.ts: without an API key the
+	// adapter stays registered (routes browsable) but every stream call fails
+	// with LlmError('MISSING_CREDENTIAL') rather than a silent mock reply.
+	ErrMissingCredential  = errors.New("deepseek: no API key configured, set DEEPSEEK_API_KEY and retry (MISSING_CREDENTIAL)")
+	ErrDeepSeekAuth       = errors.New("deepseek: authentication failed (check DEEPSEEK_API_KEY)")
+	ErrDeepSeekQuota      = errors.New("deepseek: quota/balance exhausted")
+	ErrDeepSeekRateLimit  = errors.New("deepseek: rate limited")
+	ErrDeepSeekContext    = errors.New("deepseek: context window exceeded")
+	ErrDeepSeekBadRequest = errors.New("deepseek: malformed request")
+	ErrDeepSeekServer     = errors.New("deepseek: upstream server error")
+	ErrDeepSeekStream     = errors.New("deepseek: malformed SSE stream")
+	ErrDeepSeekWatchdog   = errors.New("deepseek: stream idle watchdog fired")
 )
 
-// DeepSeekConfig wires up the real deepseek-chat streaming adapter.
-type DeepSeekConfig struct {
+// Deprecated: ErrDeepSeekMissingCredential is the pre-rename name of
+// ErrMissingCredential (kept one release so existing callers compile).
+var ErrDeepSeekMissingCredential = ErrMissingCredential
+
+// CompletionsConfig wires up the openai-completions streaming adapter via the
+// legacy constructor (NewDeepSeekAdapter). The profile-based
+// NewProtocolAdapter is the default construction entry.
+type CompletionsConfig struct {
 	APIKey     string
-	BaseURL    string        // defaults to DefaultDeepSeekBaseURL
-	Model      string        // defaults to DefaultDeepSeekModel
-	Timeout    time.Duration // whole request+stream deadline; <=0 -> defaultDeepSeekTimeout
-	Watchdog   time.Duration // max silence between SSE bytes; <=0 -> defaultDeepSeekWatchdog
+	BaseURL    string        // defaults to DefaultCompletionsBaseURL
+	Model      string        // defaults to DefaultCompletionsModel
+	Timeout    time.Duration // whole request+stream deadline; <=0 -> defaultTimeout
+	Watchdog   time.Duration // max silence between SSE bytes; <=0 -> defaultWatchdog
 	HTTPClient *http.Client  // nil -> http.DefaultClient
 	// APIKeyResolver, when set, is consulted at Stream time when APIKey is
 	// empty. It lets the host resolve the key through the credential seam
@@ -100,12 +137,18 @@ type DeepSeekConfig struct {
 	APIKeyResolver func() (string, error)
 }
 
-// DeepSeekAdapter implements LlmAdapter against the OpenAI Chat Completions
-// API. DeepSeek is a provider that speaks openai-completions (origin
-// https://api.deepseek.com, path /chat/completions).
-type DeepSeekAdapter struct {
+// Deprecated: DeepSeekConfig is the pre-rename alias of CompletionsConfig
+// ("deepseek" 是 provider profile，不是协议；类型归属 openai-completions 线协议).
+type DeepSeekConfig = CompletionsConfig
+
+// CompletionsAdapter implements LlmAdapter against the OpenAI Chat Completions
+// wire protocol (ProtocolOpenAICompletions). It IS the 中转 adapter: it speaks
+// the internal protocol (dsh-internal/v1, i.e. the LlmAdapter interface) on
+// this side and openai-completions on the wire. DeepSeek 是走这条线协议的默认
+// provider profile（origin https://api.deepseek.com, path /chat/completions）。
+type CompletionsAdapter struct {
 	mu       sync.Mutex
-	cfg      DeepSeekConfig
+	cfg      CompletionsConfig
 	httpc    *http.Client
 	baseURL  string
 	model    string
@@ -114,27 +157,39 @@ type DeepSeekAdapter struct {
 	extra    map[string]string
 }
 
+// Deprecated: DeepSeekAdapter is the pre-rename alias of CompletionsAdapter
+// (kept one release; pkg/gateway type-switches still name the old type).
+type DeepSeekAdapter = CompletionsAdapter
+
 // NewDeepSeekAdapter returns a configured adapter. Construction is offline: no
 // network I/O happens until Stream is called. It is the openai-completions
-// convenience constructor (ProtocolOpenAICompletions + DefaultDeepSeekBaseURL).
-func NewDeepSeekAdapter(cfg DeepSeekConfig) *DeepSeekAdapter {
-	a, err := NewProtocolAdapter(profileFromDeepSeek(cfg))
-	if err == nil {
-		if d, ok := a.(*DeepSeekAdapter); ok {
-			return d
-		}
+// convenience constructor (ProtocolOpenAICompletions + DefaultCompletionsBaseURL).
+//
+// Deprecated: DeepSeek 没有自有线协议——DeepSeek 走 OpenAI Chat Completions。
+// 请改用 NewProtocolAdapter（Protocol "openai-completions"）；DeepSeek 只是
+// 该协议之上的 provider profile（DefaultCompletionsBaseURL /
+// DefaultCompletionsModel / DEEPSEEK_API_KEY）。本构造函数保留一个发布周期
+// 以便存量调用方（pkg/gateway 迁移属 Track 2）编译平滑。
+func NewDeepSeekAdapter(cfg CompletionsConfig) LlmAdapter {
+	p := profileFromDeepSeek(cfg)
+	if a, err := NewProtocolAdapter(p); err == nil {
+		return a
 	}
-	return newCompletionsAdapter(profileFromDeepSeek(cfg))
+	return newCompletionsAdapter(p)
 }
 
-func profileFromDeepSeek(cfg DeepSeekConfig) ProviderProfile {
+// profileFromDeepSeek builds the seeded "deepseek" PROVIDER PROFILE on the
+// openai-completions wire protocol: api.deepseek.com / deepseek-v4-flash /
+// DEEPSEEK_API_KEY credential reference. 名字保留 "deepseek"：它构造的就是
+// DeepSeek 这个 provider 的 profile（协议归属不变：ProtocolOpenAICompletions）。
+func profileFromDeepSeek(cfg CompletionsConfig) ProviderProfile {
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" {
-		base = DefaultDeepSeekBaseURL
+		base = DefaultCompletionsBaseURL
 	}
 	model := cfg.Model
 	if model == "" {
-		model = DefaultDeepSeekModel
+		model = DefaultCompletionsModel
 	}
 	return ProviderProfile{
 		Protocol:       ProtocolOpenAICompletions,
@@ -150,7 +205,7 @@ func profileFromDeepSeek(cfg DeepSeekConfig) ProviderProfile {
 
 // SetEndpoint swaps the upstream base URL at runtime (thread-safe). A trailing
 // slash is trimmed. It takes effect on the next Stream call.
-func (d *DeepSeekAdapter) SetEndpoint(baseURL string) {
+func (d *CompletionsAdapter) SetEndpoint(baseURL string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if baseURL == "" {
@@ -161,7 +216,7 @@ func (d *DeepSeekAdapter) SetEndpoint(baseURL string) {
 
 // SetModel swaps the default model id at runtime (thread-safe). It takes
 // effect on the next Stream call.
-func (d *DeepSeekAdapter) SetModel(model string) {
+func (d *CompletionsAdapter) SetModel(model string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if model == "" {
@@ -171,14 +226,14 @@ func (d *DeepSeekAdapter) SetModel(model string) {
 }
 
 // Endpoint returns the current chat-completions endpoint (thread-safe).
-func (d *DeepSeekAdapter) Endpoint() string {
+func (d *CompletionsAdapter) Endpoint() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return chatCompletionsURL(d.baseURL)
 }
 
 // Model returns the current default model id (thread-safe).
-func (d *DeepSeekAdapter) Model() string {
+func (d *CompletionsAdapter) Model() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.model
@@ -188,7 +243,7 @@ func (d *DeepSeekAdapter) Model() string {
 // GET {baseURL}/models). The key is resolved through the adapter's resolver
 // (or cfg.APIKey) so a configured credential is honored. On any failure it
 // returns the error; callers fall back to the static DefaultModels catalog.
-func (d *DeepSeekAdapter) FetchModels(ctx context.Context) ([]ModelInfo, error) {
+func (d *CompletionsAdapter) FetchModels(ctx context.Context) ([]ModelInfo, error) {
 	key := d.cfg.APIKey
 	if key == "" && d.cfg.APIKeyResolver != nil {
 		if rk, rerr := d.cfg.APIKeyResolver(); rerr != nil {
@@ -204,11 +259,11 @@ func (d *DeepSeekAdapter) FetchModels(ctx context.Context) ([]ModelInfo, error) 
 	return FetchModelsFor(ctx, ProtocolOpenAICompletions, base, key, httpc)
 }
 
-// DeepSeekProviderError is a typed provider failure carrying the normalized
+// ProviderError is a typed provider failure carrying the normalized
 // harness code, the provider's message, and the optional retry-after delay and
 // request id the upstream LlmError attaches (adapter.ts:622-657). The stable
 // code is what retry policy routes on.
-type DeepSeekProviderError struct {
+type ProviderError struct {
 	Code               string // "AUTH" | "INVALID_REQUEST" | "QUOTA" | "RATE_LIMIT" | "CONTEXT_WINDOW_EXCEEDED" | "SERVER" | "HTTP_<status>"
 	Message            string // provider message when JSON-parsable, else "DeepSeek API error (HTTP n)"
 	Status             int
@@ -216,13 +271,17 @@ type DeepSeekProviderError struct {
 	RequestID          string        // "" when absent
 }
 
-func (e *DeepSeekProviderError) Error() string {
+// Deprecated: DeepSeekProviderError is the pre-rename alias of ProviderError
+// （sentinels/错误文案不变，供一版过渡）.
+type DeepSeekProviderError = ProviderError
+
+func (e *ProviderError) Error() string {
 	return fmt.Sprintf("deepseek: %s (%s)", e.Message, e.Code)
 }
 
 // Unwrap exposes the matching sentinel so errors.Is(err, ErrDeepSeekAuth)
 // (and RateLimit / BadRequest / Server / …) still classifies HTTP failures.
-func (e *DeepSeekProviderError) Unwrap() error {
+func (e *ProviderError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
@@ -244,7 +303,7 @@ func (e *DeepSeekProviderError) Unwrap() error {
 	}
 }
 
-// wireError is the DeepSeek error body shape (`WireError['error']`).
+// wireError is the provider error body shape (`WireError['error']`).
 type wireError struct {
 	Code    string `json:"code,omitempty"`
 	Type    string `json:"type,omitempty"`
@@ -319,10 +378,10 @@ func providerRetryAfterMs(value string) time.Duration {
 	return 0
 }
 
-// mapDeepSeekStatus converts an HTTP status plus the parsed provider error
-// body into a structured DeepSeekProviderError, exactly mirroring upstream
+// mapProviderStatus converts an HTTP status plus the parsed provider error
+// body into a structured ProviderError, exactly mirroring upstream
 // httpErrorCode + requestId + providerRetryAfterMs (adapter.ts:333-345).
-func mapDeepSeekStatus(code int, providerError *wireError, retryAfter string, requestID string) *DeepSeekProviderError {
+func mapProviderStatus(code int, providerError *wireError, retryAfter string, requestID string) *ProviderError {
 	if code >= 200 && code < 300 {
 		return nil
 	}
@@ -354,7 +413,7 @@ func mapDeepSeekStatus(code int, providerError *wireError, retryAfter string, re
 	case code >= 500:
 		httpCode = "SERVER"
 	}
-	return &DeepSeekProviderError{
+	return &ProviderError{
 		Code:               httpCode,
 		Message:            message,
 		Status:             code,

@@ -35,6 +35,12 @@ type Capabilities struct {
 	Tools    *tools.ToolRegistry
 	Commands *tools.CommandRegistry
 	Events   *EventBus
+	// Bridge is the live CoreBridge used by builtin capabilities that also
+	// implement the public core.Plugin lifecycle.
+	Bridge *CoreBridge
+	// SetHooks installs the live hooks.json runtime on the Registry (nil = inert).
+	// Injected by mountBuiltin; the hooks capability disposer calls SetHooks(nil).
+	SetHooks func(*Hooks)
 }
 
 // 可选能力接口：宿主通过类型断言探测，非强制。

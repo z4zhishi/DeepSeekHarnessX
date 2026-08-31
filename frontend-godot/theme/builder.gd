@@ -68,6 +68,12 @@ static func build(dark: bool) -> Theme:
 
 	t.set_color("font_color", "Tree", tp)
 	t.set_stylebox("panel", "Tree", DshTokens.box(Color(0, 0, 0, 0)))
+	# 谱系/树表头（Apple 化第一批，截图审出缺陷 3）：表头按钮不再用默认
+	# 灰底色块，改为透明 + tertiary 文字，主题/侧栏统一安静。
+	t.set_stylebox("title_button_normal", "Tree", DshTokens.box(Color(0, 0, 0, 0), 0, Color(0, 0, 0, 0), 0, Vector4(4, 2, 4, 2)))
+	t.set_stylebox("title_button_hover", "Tree", DshTokens.box(Color(0, 0, 0, 0), 0, Color(0, 0, 0, 0), 0, Vector4(4, 2, 4, 2)))
+	t.set_stylebox("title_button_pressed", "Tree", DshTokens.box(Color(0, 0, 0, 0), 0, Color(0, 0, 0, 0), 0, Vector4(4, 2, 4, 2)))
+	t.set_color("title_button_color", "Tree", tt)
 
 	t.set_color("font_color", "OptionButton", tp)
 	t.set_color("font_hover_color", "OptionButton", tp)

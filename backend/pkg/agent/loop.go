@@ -70,6 +70,13 @@ type Agent struct {
 	LlmAdapter   llm.LlmAdapter
 	SystemPrompt string
 	ModelName    string
+	// Instructions carries the resolved workspace instruction files (the
+	// community memory family: AGENTS.md / CLAUDE.md / ... from pkg/
+	// instructions). It is appended to SystemPrompt when the ModelRequest is
+	// built; empty keeps the system prompt byte-for-byte identical to the
+	// pre-seam behavior. Hosts set it once at boot from
+	// instructions.Resolve(workspace cwd).
+	Instructions string
 	// Effort overrides the reasoning_effort sent to the model for this agent
 	// ("off" | "low" | "high" | "max"). Empty means the provider default. The
 	// GUI/TUI set it per session (mirrors tunedAdapter's live override).
@@ -90,13 +97,22 @@ type Agent struct {
 	// appends the schedule/change dispatch events.
 	Schedule *tools.ScheduleDispatcher
 	// HookBus optionally wires the CC-style hooks runtime into the agent loop.
-	// When both HookBus and Hooks are set, the four dispatch intercept points
-	// (UserPromptSubmit / PreToolUse / PostToolUse / Stop) run matching command
-	// hooks and emit hook/invoked + hook/result events into the session log.
-	// Dispatch is best-effort: a failing or missing hook never blocks the loop.
+	// When both HookBus and a live *Hooks are set, the four dispatch intercept
+	// points (UserPromptSubmit / PreToolUse / PostToolUse / Stop) run matching
+	// command hooks and emit hook/invoked + hook/result events into the session
+	// log. Dispatch is best-effort: a failing or missing hook never blocks the loop.
 	HookBus *plugin.EventBus
-	// Hooks is the parsed hooks.json configuration driven by HookBus.
+	// Hooks is the parsed hooks.json configuration driven by HookBus. Fallback
+	// for tests that set it directly; live hosts should set HooksProvider.
 	Hooks *plugin.Hooks
+	// HooksProvider is a live lookup for parsed hooks.json. When set, dispatchHook
+	// re-reads it on every intercept so plugin Unload/SetEnabled("hooks", false)
+	// stops hooks for already-running agents. Product hosts set this via
+	// AttachPluginRuntime rather than assigning the field directly.
+	HooksProvider HooksProvider
+	// pluginRuntime is the live plugin host. Agents re-read it on every hook
+	// dispatch (via HooksProvider) and every LLM Stream (via liveAdapter).
+	pluginRuntime PluginRuntime
 	// AutoTitle enables one-shot automatic session-title generation after the
 	// first eligible human message (prompt first-eligible last-turn mode).
 	// It defaults false so in-memory/test hosts stay title-free; the gateway,
@@ -396,6 +412,14 @@ func (a *Agent) emitRaw(env *session.SessionEnvelope) error {
 // carry no such marker and drive boundary-event escalation instead.
 var errInvalidTransition = errors.New("invalid transition")
 
+// errStreamClosedAfterCancel is the sentinel routed when the step-loop stream
+// read observes a closed chunkChan after the turn context was already
+// cancelled: llmRetry exits silently on ctx.Done and closes both channels
+// without an error, so the close itself is an abort artifact, never a clean
+// EOF. routeStepFatal consumes only the ctx state for this shape — aborted
+// beats failed — so the message is purely diagnostic.
+var errStreamClosedAfterCancel = errors.New("stream closed after turn context cancellation")
+
 // emitBoundary appends a turn/step lifecycle boundary event (turn/start,
 // step/end, turn/end). The transition machine mutates before AppendEvents, so
 // a persistence failure would leave later events referencing a turn/step the
@@ -620,6 +644,14 @@ func (a *Agent) Alive() bool {
 	return a != nil && a.ctx != nil && a.ctx.Err() == nil
 }
 
+// Done exposes the agent's app-level termination signal — the context Stop()
+// cancels — so long-lived downlink consumers can stop ranging a dead agent's
+// subscriber channel (and then Unsubscribe it) instead of parking forever.
+// No new lifecycle state: Start/Stop already own this context.
+func (a *Agent) Done() <-chan struct{} {
+	return a.ctx.Done()
+}
+
 // AbortTurn cancels the per-turn context used by llmRetry/Stream without
 // cancelling the actor. The loop emits step/end + turn/end reason=aborted
 // and then waits for the next PostUserMessage. A no-op when idle.
@@ -671,17 +703,26 @@ func (a *Agent) finishTurnReason(kind, message string) {
 	}
 }
 
+// HooksProvider is a live lookup for parsed hooks.json (typically *plugin.Registry).
+type HooksProvider interface {
+	Hooks() *plugin.Hooks
+}
+
 // dispatchHook runs the CC-style hooks runtime at one interception point. It is
-// a no-op when the runtime is not wired (HookBus or Hooks nil). Each matching
+// a no-op when the runtime is not wired (HookBus or live hooks nil). Each matching
 // command hook first emits hook/invoked, then (after running) hook/result, so
 // the durable log carries the paired lifecycle audit; a failure is isolated and
 // never panics. Returns true when any hook decided to BLOCK (exit code 2), so a
 // PreToolUse hook can actually gate the tool call.
 func (a *Agent) dispatchHook(point, subject string, turn int) bool {
-	if a.HookBus == nil || a.Hooks == nil {
+	hooks := a.Hooks
+	if a.HooksProvider != nil {
+		hooks = a.HooksProvider.Hooks()
+	}
+	if a.HookBus == nil || hooks == nil {
 		return false
 	}
-	os := a.HookBus.DispatchHook(a.ctx, a.Hooks, point, subject, turn)
+	os := a.HookBus.DispatchHook(a.ctx, hooks, point, subject, turn)
 	for _, o := range os {
 		if o.Decision == "block" {
 			return true
@@ -793,10 +834,22 @@ turns:
 					}
 				}
 
+				// Effective system prompt: host base prompt + resolved
+				// workspace instructions (community memory family). Empty
+				// Instructions leaves SystemPrompt untouched.
+				system := a.SystemPrompt
+				if a.Instructions != "" {
+					if system == "" {
+						system = a.Instructions
+					} else {
+						system = system + "\n\n" + a.Instructions
+					}
+				}
+
 				modelReq := llm.ModelRequest{
 					Model:           a.ModelName,
 					Messages:        derivedMsgs,
-					System:          a.SystemPrompt,
+					System:          system,
 					Tools:           toolDecls,
 					ReasoningEffort: a.Effort, // "" => provider default
 				}
@@ -817,7 +870,7 @@ turns:
 							Provider: "deepseek-official",
 							Model:    a.ModelName,
 						},
-						System: a.SystemPrompt,
+						System: system,
 						Tools:  schemaTools,
 					},
 					Reason: session.HeaderReasonInitial,
@@ -836,6 +889,31 @@ turns:
 				llmFailed := false
 				actorStopped := false
 				turnAborted := false
+				// routeStepFatal routes one fatal stream error through the same
+				// turn-closing path regardless of which select case delivered
+				// it: context cancellation wins first (aborted beats failed),
+				// then the step:end boundary, then turn:end carrying the
+				// structured provider code. Outcome flags feed the post-stream
+				// switch below.
+				routeStepFatal := func(err error) {
+					if a.ctx.Err() != nil {
+						actorStopped = true
+						return
+					}
+					if turnCtx.Err() != nil {
+						turnAborted = true
+						return
+					}
+					if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step}) {
+						llmFailed = true
+						return
+					}
+					if !a.turnEndError(turn, err) {
+						llmFailed = true
+						return
+					}
+					llmFailed = true
+				}
 				for !streamDone {
 					// Priority check: the next-step inbox wins over stream
 					// chunks at every iteration, so an interrupt can never be
@@ -868,31 +946,40 @@ turns:
 							break
 						}
 						if err != nil {
-							if a.ctx.Err() != nil {
-								actorStopped = true
-								streamDone = true
-								break
-							}
-							if turnCtx.Err() != nil {
-								turnAborted = true
-								streamDone = true
-								break
-							}
-							if !a.emitBoundary(session.EventStepEnd, session.StepEndPayload{Turn: turn, Step: step}) {
-								llmFailed = true
-								streamDone = true
-								break
-							}
-							if !a.turnEndError(turn, err) {
-								llmFailed = true
-								streamDone = true
-								break
-							}
-							llmFailed = true
+							routeStepFatal(err)
 							streamDone = true
 						}
 					case chunk, ok := <-chunkChan:
 						if !ok {
+							// A fatal buffered error must not be lost to
+							// select randomness: llmRetry buffers outErr
+							// before closing both channels (same shape as
+							// llm/sse.go failStream), so closed-chunkChan
+							// alone is not proof of clean EOF — draining
+							// finds the buffered failure, closed-empty means
+							// the stream really ended.
+							select {
+							case err, errOk := <-errChan:
+								if errOk && err != nil {
+									routeStepFatal(err)
+								}
+							default:
+							}
+							// Cancellation wins over close: on ctx.Done
+							// llmRetry exits silently (both channels closed,
+							// no error delivered), so a closed chunkChan races
+							// the turnCtx.Done case above with no intent data
+							// at this select — and the close would classify
+							// the cancelled turn as a clean completion with
+							// an empty assistant message. Before accepting
+							// EOF, check the turn context (a child of a.ctx,
+							// so AbortTurn and Stop both land here): when
+							// cancelled, route through the same fatal path
+							// (aborted beats failed) instead of the clean-EOF
+							// fallthrough.
+							if turnCtx.Err() != nil {
+								routeStepFatal(errStreamClosedAfterCancel)
+							}
 							streamDone = true
 							break
 						}
@@ -1170,7 +1257,7 @@ func (a *Agent) generateSessionTitle() {
 	for _, m := range messages {
 		seqs = append(seqs, m.Seq)
 	}
-	title, _ := GenerateTitle(context.Background(), a.LlmAdapter, events)
+	title, _ := GenerateTitle(context.Background(), a.liveAdapter(), events)
 	// Deterministic fallback / empty: single provider event, never a mock LLM
 	// dispatch (generation is off the main path).
 	_, _ = a.EmitEvent(session.EventSessionTitle, titleEventData{
@@ -1234,7 +1321,7 @@ var retryableCodes = map[string]bool{
 func isRetryableCode(code string) bool { return retryableCodes[code] }
 
 // llmRetryError is the provider-neutral failure fact the agent loop routes on.
-// It is a strict subset of the DeepSeekProviderError / transport errors the
+// It is a strict subset of the ProviderError / transport errors the
 // deepseek adapter can produce.
 type llmRetryError struct {
 	message string
@@ -1275,13 +1362,34 @@ func (a *Agent) llmRetry(ctx context.Context, turn, step int, modelReq llm.Model
 		// attempt counts completed retries (0 before any).
 		attempt := 0
 		for {
-			chunkChan, errChan := a.LlmAdapter.Stream(ctx, modelReq)
+			adapter := a.liveAdapter()
+			if adapter == nil {
+				outErr <- fmt.Errorf("llm adapter unavailable (llm-provider disabled or unloaded)")
+				return
+			}
+			chunkChan, errChan := adapter.Stream(ctx, modelReq)
 
 			// Forward chunks and watch for the terminal error or clean finish.
-			// chunkChan is the authoritative stream (its close is the clean EOF);
-			// errChan only signals a fatal error when it delivers a non-nil value —
-			// a closed or nil errChan alongside a healthy chunk stream is normal
-			// adapter behavior and must not end the stream early.
+			// chunkChan is the authoritative stream (its close is the candidate
+			// clean EOF); errChan only signals a fatal error when it delivers a
+			// non-nil value — a closed or nil errChan alongside a healthy chunk
+			// stream is normal adapter behavior and must not end the stream early.
+			//
+			// Closed chunkChan alone is NOT proof of clean EOF. Every adapter
+			// close path (llm/sse.go failStream and startStream) buffers the
+			// fatal error BEFORE closing the channels, so at close time a fatal
+			// error is already buffered on errChan whenever one exists — and
+			// Go's select picks pseudo-randomly between the two ready channels.
+			// Letting closed-chunkChan win would classify fatal transport/auth
+			// failures as clean successes and complete the turn with an
+			// empty/partial assistant message (W8-c evidence: ~50% of real
+			// failures surfaced as silent empty successes). The !ok branch
+			// therefore drains errChan non-blockingly once before accepting the
+			// close: the buffered error is found deterministically; closed-empty
+			// or not-yet-ready means the stream truly ended. This keeps the
+			// documented contract intact — errChan still never ends a healthy
+			// stream early, and an error that arrives while chunkChan is open is
+			// taken by the errChan case exactly as before.
 			var attemptErr error
 			streamDone := false
 			for !streamDone {
@@ -1291,6 +1399,27 @@ func (a *Agent) llmRetry(ctx context.Context, turn, step int, modelReq llm.Model
 					return
 				case chunk, ok := <-chunkChan:
 					if !ok {
+						// Cancellation wins over close: when ctx is already
+						// done this close is the silent-exit shape (both
+						// channels closed, no error) and must not be classified
+						// as a clean success — nor may a buffered adapter
+						// failure from before the cancel schedule a retry.
+						// Return without classifying; the step loop routes the
+						// cancellation on its side.
+						if ctx.Err() != nil {
+							return
+						}
+						// A fatal buffered error must not be lost to select
+						// randomness: failStream closes both channels with the
+						// error already buffered, so closed-chunkChan alone is
+						// not proof of clean EOF.
+						select {
+						case err, errOk := <-errChan:
+							if errOk && err != nil {
+								attemptErr = err
+							}
+						default:
+						}
 						streamDone = true
 						continue
 					}
@@ -1374,13 +1503,13 @@ func failureCode(f *llmRetryError) string {
 
 // classifyLlmError maps an adapter error onto a provider-neutral retryable
 // classification, or nil when it is not a retryable failure. It understands the
-// deepseek adapter's typed DeepSeekProviderError (code field) and the transport
+// provider adapter's typed ProviderError (code field) and the transport
 // sentinels (ErrDeepSeekStream/Watchdog).
 func classifyLlmError(err error) *llmRetryError {
 	if err == nil {
 		return nil
 	}
-	var dpe *llm.DeepSeekProviderError
+	var dpe *llm.ProviderError
 	if errors.As(err, &dpe) {
 		switch dpe.Code {
 		case "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT":
@@ -1407,7 +1536,7 @@ func classifyLlmError(err error) *llmRetryError {
 // "UNKNOWN". The zero value ("") means "no structured code" and is treated as a
 // non-blocking inline failure by the host.
 func classifyProviderCode(err error) string {
-	var dpe *llm.DeepSeekProviderError
+	var dpe *llm.ProviderError
 	if errors.As(err, &dpe) && dpe != nil {
 		if dpe.Code != "" {
 			return dpe.Code

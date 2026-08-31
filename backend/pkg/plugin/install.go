@@ -23,6 +23,7 @@ type PluginInfo struct {
 	Source       string   `json:"source,omitempty"` // builtin | external
 	Capabilities []string `json:"capabilities,omitempty"`
 	Error        string   `json:"error,omitempty"`
+	Tools        []string `json:"tools,omitempty"`
 }
 
 // ListInfo 返回内置与外部插件的当前状态（按 Name 排序）。
@@ -62,6 +63,9 @@ func (r *Registry) infoLocked(name string) PluginInfo {
 		if len(ext.Capabilities) > 0 {
 			info.Capabilities = append([]string{}, ext.Capabilities...)
 		}
+	}
+	if r.tools != nil {
+		info.Tools = r.OwnedTools(name)
 	}
 	switch {
 	case r.disabled[name]:
@@ -353,7 +357,9 @@ func (r *Registry) SetEnabled(name string, enabled bool) error {
 		return err
 	}
 	if !enabled {
+		r.reconcileMu.Lock()
 		r.Unload(name)
+		r.reconcileMu.Unlock()
 		return nil
 	}
 	r.Reconcile(context.Background())

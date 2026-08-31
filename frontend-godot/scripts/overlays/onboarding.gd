@@ -1,10 +1,33 @@
 extends CanvasLayer
 class_name OnboardingOverlay
 
-## First-run: language → provider key (saved) → models. Skip allowed.
+## First-run: language → persona preset (四选一, superscy-plan §1.2) → provider
+## key (saved) → models → persona info. Skip allowed (Esc or 稍后).
+##
+## Persona presets (supremacy-plan §1 item 2 "模式预设=零入门成本"):
+##   engineer     零额外效果（默认;全功能+终端流）
+##   privacy      records general.privacyLocalOnly（遥测本就为零;本地/审计引导见信息页）
+##   subscription 信息页（OAuth 订阅复用未上线,多协议 provider 已就绪）
+##   migrator     信息页只读检测 ~/.claude 资产(dshx import 兗未落地)
+## The preset is recorded through settings.mutate("general", …) — one key, no
+## parallel storage. DSHX_FAKE_HOME overrides the home root for GUI probes.
 
 signal onboarding_completed
 signal onboarding_skipped
+
+const STEP_LANGUAGE := "language"
+const STEP_PERSONA := "persona"
+const STEP_PERSONA_INFO := "persona_info"
+const STEP_PROVIDER := "provider"
+const STEP_MODEL := "model"
+
+## 四选一预设。顺序即展示顺序;工程师默认高亮。
+const PERSONAS := [
+	["engineer", "onboarding.persona.engineer", "onboarding.personaEngineerHint"],
+	["privacy", "onboarding.persona.privacy", "onboarding.personaPrivacyHint"],
+	["subscription", "onboarding.persona.subscription", "onboarding.personaSubscriptionHint"],
+	["migrator", "onboarding.persona.migrator", "onboarding.personaMigratorHint"],
+]
 
 var _client: DshClient = null
 var _step: int = 1

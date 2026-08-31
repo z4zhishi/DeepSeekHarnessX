@@ -46,6 +46,11 @@ var _btn_row: HBoxContainer
 var _icon: TextureRect
 var _countdown: Label
 var _tick: Timer
+var _auto_reject := false
+
+
+func set_auto_reject(v: bool) -> void:
+	_auto_reject = v
 
 
 func _ready() -> void:
@@ -149,13 +154,18 @@ func _build() -> void:
 
 
 func _apply_style() -> void:
-	var card_bg := DshTokens.bg_layer1()
-	card_bg.a = 0.98
-	var card_box := DshTokens.box(card_bg, DshTokens.RADIUS_LG, DshTokens.warn(), 1, Vector4(20, 18, 20, 18))
-	card_box.shadow_size = 0
-	_card.add_theme_stylebox_override("panel", card_box)
-	_title.add_theme_color_override("font_color", DshTokens.warn())
-	_prompt.add_theme_color_override("default_color", DshTokens.text_primary())
+	# 视觉重设计（task #18/#19）：elevated 浮层 + 警示 accent 细描边 +
+	# 平滑圆角；暗/亮主题同一套 token，不再出现锯齿硬边。
+	var card := DshTokens.elevated(DshTokens.bg_layer1(), DshTokens.RADIUS_LG, Vector4(22, 20, 20, 18), 3)
+	card.border_color = DshTokens.warn().darkened(0.15)
+	card.border_width_left = 1
+	card.border_width_top = 1
+	card.border_width_right = 1
+	card.border_width_bottom = 1
+	_card.add_theme_stylebox_override("panel", card)
+	_title.add_theme_color_override("font_color", DshTokens.text_primary())
+	_title.add_theme_font_size_override("font_size", DshTokens.FONT_CHROME_LG)
+	_prompt.add_theme_color_override("default_color", DshTokens.text_secondary())
 	_icon.modulate = DshTokens.warn()
 	_tool_label.add_theme_color_override("font_color", DshTokens.text_primary())
 	_target_label.add_theme_color_override("font_color", DshTokens.text_secondary())
@@ -183,6 +193,8 @@ func _on_locale_changed(_loc: String) -> void:
 
 
 func show_request(call_id: String, prompt: String, options: Array = []) -> void:
+	if _auto_reject:
+		return
 	_call_id = call_id
 	_raw_prompt = prompt
 	_raw_options = options.duplicate()
@@ -230,6 +242,12 @@ func resolve_remote(call_id: String, _outcome: String) -> bool:
 	_stop_countdown()
 	visible = false
 	return true
+
+
+## CallId of the request currently shown ("" when the card is closed). Used by
+## the app shell to restore the card after a session switch.
+func current_call_id() -> String:
+	return _call_id
 
 
 func _decide(decision: String) -> void:
@@ -385,29 +403,37 @@ func _focus_primary() -> void:
 
 
 func _style_decision_button(btn: Button, decision: String) -> void:
-	var bg: Color = DshTokens.bg_layer3()
-	var hover: Color = DshTokens.border_l4()
+	# 视觉重设计（task #19）：决策按钮分级——主操作 accent 实底、危险操作
+	# danger 实底、第三主键 accent 弱底、其余中性面；统一大圆角、hover 抬亮、
+	# pressed 下压（pressed_layer 语义），焦点环保留全键盘可达性。
+	const PAD := Vector4(14, 7, 14, 7)
+	var bg := DshTokens.bg_layer2()
+	var hov := DshTokens.bg_layer3()
+	var font := DshTokens.text_primary()
+	var font_hov := DshTokens.text_primary()
 	if decision == "allow_once":
-		bg = DshTokens.brand_button()
-		hover = DshTokens.text_secondary()
-		btn.add_theme_color_override("font_color", DshTokens.bg_base())
-		btn.add_theme_color_override("font_hover_color", DshTokens.bg_base())
+		bg = DshTokens.accent()
+		hov = DshTokens.accent_hover()
+		font = DshTokens.bg_base() if DshTokens.is_dark() else Color.WHITE
+		font_hov = font
 	elif decision == "deny":
 		bg = DshTokens.danger()
-		hover = DshTokens.danger()
-		btn.add_theme_color_override("font_color", Color(1, 1, 1, 1))
-		btn.add_theme_color_override("font_hover_color", Color(1, 1, 1, 1))
+		hov = DshTokens.danger().lightened(0.08)
+		font = Color.WHITE
+		font_hov = Color.WHITE
 	elif decision == "allow_all":
-		# 第三主键：次级强调（描边 accent），不与「允许一次」争夺主视觉。
-		btn.add_theme_color_override("font_color", DshTokens.accent())
-		btn.add_theme_color_override("font_hover_color", DshTokens.accent_hover())
-	else:
-		btn.add_theme_color_override("font_color", DshTokens.text_primary())
-	btn.add_theme_stylebox_override("normal", DshTokens.box(bg, DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, Vector4(12, 6, 12, 6)))
-	btn.add_theme_stylebox_override("hover", DshTokens.box(hover, DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, Vector4(12, 6, 12, 6)))
-	btn.add_theme_stylebox_override("pressed", DshTokens.box(hover, DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, Vector4(12, 6, 12, 6)))
+		# 第三主键：次级强调（accent 弱底），不与「允许一次」争夺主视觉。
+		bg = DshTokens.accent_soft()
+		font = DshTokens.accent()
+		font_hov = DshTokens.accent_hover()
+	btn.add_theme_color_override("font_color", font)
+	btn.add_theme_color_override("font_hover_color", font_hov)
+	btn.add_theme_color_override("font_pressed_color", font)
+	btn.add_theme_stylebox_override("normal", DshTokens.box(bg, DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, PAD))
+	btn.add_theme_stylebox_override("hover", DshTokens.box(hov, DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, PAD))
+	btn.add_theme_stylebox_override("pressed", DshTokens.box(DshTokens.pressed_layer(), DshTokens.RADIUS_MD, Color(0, 0, 0, 0), 0, PAD))
 	# 键盘焦点环：draw_center=false 只描边，保证全键盘可选可见。
-	var focus_sb := DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_MD, DshTokens.accent(), 1, Vector4(12, 6, 12, 6))
+	var focus_sb := DshTokens.box(Color(0, 0, 0, 0), DshTokens.RADIUS_MD, DshTokens.accent(), 1, PAD)
 	focus_sb.draw_center = false
 	btn.add_theme_stylebox_override("focus", focus_sb)
 

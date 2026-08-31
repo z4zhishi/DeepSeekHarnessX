@@ -1,0 +1,17 @@
+{
+  "name": "dshx-session-demos",
+  "version": "0.1.0",
+  "apiVersion": "1",
+  "description": "Builtin system plugin used to verify Core plugin, event, permission and lifecycle integration",
+  "required": false,
+  "dependencies": [],
+  "permissions": [],
+  "libs": [],
+  "capabilities": [
+    {
+      "id": "demo.session.echo",
+      "type": "command",
+      "description": "Echoes a real session-scoped event back to the bus."
+    }
+  ]
+}

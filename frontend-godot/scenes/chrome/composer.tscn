@@ -40,18 +40,17 @@ wrap_mode = 1
 scroll_fit_content_height = true
 placeholder_text = "Message the agent"
 
-[node name="Row" type="HBoxContainer" parent="VBox"]
+[node name="Toolbar" type="HBoxContainer" parent="VBox"]
+unique_name_in_owner = true
 layout_mode = 2
 theme_override_constants/separation = 8
 
-[node name="CmdBtn" type="Button" parent="VBox/Row"]
+[node name="LeftChrome" type="HBoxContainer" parent="VBox/Toolbar"]
 unique_name_in_owner = true
-custom_minimum_size = Vector2(28, 28)
 layout_mode = 2
-flat = true
-text = "/"
+theme_override_constants/separation = 6
 
-[node name="AccessBtn" type="Button" parent="VBox/Row"]
+[node name="AccessBtn" type="Button" parent="VBox/Toolbar/LeftChrome"]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 28)
 layout_mode = 2
@@ -60,25 +59,64 @@ clip_text = true
 text_overrun_behavior = 3
 text = "Workspace Write"
 
-[node name="Spacer" type="Control" parent="VBox/Row"]
+[node name="RejectAllBtn" type="Button" parent="VBox/Toolbar/LeftChrome"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 28)
+layout_mode = 2
+toggle_mode = true
+flat = true
+clip_text = true
+text = "Ask"
+
+[node name="Spacer" type="Control" parent="VBox/Toolbar"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="ModelPicker" type="OptionButton" parent="VBox/Row"]
+[node name="RightChrome" type="HBoxContainer" parent="VBox/Toolbar"]
 unique_name_in_owner = true
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="ModelEffortBtn" type="Button" parent="VBox/Toolbar/RightChrome"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 28)
+layout_mode = 2
+flat = true
+clip_text = true
+text_overrun_behavior = 3
+text = "Model · high"
+
+[node name="OverflowBtn" type="Button" parent="VBox/Toolbar/RightChrome"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+text = "⋯"
+
+[node name="CmdBtn" type="Button" parent="VBox/Toolbar/RightChrome"]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(28, 28)
+layout_mode = 2
+flat = true
+text = "/"
+
+[node name="ModelPicker" type="OptionButton" parent="VBox/Toolbar/RightChrome"]
+unique_name_in_owner = true
+visible = false
 custom_minimum_size = Vector2(160, 28)
 layout_mode = 2
 fit_to_longest_item = false
 clip_text = true
 disabled = true
 
-[node name="AttachBtn" type="Button" parent="VBox/Row"]
+[node name="AttachBtn" type="Button" parent="VBox/Toolbar/RightChrome"]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(28, 28)
 layout_mode = 2
 flat = true
 
-[node name="AttachIcon" type="TextureRect" parent="VBox/Row/AttachBtn"]
+[node name="AttachIcon" type="TextureRect" parent="VBox/Toolbar/RightChrome/AttachBtn"]
 unique_name_in_owner = true
 layout_mode = 1
 anchors_preset = 15
@@ -92,13 +130,13 @@ mouse_filter = 2
 expand_mode = 1
 stretch_mode = 5
 
-[node name="SendBtn" type="Button" parent="VBox/Row"]
+[node name="SendBtn" type="Button" parent="VBox/Toolbar/RightChrome"]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(34, 34)
 layout_mode = 2
 flat = true
 
-[node name="SendIcon" type="TextureRect" parent="VBox/Row/SendBtn"]
+[node name="SendIcon" type="TextureRect" parent="VBox/Toolbar/RightChrome/SendBtn"]
 unique_name_in_owner = true
 layout_mode = 1
 anchors_preset = 15

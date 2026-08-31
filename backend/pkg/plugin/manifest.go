@@ -24,6 +24,9 @@ type Manifest struct {
 	// Deps 声明依赖的其它能力（如 "llm"、"session"）；Registry 按需解析，
 	// 未满足则延迟到满足后再 Load（空时表示无依赖）。
 	Deps []string `json:"deps,omitempty"`
+	// Libs 声明依赖的开发者 lib 层（plan §Lib registry），如 dshx-easy-api。
+	// Registry.LibRegistry 在加载前解析版本约束；缺失即拒绝。
+	Libs []LibDecl `json:"libs,omitempty"`
 	// Policy 声明权限与生命周期策略。
 	Policy *Policy `json:"policy,omitempty"`
 }
@@ -73,6 +76,11 @@ func (m *Manifest) Validate() error {
 	for i := range m.Capabilities {
 		if m.Capabilities[i].Name == "" {
 			return fmt.Errorf("plugin manifest %q: 能力缺 name", m.Name)
+		}
+	}
+	for _, lib := range m.Libs {
+		if lib.ID == "" {
+			return fmt.Errorf("plugin manifest %q: lib 声明缺 id", m.Name)
 		}
 	}
 	return nil

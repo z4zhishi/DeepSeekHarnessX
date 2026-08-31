@@ -16,6 +16,15 @@ func makeProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// attachProcessGroup is a no-op on Unix: unlike the Windows Job Object, Unix
+// has no post-start group-assignment step — Setpgid in SysProcAttr already
+// places the child in its own process group at spawn time (verified by
+// assertPshellProcessGroup in pshell_kill_unix_test.go), so by the time
+// attachProcessGroup is invoked after Start the association already exists.
+// The no-op exists only to satisfy the shared call sites (jobs.go, pshell.go,
+// terminal.go) on this GOOS.
+func attachProcessGroup(_ *exec.Cmd) {}
+
 // killProcessTree terminates a process and its whole process group. The job
 // commands are launched with Setpgid=true (see jobs.go), so the root PID is
 // its own group leader and signalling the negative pgid reaches every child.

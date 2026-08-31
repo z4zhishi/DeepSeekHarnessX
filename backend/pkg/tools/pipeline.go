@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -121,6 +122,7 @@ type ToolDefinition struct {
 	ParametersJSON json.RawMessage `json:"parameters"`
 	Execute        func(ctx ToolExecutionContext, argsJSON string) (any, error)
 	RequiresPerm   bool   `json:"requiresPerm"`
+	Owner          string `json:"owner,omitempty"`
 	// TimeoutMs declares this tool's own execution budget in milliseconds;
 	// ExecutePipeline arms exactly this deadline instead of the shared
 	// defaultToolTimeout. Declare slightly MORE than the tool's internal
@@ -136,6 +138,8 @@ type ToolDefinition struct {
 // ToolRegistry manages registered tools and runs the execution pipeline.
 type ToolRegistry struct {
 	tools  map[string]ToolDefinition
+	owners map[string]string
+	defs   map[string]ToolDefinition
 	mu     sync.RWMutex
 	Policy *PolicyStore
 	// Commands is the shared slash-command registry; every frontend
@@ -211,15 +215,30 @@ const reviewTimeout = 3 * time.Second
 
 // NewToolRegistry initializes a tool registry with standard builtin tools.
 func NewToolRegistry() *ToolRegistry {
-	r := &ToolRegistry{
+	r := NewToolRegistryEmpty()
+	r.RegisterBuiltinTools()
+	return r
+}
+
+// NewToolRegistryEmpty creates the shared registries without mounting builtin
+// families. Production hosts use this with the plugin registry so each family
+// has an owner and disposer.
+func NewToolRegistryEmpty() *ToolRegistry {
+	return &ToolRegistry{
 		tools:    make(map[string]ToolDefinition),
+		owners:   make(map[string]string),
 		Policy:   NewPolicyStore(),
 		Commands: NewCommandRegistry(),
 	}
+}
+
+// RegisterBuiltinTools mounts the legacy implementations as one migration
+// unit. The plugin host owns this unit in production; the legacy constructor
+// calls it for compatibility with package consumers.
+func (r *ToolRegistry) RegisterBuiltinTools() {
 	r.Commands.RegisterBuiltinCommands()
 	r.registerBuiltins()
 	r.RegisterFSTools()
-	r.RegisterWebTools()
 	r.RegisterTaskTools()
 	r.RegisterPersistentShellTools()
 	r.RegisterJobTools()
@@ -231,20 +250,39 @@ func NewToolRegistry() *ToolRegistry {
 	r.RegisterExitPlanModeTool()
 	r.RegisterScheduleTools()
 	// Phase 2（第二轮迁移 B/C 缺口）补齐的工具族：
+	// TODO(Phase2): migrate these tool families into Core-backed capabilities so
+	// the tool registry is assembled exclusively through plugin mounts.
 	r.RegisterImageTools()        // 视觉读图 read_image
 	r.RegisterPwshTools()         // pwsh 持久化会话
 	r.RegisterSessionQueryTools() // session_search / session_trace / session_event_read
 	r.RegisterSkillTools()        // skill / skill_list
 	r.RegisterTeamTools()         // Agent Teams 运行时工具（spawn_teammate 等）
 	r.RegisterWorkflowTools()     // workflow_run（subagent 工作流编排）
-	return r
+	return
 }
 
 // Register registers a tool definition.
 func (r *ToolRegistry) Register(tool ToolDefinition) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.owners == nil {
+		r.owners = map[string]string{}
+	}
+	delete(r.owners, tool.Name)
+	tool.Owner = ""
 	r.tools[tool.Name] = tool
+}
+
+// Names returns a stable snapshot of registered tool names.
+func (r *ToolRegistry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Get looks up a tool by name.
@@ -252,15 +290,31 @@ func (r *ToolRegistry) Get(name string) (ToolDefinition, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	t, ok := r.tools[name]
-	return t, ok
+	if !ok {
+		return ToolDefinition{}, false
+	}
+	t.Owner = r.owners[name]
+	return t, true
+}
+
+// ToolOwners returns a snapshot of owner assignments.
+func (r *ToolRegistry) ToolOwners() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(r.owners))
+	for k, v := range r.owners {
+		out[k] = v
+	}
+	return out
 }
 
 // ListDeclarations returns all registered tool schemas for LLM prompts.
 func (r *ToolRegistry) ListDeclarations() []ToolDefinition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var list []ToolDefinition
+	list := make([]ToolDefinition, 0, len(r.tools))
 	for _, t := range r.tools {
+		t.Owner = r.owners[t.Name]
 		list = append(list, t)
 	}
 	return list
@@ -484,10 +538,16 @@ func (r *ToolRegistry) registerBuiltins() {
 		},
 	})
 
-	// 3. run_command (upstream @deepseek-ai/dsh-tool-bash contract)
+	// 3. run_command is a separate family so production can mount it
+	// from the terminal capability without re-registering the FS stubs.
+	r.RegisterRunCommandTool()
+}
+
+// RegisterRunCommandTool mounts the one-shot shell tool (fresh process per call).
+func (r *ToolRegistry) RegisterRunCommandTool() {
 	r.Register(ToolDefinition{
 		Name:         "run_command",
-		Description:  "Execute a shell command and return its stdout/stderr. Each call runs in a fresh shell: no state (cwd, variables, functions) persists between calls 鈥?pass workdir instead of using cd. Non-zero exits are reported as [exit code: N]. Set run_in_background:true for long-running commands: the call returns a job id immediately; read its output with job_output and stop it with job_kill.",
+		Description:  "Execute a shell command and return its stdout/stderr. Each call runs in a fresh shell: no state (cwd, variables, functions) persists between calls — pass workdir instead of using cd. Non-zero exits are reported as [exit code: N]. Set run_in_background:true for long-running commands: the call returns a job id immediately; read its output with job_output and stop it with job_kill.",
 		RequiresPerm: true,
 		ParametersJSON: json.RawMessage(`{
 			"type": "object",
@@ -572,10 +632,57 @@ func (r *ToolRegistry) registerBuiltins() {
 	})
 }
 
-// RegisterChecked 注册工具；名称冲突时返回错误而非静默覆盖（MCP 两阶段同步使用）。
+// RegisterOwned registers a tool with an owner and returns a conditional disposer.
+// RegisterOwned registers a tool with an owner and returns a conditional disposer.
+func (r *ToolRegistry) RegisterOwned(owner string, tool ToolDefinition) func() {
+	if owner == "" || tool.Name == "" {
+		return func() {}
+	}
+	r.mu.Lock()
+	if r.owners == nil {
+		r.owners = map[string]string{}
+	}
+	tool.Owner = owner
+	r.tools[tool.Name] = tool
+	r.owners[tool.Name] = owner
+	r.mu.Unlock()
+	return func() { r.UnregisterOwned(owner, tool.Name) }
+}
+
+// ClaimOwner associates existing tool definitions with an owner after a
+// compatibility family has mounted them.
+func (r *ToolRegistry) ClaimOwner(owner string, names ...string) {
+	if owner == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.owners == nil {
+		r.owners = map[string]string{}
+	}
+	for _, name := range names {
+		if _, ok := r.tools[name]; ok {
+			r.owners[name] = owner
+		}
+	}
+}
+
+func (r *ToolRegistry) UnregisterOwned(owner, name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.owners[name] != owner {
+		return
+	}
+	delete(r.tools, name)
+	delete(r.owners, name)
+}
+
 func (r *ToolRegistry) RegisterChecked(tool ToolDefinition) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.owners == nil {
+		r.owners = map[string]string{}
+	}
 	if _, exists := r.tools[tool.Name]; exists {
 		return fmt.Errorf("tool %q 已存在", tool.Name)
 	}
@@ -587,5 +694,6 @@ func (r *ToolRegistry) RegisterChecked(tool ToolDefinition) error {
 func (r *ToolRegistry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.owners, name)
 	delete(r.tools, name)
 }
